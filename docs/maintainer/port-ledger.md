@@ -202,6 +202,11 @@ probes complete at normal acceptance (code 0.57 vs 0.58, prose 0.43 vs 0.36; the
 content-dependent). New planner fields present (`search_stop_phase`, `search_granted_ns` 5 ms,
 `insufficient_expected_gain` on the unpressured probes).
 
+**DEPLOYED 2026-09-12 19:55 UTC as `catchup3-9b26ae76`** (`deploy-catchup3.sh`: provenance ok, installed binary
+byte-identical, health ok, gateway 200, boot `long_anchors_per_continuation=2 auto_long_anchors=2`, 0 warnings).
+Rollback `~/ninfer-deploy/bin/ninfer-serve.pre-catchup3-9b26ae76-20260912-1955` (= wave1-6f1399c9). Soak 1-2
+days, then fast-forward `rtx4090-port` and push.
+
 Deliberately NOT taken: nothing dropped this time. Upstream PR #211 (the stream-ordered
 membership publish we carry as `e565fe50`) was closed unmerged by its author on 09-10 and master
 still publishes unordered - the patch stays fork-only.
