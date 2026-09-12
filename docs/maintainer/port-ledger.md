@@ -166,6 +166,57 @@ edited, backup `.pre-ccost-20260907`). Boot line on production reads external/ex
 the soak: `materialization.predicted_*` and `prefix_reuse_path` in the JSONL - this is the first
 time the planner prices restores and prefills with 4090 numbers.
 
+## Upstream catch-up 2026-09-12: `neroued/master` `d4929686` merged (catch-up #3)
+
+Merge commit on `recon/catchup-20260912` (worktree `ninfer-recon`), 93 upstream commits since
+`ad0f3d38`. Full inventory and every decision: `ninfer-recon-notes/CATCHUP-20260912.md`.
+
+| Item | Outcome |
+|---|---|
+| DFlash2 (`4df5e0b4`..`385b30ce`, ~75 commits: op set, converter, `dflash_impl.h`, corpus bench) | Merged as-is. Optional at runtime (`--spec dflash2 --draft-tokens 1..15`, weights bound only when the artifact carries `dflash2/*`); our artifact has none, production line unchanged. `kMaximumDFlashDraftTokens` 0 -> 15 for the 27B (upstream value; inert without flag + artifact). soohl's 4090 numbers (K5 vs MTP3: code +5%, prose -6%, JSON +23%) say bench pi's mix before fetching the 19 GiB artifact |
+| `d4929686` materialization search budgets (closes #176) | Merged. `materialization_budget.h` (50 ms / 10 ms admission allowance, renewing search budget), `pressure_planner.h` rewrite, 10 new request-log `search_*` fields. **Supersedes `fix/d1-planner-search-budget` (`060b1b21`, deleted locally; delete `fork/fix/d1-planner-search-budget`).** Our `best_reuse_prompt_tokens` kept beside the new fields (different question: reuse on the table vs what the search did) |
+| `a7818988` variable-width small-T attention | Merged. The int8 partial kernel now writes FP32 partials and runs FP16 P / FP16 V `mma_f16` (was bf16); the fork's PackedK/E8Root/PackedV paths decode into the int8 staging tiles upstream of that change, so every int8-family mode moves together. `tokens >= 6` split cases, the reduce `<Int8>` dispatch, the batch>1 `target_ctas` branch, `causal_attention_chunk_tokens` and the `resolve_route` switch all cover the int8 family (fork case labels added). **Numerics change on the production path - the window A/B at temp 0 is the gate** |
+| `03177b91` kv coverage during speculative settlement | `materialize_to_tokens` -> `ensure_mapped_to_tokens`; our restore path renamed and given an explicit `mapped_pages == page_count` check (the old call threw on a mismatch, the new one treats coverage as a lower bound) |
+| `b88c0f6f` H2D upload completion, `9f0575bb` bf16 include, `b158afe2` BPE flat table, `641ef3e7` ASCII NFC skip | Merged clean |
+| MoE / nvfp4 perf (`487f8977`, `437e9f98`, `ce954918`, `7f14d963`, `ee9d5192`, `1c8f8acc`) | Merged; not exercised on this dense sm_89 target |
+| Option tables, docs, bench usage | kv-dtype lists stay the fork's; `--spec` gains `dflash2`; the bench's `--mtp-draft-tokens` went with upstream's `--spec/--draft-tokens` |
+| `tests/ops/softmax_attention/causal_cache.cpp` | Our unrotated `encode_key_row` oracle kept (the fork's Int8Group64 K is not D256-rotated); its `logical_k_quantized` output dropped because upstream's `cache_value()` now dequantizes `codes * scale`, which equals it for unrotated codes |
+
+Also in the same pass: the dead `catch (const std::invalid_argument&)` our wave-1 pick `02d0976d`
+left behind `catch (const std::logic_error&)` in `progress_materialization` was removed
+(`-Wexceptions`).
+
+Deliberately NOT taken: nothing dropped this time. Upstream PR #211 (the stream-ordered
+membership publish we carry as `e565fe50`) was closed unmerged by its author on 09-10 and master
+still publishes unordered - the patch stays fork-only.
+
+## Inbound sweep 2026-09-12 (all remotes, upstream issues, forks)
+
+Counts vs `rtx4090-port` `1bd56c9a`. Upstream +93 (taken above). The rest, ranked:
+
+| Source | What | Decision |
+|---|---|---|
+| **UDP `v1.2.0`** (`25c3099f`, `f34c3358`, `f589d684`) | Structured JSON generation (`response_format`) through a grammar mask, MTP preserved, mask scoped to the first MTP position | **Design port** (patches `concurrent_executor.h`, gone here since 08-30). Closes one of the two TEB feature gaps |
+| UDP `912cbb56` | Validate-only stubs for the 66 `dflash2/*` tensors so the new HF artifact revision loads on a non-DFlash2 build | Not needed after this catch-up (upstream binds them optionally) |
+| **gzenz `3c0b4dc5`** (9 files, +265, parser tests) | Tolerant text-form tool-call recovery (last-close parsing) | **Small port**; matches our measured 0.23% malformed calls |
+| **gzenz `a8cdc1a6`** | Tool-call arguments typed by their declared JSON schema (boolean/int coercion, strings preserved) | **Small port**; matches `tool_call_parse.schema_mismatch_arguments` |
+| gzenz `ae8eb23e` | Post-thinking sampler (second preset after the reasoning close, registered 0.2/0.95/20, HTTP `post_thinking`) + atomic {KV+state} cache units | Medium; the temp-0.6 tool-work mitigation could become a post-thinking preset |
+| gzenz `6df4f011`, `cb535944` | Unified KV+state host demotion with state-only fallback and OOM recovery (production-verified on their 5090); vendored jinja chat-template engine replacing the hand-written renderer | The item-7 host-KV design choice now has a shipped candidate; the jinja engine is a large replatform - read before the next frontend work |
+| soohl `aaec1533` | DFlash2 + adaptive MTP + host-staged BF16 vision on Ada, with the MTP3-vs-DFlash2 table | Evidence for the DFlash2 decision (above); the INT8 dense prefill (+68%) is still the top perf item |
+| upstream #229 (Gene0Liu) | Duplicate of #176 filed 09-10; its JSON carries `best_reuse_prompt_tokens`, a field only this fork logs | Someone runs this fork or a derivative; #176 is closed by `d4929686` |
+| upstream #224 (MichaelDementii, closed by Neroued) | Forced `tool_choice` by prompt opener; upstream wants constrained decoding later | The TEB `tool_choice=required` gap stays open (#223 tracks) |
+| upstream #213/#215/#216 (ranxianglei, closed unmerged) | Groupwise-W8 variant; W8 linear_add split-K hardcodes 2048 rows ("silent corruption when routed to other row counts"); W8 short-K decode inefficiency | Probably not our path (our W8 is the embedding/head only, text body Q4/Q5/Q6) - verify which kernels the groupwise profile routes through `w8_linear_add_*` before dismissing #215 |
+| 0xrjman +14, #152, #208, #231, 3090 base, shantanu, tensorninja | Upstream merges + Responses fixes; auto shared prefix still open; NVFP4 illegal address; abliterated NVFP4 artifact (5090); no new commits | Nothing to do |
+
+### Recommended order after this catch-up
+
+1. Deploy + soak catch-up #3 (this branch), ff `rtx4090-port`, delete the D1b branches.
+2. soohl INT8 dense prefill: kernel-bench + temp-0 quality gate on the 4090.
+3. gzenz `3c0b4dc5` + `a8cdc1a6` tool-call robustness.
+4. UDP structured-JSON design port (TEB `response_format`).
+5. Unchanged: #152 auto shared prefix, tensorninja `e3a129c3`, host-KV design (gzenz `6df4f011` vs xkeyC).
+6. DFlash2 only after a pi-mix bench with the new artifact.
+
 ## Inbound sweep 2026-09-07 (all remotes, upstream issues, forks of this repo, active forks of upstream)
 
 Counts are commits absent from `rtx4090-port` at `6f327f49` (= production `catchup-6f327f49`).
