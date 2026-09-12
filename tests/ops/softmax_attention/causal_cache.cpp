@@ -859,7 +859,10 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
                                     const std::vector<std::int32_t>& positions) {
     const Geometry& geometry = cache.geometry;
     const int tokens = positions.size(), visible = positions.back() + 1;
-    const bool rotate_q = cache.storage != KvCacheStorage::BFloat16;
+    // The fork's plain-i8 codec keeps K in the original coordinates (no D256 rotation), so the
+    // reference query stays unrotated for Int8Group64; fp8 and nvfp4 keep upstream's rotation.
+    const bool rotate_q = cache.storage != KvCacheStorage::BFloat16 &&
+                          cache.storage != KvCacheStorage::Int8Group64;
     const bool rotate_v = cache.storage == KvCacheStorage::Nvfp4Group16 ||
                           cache.storage == KvCacheStorage::Fp8KeyNvfp4Value;
     std::vector<double> query(q.begin(), q.end()), output(q.size());
@@ -2171,6 +2174,12 @@ int run_dflash2_cases() {
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_SM86
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 KV-cache storage requires an sm_120a GPU
+        }
+#endif
         const auto run = [&](int width, int batch, int base, bool graph) {
             BatchAttentionCase c{width,
                                  {},
@@ -2215,6 +2224,12 @@ int run_batch_cases() {
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_SM86
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 KV-cache storage requires an sm_120a GPU
+        }
+#endif
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
         failures += run_batch_case(kGeometries[0], storage,
