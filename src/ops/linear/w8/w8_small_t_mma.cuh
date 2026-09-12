@@ -100,6 +100,12 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
     using SharedStorage = W8SmallTMmaSharedStorage<Schedule>;
 
     constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
+#if defined(NINFER_SM86)
+    // sm_86/sm_89 cap statically allocated shared memory at 48 KB; the staging tile is
+    // KWarps * (1088 + 128 * TileTokens) bytes, so 8 K-warps overflow from a 40-token tile on.
+    static_assert(kDynamicShared || sizeof(SharedStorage) <= 48 * 1024,
+                  "sm_86/sm_89 static shared memory limit: use fewer K warps or a narrower tile");
+#endif
     __shared__ __align__(
         16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];

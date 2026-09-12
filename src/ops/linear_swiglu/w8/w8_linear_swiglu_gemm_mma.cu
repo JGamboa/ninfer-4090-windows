@@ -117,7 +117,14 @@ void w8_dflash2_linear_swiglu_mma_r64_c80_k128_launch(const Tensor& x, const Wei
 
 void w8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                       cudaStream_t stream) {
+#if defined(NINFER_SM86)
+    // The 64x96 K128 single-activation-stage tile needs 50,176 B of static shared memory, over
+    // the 48 KB sm_86/sm_89 cap. Run this route on the neighbouring 64x80 tile (46,080 B), which
+    // the r64_c80_k128 route already qualifies; the predicated grid handles the column remainder.
+    using Schedule = W8RowSplitMmaGemmSchedule<64, 80, 64, 8, 2, 2, 128, 1>;
+#else
     using Schedule = W8RowSplitMmaGemmSchedule<64, 96, 64, 8, 2, 2, 128, 1>;
+#endif
     launch_route<Schedule>(x, w, out, stream);
 }
 
