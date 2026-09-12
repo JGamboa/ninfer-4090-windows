@@ -892,7 +892,13 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
             if (page_count == 0) { return *address; }
             try {
                 addresses.activate(*address, page_count, *free_row);
-                addresses.materialize_to_tokens(*address, committed, device.stream);
+                // ensure_mapped_to_tokens (upstream 03177b91) treats coverage as a lower bound;
+                // a fresh address has no pages, so this maps exactly pages_for(committed).
+                addresses.ensure_mapped_to_tokens(*address, committed, device.stream);
+                if (addresses.mapped_pages(*address) != page_count) {
+                    throw std::invalid_argument(
+                        "session snapshot KV page count does not match its committed tokens");
+                }
                 addresses.commit_frontier(*address, committed);
                 std::vector<DeviceKVPageHandle> destinations;
                 destinations.reserve(page_count);

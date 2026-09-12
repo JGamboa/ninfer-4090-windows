@@ -74,6 +74,7 @@ ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
+ninfer_add_test(ninfer_materialization_budget_test SOURCES test_materialization_budget.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
@@ -146,6 +147,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
   SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash2_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_dflash2_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -242,6 +247,7 @@ set(ninfer_op_tests
   residual_add
   sigmoid_mul
   rmsnorm
+  rmsnorm_pack_tail
   gated_rmsnorm
   l2norm
   gated_delta_net
@@ -256,7 +262,9 @@ set(ninfer_op_tests
   sampling
   scalar
   cast
+  prepare_ragged_prefix
   scatter
+  scatter_bf16_batch
   target_logprobs
   position)
 foreach(op IN LISTS ninfer_op_tests)
@@ -264,6 +272,13 @@ foreach(op IN LISTS ninfer_op_tests)
     SOURCES ops/test_${op}.cpp
     LIBRARIES ninfer_ops)
 endforeach()
+
+ninfer_add_op_test(ninfer_linear_topk_test
+  SOURCES ops/test_linear_topk.cu
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_candidate_selector_test
+  SOURCES ops/test_candidate_selector.cpp
+  LIBRARIES ninfer_ops)
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.
@@ -289,6 +304,12 @@ ninfer_add_op_test(ninfer_kv_cache_append_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_e8_root_codec_test
   SOURCES ops/test_e8_root_codec.cu
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_rmsnorm_rope_test
+  SOURCES ops/test_rmsnorm_rope.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_context_kv_materialize_test
+  SOURCES ops/test_context_kv_materialize.cpp
   LIBRARIES ninfer_ops)
 add_test(NAME ninfer_kv_cache_append_nvfp4_test
   COMMAND ninfer_kv_cache_append_test --nvfp4-only)
@@ -329,6 +350,12 @@ ninfer_add_op_test(ninfer_attn_input_proj_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES ops/test_gdn_input_proj.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dynamic_grouped_conv_prepare_test
+  SOURCES ops/test_dynamic_grouped_conv_prepare.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_dynamic_grouped_conv_add_test
+  SOURCES ops/test_linear_dynamic_grouped_conv_add.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp

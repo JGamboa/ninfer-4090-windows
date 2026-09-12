@@ -271,7 +271,8 @@ public:
     }
 
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
-                                     const RequestBasePlan& base, std::uint64_t publication_order) {
+                                     const RequestBasePlan& base, std::uint64_t publication_order,
+                                     PlanningAllowance allowance = {}) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
             return {.readiness = Readiness::TemporarilyBlocked};
@@ -395,7 +396,7 @@ public:
 
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
-                                 planning_started, provisional_demand);
+                                 planning_started, provisional_demand, allowance);
         if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
@@ -1940,7 +1941,7 @@ private:
                          const RequestBasePlan& base, LaneId destination,
                          std::vector<Candidate>& candidates, std::uint64_t publication_order,
                          typename Planner::Clock::time_point planning_started,
-                         PrefixDemandRecord& provisional_demand) {
+                         PrefixDemandRecord& provisional_demand, PlanningAllowance allowance) {
         std::vector<typename Planner::CandidateInput> candidate_inputs;
         std::vector<const ContinuationHandle*> private_owners;
         std::vector<PlanningOwnerId> private_owner_ids;
@@ -2199,7 +2200,7 @@ private:
 
         std::optional<typename Planner::Result> planned =
             planner_.plan(program, prompt, cost_model_, candidate_inputs, 0, build_pressure_inputs,
-                          logical_goal, final_schedule, planning_started);
+                          logical_goal, final_schedule, planning_started, allowance);
         const auto selected_candidate =
             planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
                                    [&](const typename Planner::CandidateInput& input) {
