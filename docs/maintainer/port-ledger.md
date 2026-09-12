@@ -187,6 +187,21 @@ Also in the same pass: the dead `catch (const std::invalid_argument&)` our wave-
 left behind `catch (const std::logic_error&)` in `progress_materialization` was removed
 (`-Wexceptions`).
 
+**GPU window 2026-09-12 19:23-19:33 UTC (`ninfer-recon-notes/deploy-20260912/run-gpu-window-catchup3.sh`): all
+gates passed.** ctest 119/120 (11 skipped: nvfp4/k8v4/A4, dflash2-real, 35B, score, load-plan) - the one
+failure was the attention unit test's oracle, not the kernels: upstream's harness rewrite rotates the
+reference query for every non-bf16 storage, which is wrong for the fork's unrotated Int8Group64 codec
+(fixed, PASS on an idle GPU in a 47 s follow-up stop); the same run had lost the sm_86 skip on the two
+new nvfp4/k8v4 case loops (abort -> guarded). Real-model E2E on rk4v4-e8 ok x3 (default,
+automatic-private-anchors, shared-release-source). Production slot copy restored digest-exact
+(n_restored=105383, session 5a96e7894feb885f, 0.79 s) through the renamed `ensure_mapped_to_tokens`
+path. Boot geometry identical, effort high/minimal 200, 0 warnings. A/B vs `wave1-6f1399c9` on fresh
+servers: prefill 2k/16k/49k 1968/2063/1883 vs 1919/2015/1844 tok/s (+2.1..2.5%), cache hits identical
+(15,168 / 15,190), 49k save 1021 vs 1071 ms, 16k save 537 vs 581 ms, restores flat, decode 600-token
+probes complete at normal acceptance (code 0.57 vs 0.58, prose 0.43 vs 0.36; the nonce makes counts
+content-dependent). New planner fields present (`search_stop_phase`, `search_granted_ns` 5 ms,
+`insufficient_expected_gain` on the unpressured probes).
+
 Deliberately NOT taken: nothing dropped this time. Upstream PR #211 (the stream-ordered
 membership publish we carry as `e565fe50`) was closed unmerged by its author on 09-10 and master
 still publishes unordered - the patch stays fork-only.
