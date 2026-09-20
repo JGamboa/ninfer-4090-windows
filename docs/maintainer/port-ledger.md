@@ -204,8 +204,30 @@ content-dependent). New planner fields present (`search_stop_phase`, `search_gra
 
 **DEPLOYED 2026-09-12 19:55 UTC as `catchup3-9b26ae76`** (`deploy-catchup3.sh`: provenance ok, installed binary
 byte-identical, health ok, gateway 200, boot `long_anchors_per_continuation=2 auto_long_anchors=2`, 0 warnings).
-Rollback `~/ninfer-deploy/bin/ninfer-serve.pre-catchup3-9b26ae76-20260912-1955` (= wave1-6f1399c9). Soak 1-2
-days, then fast-forward `rtx4090-port` and push.
+Rollback `~/ninfer-deploy/bin/ninfer-serve.pre-catchup3-9b26ae76-20260912-1955` (= wave1-6f1399c9).
+
+**SOAK PASSED 2026-09-12 19:55 -> 2026-09-20 07:46 UTC (7.5 days); `rtx4090-port` FAST-FORWARDED
+`1bd56c9a` -> `6505b7fc` on 2026-09-20.** Live binary sha `fff53605` == `bin/ninfer-serve.catchup3-9b26ae76`,
+container RestartCount 0, one `server_start` (the deploy), no VM boot since 09-11. JSONL since the deploy:
+129 `request_done` / 0 `request_error`; 748 stderr lines, 0 WARN/ERROR/crash signatures. Reuse paths
+`private_endpoint` 119, `root` 8, `private_response_replay` 2; all 68 deep turns (>50k tokens, max
+203,867) reused, ttft median 0.82 s, max 14.1 s (16-19k appended tokens at 73-118k depth, partial reuse).
+The 8 roots are the 2 deploy probes and 6 first turns (`message_count` 3, 18-23k tokens at 2,033-2,059
+tok/s; the wave-1 soak saw 1,890-1,950 at 29-39k); no `root` with `best_reuse_prompt_tokens` > 0. Planner
+rework: `stop_reason` `insufficient_expected_gain` 127 / `no_pressure` 2, `budget_exhausted` 0 (32/81 on
+wave-1), `selected_maximal_fallback` 0, `search_stop_phase` `expansion` 127, `search_granted_ns` median
+5 ms max 10 ms (one renewal), `prefix_cache_hit_tokens` == `best_reuse_prompt_tokens` 129/129. Preset:
+`predicted_now_ns` / measured prefill median 1.02 (p10 0.99, p90 1.05, n=60). Pressure was exercised for
+the first time in a soak: `private_owners_evicted` 1, `checkpoints_dropped` 4, `spill_pages` 1,880
+(7.2 GB d2h, 2.2 GB h2d), state `restores` 1, `search_budget_exhaustions` 0, host KV occupancy 2.3 GB at
+the end - demotion and promotion ran under two resident sessions with no reuse loss. MTP acceptance
+62.1% (98,378/158,511; temp 1.0 + tools n=127, like-for-like wave-1 53.4%). Effort tiers `xhigh`
+127/127, `tool_call_parse.fallback_reason` none 129/129, 0 schema mismatches over 148 tool calls. Decode
+(completion >= 200) median 105.8 tok/s. Slots 09-19/09-20: 9 saves, 3 auto-saves, 2 restores from disk
+(92,798 tokens in 2.57 s, 24,726 in 1.50 s), 0 SKIPPED - restore-from-disk is production-verified on this
+build. Caveat: light traffic (129 requests, 09-17 idle). Fast-forward per the 09-07 convention
+(`git merge --ff-only`, `ninfer-recon` detached, `recon/catchup-20260912` deleted); the push deletes
+`fork/fix/d1-planner-search-budget`.
 
 Deliberately NOT taken: nothing dropped this time. Upstream PR #211 (the stream-ordered
 membership publish we carry as `e565fe50`) was closed unmerged by its author on 09-10 and master
@@ -231,7 +253,7 @@ Counts vs `rtx4090-port` `1bd56c9a`. Upstream +93 (taken above). The rest, ranke
 
 ### Recommended order after this catch-up
 
-1. Deploy + soak catch-up #3 (this branch), ff `rtx4090-port`, delete the D1b branches.
+1. DONE 2026-09-20: catch-up #3 deployed, soaked and fast-forwarded; `fork/fix/d1-planner-search-budget` goes with the push.
 2. soohl INT8 dense prefill: kernel-bench + temp-0 quality gate on the 4090.
 3. gzenz `3c0b4dc5` + `a8cdc1a6` tool-call robustness.
 4. UDP structured-JSON design port (TEB `response_format`).
