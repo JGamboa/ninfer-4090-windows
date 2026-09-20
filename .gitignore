@@ -1,0 +1,72 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+*.o
+*.obj
+*.so
+*.a
+compile_commands.json
+CMakeUserPresets.json
+.cache/
+
+# CUDA / profiling artifacts
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Python tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.venv-*/
+venv/
+*.egg-info/
+
+# Weight artifacts (large; produced by offline tooling)
+*.qus
+*.bin
+*.safetensors
+*.gguf
+*.ninfer
+*.ninfer.conversion.json
+/models/
+out/
+models/
+vcpkg_installed/
+
+# Local workspace and transient runtime output
+/.local/
+/temp/
+/temp-*/
+/tmp/
+/tmp-*/
+/AGENTS.override.md
+/logs/
+*.log
+*.tmp
+/core
+/core.*
+
+# Measurement raw corpora & intermediates (large; produced by offline tooling).
+# The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.
+tools/freq_corpus/fixtures/*
+!tools/freq_corpus/fixtures/ranking/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+profiles/
+.chatgpt/
+benchmark_results/
+
+# Local release products. Keep the publishing guide, upload archives as GitHub Release assets.
+dist/*
+!dist/README.md
+
+# Claude Code personal/local settings (may contain API tokens)
+.claude/settings.local.json
