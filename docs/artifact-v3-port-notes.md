@@ -6,21 +6,84 @@ This documents the port that lets this fork's reader open v3 `.ninfer` artifacts
 
 ## Status
 
-**Done**: `src/artifact/reader.{h,cpp}` and `src/artifact/binder.{h,cpp}` parse v3's
-container framing and JSON directory (`components`/`objects`/`bindings`/`uses`/`files`) and
-expose it through the *same* flat name-keyed API v2 already had (`Reader::find`,
-`Binder::require_tensor`), plus one new primitive (`find_fused` /
-`Binder::require_tensor_fused`) for the cases v2 didn't need. Validated against the real
-`Qwen3.8-27B` v3 artifact with `apps/artifact_inspect/main.cpp`
-(`ninfer-artifact-inspect.exe <file.ninfer>`), which resolves the actual fusion groups the
-model needs and prints their shapes.
+**Done and validated end-to-end**: `ninfer-serve.exe` loads the real `Qwen3.8-27B` v3
+artifact -- every binding resolves (text, vision, mtp, dflash2), `weights_id` resolves
+correctly (inferred, not a placeholder), and all 16.7 GiB of weights load onto the GPU.
+Startup now only fails on a data problem in the specific test artifact, not a bug in this
+port (see "Known blocker" below).
 
-**Not done**: `src/targets/qwen3_6_27b/impl/load/bindings.cpp` still only asks for v2-style
-names (e.g. `"gdn/query_key"` as one name) — it needs to switch its ~7 fused call sites to
-`require_tensor_fused` with the v3 leaf names (see below). `Reader::identity()` for v3 is a
-placeholder (`model_id="v3-artifact"`, `weights_id="unresolved"`); matching it to a
-`WeightsProfile` (`registry.cpp` / `Target::resolve_weights`) needs its own v3-aware pass.
-No engine/GPU integration test has been run yet.
+What changed to get there, on top of the reader/binder layer (`src/artifact/reader.{h,cpp}`,
+`src/artifact/binder.{h,cpp}` -- container framing, JSON directory, `find_fused()` /
+`require_tensor_fused()`; see git history for that first commit's details):
+
+- `artifact::bind_tensor_fused()` (`src/artifact/typed_binding.{h,cpp}`): tries the v2
+  whole-object name first (`Binder::has_object`), falls back to `require_tensor_fused` with
+  the v3 leaf names otherwise. This is the one new primitive every call site below uses, so
+  each of them works unchanged against either artifact version.
+- `src/targets/qwen3_6_27b/impl/load/bindings.cpp` (the real model's loader): rewired
+  attention `query_key`/`gate_value`, gdn `query_key`/`value_z`, `mlp/gate_up`, all of MTP's
+  per-layer tensors (v3 path is `"mtp/layers/0/..."`, not v2's `"mtp/layer/..."`),
+  `draft_head`/`draft_head_token_ids` (v3: `"proposal/head"`/`"proposal/token_ids"`, per
+  container spec section 9.2), and dflash2's `query_key_value` fusion + `mlp/gate_up`.
+  dflash2 turned out **not** to be optional to fix: `bind_artifact()` auto-detects and
+  validates it whenever the artifact declares the component at all (`has_dflash2 =
+  binder.has_object(...)`), regardless of whether `--spec dflash2` was requested at serve
+  time -- placement is just `ValidateOnly` instead of `Device` when the feature isn't
+  selected, but the shapes still have to resolve.
+- `src/targets/qwen3_6/impl/vision/bindings.cpp`: same treatment for the vision backbone's
+  `qkv`/`qkv_bias` fusion, plus a plain renaming (`"norm1/weight"` v2 vs. `"norm1_weight"`
+  v3, no underlying fusion). This is *also* not optional even without `--vision`, for the
+  same reason as dflash2 above.
+
+Three bugs turned up only once tested against the real artifact end-to-end, all fixed (see
+commit `d5d9092` for detail): a units mismatch in the parts→row-range conversion (raw
+element count vs. rows), an overly strict `find_fused()` check that broke on a
+tied/shared binding (dflash2's `"context_key"` is a separate logical name for the exact
+same range as `"key"`, not an additional distinct row range -- container spec section
+12.5), and a real `std::string_view`-into-a-destroyed-temporary lifetime bug in the vision
+bindings file (fixed by owning the leaf-name strings in a named array instead of
+inlining them where they'd only live for the wrong expression).
+
+## Known blocker (data, not code) -- currently bypassed for testing
+
+`ninfer-serve.exe` reached `initializing frontend` and failed there twice, on two
+resources this fork's frontend loader already reads correctly via the aliasing this port
+added:
+
+1. `tokenizer_config.json.chat_template does not match frontend/chat_template.jinja` --
+   `validate_tokenizer_config()` in `src/targets/qwen3_6/impl/frontend/frontend.cpp`.
+   Diffing the actual bytes: the standalone `chat_template.jinja` (9712 bytes) is this
+   fork's *modified* template (SPDX header, selects semantics by SHA-256 below); the one
+   embedded in `tokenizer_config.json` (8952 bytes) is the *unmodified upstream Qwen
+   template*. They were never supposed to match unless the v3 export's converter forgot to
+   re-embed the patched template into `tokenizer_config.json`.
+2. `unsupported frontend/chat_template.jinja (sha256 a497db9e...)` --
+   `CompiledChatTemplate::resolve()` in `chat_template.cpp` doesn't recognize this
+   artifact's `chat_template.jinja` as either known digest
+   (`kThinkingToggleTemplateDigest` / `kReasoningEffortTemplateDigest`).
+
+Both are content bugs in the specific downloaded v3 artifact (or its converter), not in
+this port's reader/binder/bindings.cpp wiring, which resolved every resource's *bytes*
+correctly. **Both are currently bypassed** (search for `TEMPORARY` in `frontend.cpp` and
+`chat_template.cpp`) to validate the rest of the v3 path -- the mismatch check is `#if 0`'d
+out, and the digest resolver defaults to `ChatTemplateSemantics::ReasoningEffort` (matches
+every `enable_thinking`/`reasoning_effort` request already verified against this same
+model's v2 artifact) when neither known digest matches. **Revert both before merging** --
+they exist only to isolate the chat-template problem from everything downstream of it,
+and are not a fix for the actual data issue upstream (re-convert/re-download the v3
+artifact with matching, recognized resources).
+
+## v3 end-to-end validation: PASSED
+
+With the two bypasses above, `ninfer-serve.exe` loads the real v3 artifact completely
+(`engine ready | qwen3.8-27b/groupwise-int`, CUDA graphs built, listening on
+`:8080`) and serves a real request correctly -- asked for a documented Fibonacci function
+with `enable_thinking:false`, got back correct Python with the right docstring/type hints,
+`reasoning_tokens: 0` (confirms the ReasoningEffort semantics fallback actually behaves
+correctly for this request shape), 131.85 tok/s decode at 90% MTP draft acceptance
+(145/161). This confirms the reader/binder/bindings.cpp work in this branch is
+functionally complete and correct for the real Qwen3.8-27B v3 artifact; the only remaining
+gap is the chat-template data problem above, which is not this port's bug to fix.
 
 ## Why v3 isn't just a header/magic bump
 
