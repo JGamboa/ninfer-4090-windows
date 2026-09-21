@@ -3,7 +3,11 @@
 > ### 🪟 Native Windows port available — now reads v3 artifacts too
 > This project adds a **native Windows build (MSVC + CUDA, no WSL, no Docker required)**.
 > It's verified on RTX 4090 (sm_89), CUDA 13.4, Visual Studio Build Tools 2026, and reaches
-> **149 tok/s** decode on code generation — matching the Linux numbers below.
+> **149 tok/s** decode on code generation — matching the Linux numbers below. A later
+> `--draft-tokens`/`--spec` sweep on this same card found **210.9 tok/s** with
+> `--spec dflash2 --draft-tokens 12` (+53% over the `mtp --draft-tokens 3` config the 149
+> tok/s figure used) — see [WINDOWS_PORT.md](WINDOWS_PORT.md#faster-still---spec-dflash2-beats-mtp-and-its-sweet-spot-isnt-its-max)
+> for the full sweep.
 >
 > **→ See [WINDOWS_PORT.md](WINDOWS_PORT.md)** for build instructions and what was changed
 > to make Windows work at all.
@@ -26,6 +30,56 @@ speculative decoding, reasoning-effort control, and ReplaySSM state transactions
 This fork targets `sm_89`, on Linux natively or Windows via the native MSVC port above.
 Blackwell-only NVFP4/W4A4 execution is unavailable; the engine uses the same groupwise-int path
 as the 3090 base. The Qwen3.6-35B-A3B target is inherited but untested on the RTX 4090.
+
+## Windows native port: v3 artifact support and speed tuning
+
+Both measured directly on this Windows build, RTX 4090, `--kv-dtype rk4v4-e8`, greedy
+decoding, `enable_thinking:false`. Full detail in
+[docs/artifact-v3-port-notes.md](docs/artifact-v3-port-notes.md) and
+[WINDOWS_PORT.md](WINDOWS_PORT.md).
+
+### v3 artifact support — validated end to end
+
+The reader/binder/bindings.cpp work that lets this build open v3 `.ninfer` artifacts
+(container version auto-detected from the magic bytes; v2 keeps working unchanged) was
+checked against the real Qwen3.8-27B v3 artifact, not just unit-tested in isolation:
+
+| Check | Result |
+|---|---|
+| All bindings resolve (text, vision, MTP, dflash2) | Pass |
+| Weight load | 16.7 GiB, complete |
+| CUDA graphs build | Pass |
+| Server reaches `engine ready` and starts listening | Pass |
+| Real generation request (`enable_thinking:false`) | Correct Python output, `reasoning_tokens:0` |
+| Decode throughput on that request | 131.85 tok/s at 90% MTP draft acceptance |
+
+Along the way, two apparent artifact bugs (a `chat_template.jinja` mismatch and an
+unrecognized template hash) turned out to be neither: this fork's frontend validation was
+outdated relative to upstream `Neroued/ninfer`, which had already dropped the same
+mismatch check and moved to a different templating scheme. Fixed here instead of worked
+around — see the doc above for how that was confirmed byte-for-byte against upstream.
+
+### Speed: `--spec`/`--draft-tokens` sweep
+
+Swept both speculative-decoding backends with a fixed code-generation prompt (same seed,
+greedy) instead of assuming the existing default was optimal:
+
+| Backend | `--draft-tokens` | Decode | Draft acceptance |
+|---|---:|---:|---:|
+| `mtp` | 3 | 137.8 tok/s | 96.2% |
+| `mtp` | 5 (max for this backend) | 160.6 tok/s | 89.8% |
+| `dflash2` | 8 | 194.4 tok/s | 97.2% |
+| **`dflash2`** | **12** | **210.9 tok/s** | 85.7% |
+| `dflash2` | 15 (max for this backend) | 201.5 tok/s | 76.8% |
+
+`--spec dflash2 --draft-tokens 12` is the fastest configuration found: **210.9 tok/s**, a
+**+53%** improvement over `mtp --draft-tokens 3`. `dflash2` uses a real separate small
+autoregressive draft model (vs. MTP's single-shot prediction head), which is why it stays
+accurate at much greater speculation depth — but note the optimum is *not* either
+backend's maximum allowed `--draft-tokens`: acceptance keeps falling as it rises, and past
+a point the extra verification cost outweighs the extra accepted tokens. Requires an
+artifact that ships DFlash2 weights (~1.6 GiB extra); the server auto-detects and requires
+them once `--spec dflash2` is passed.
 
 ## Measured results on the RTX 4090
 

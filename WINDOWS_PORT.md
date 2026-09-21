@@ -149,3 +149,27 @@ For maximum decode speed on code, send requests with thinking disabled
 (`"enable_thinking": false` / `"reasoning_effort": "none"` on the OpenAI route): MTP
 acceptance rises to ~98% and decode reaches ~149 tok/s. For the full native 262K context
 on 24 GB, use `--kv-dtype rk4v4-e8`.
+
+### Faster still: `--spec dflash2` beats MTP, and its sweet spot isn't its max
+
+Swept `--draft-tokens` on this RTX 4090 with a fixed code-generation prompt
+(`enable_thinking:false`, greedy, same seed) to find the actual optimum instead of
+guessing. `--spec mtp` accepts `--draft-tokens` in `[1,5]`; `--spec dflash2` (a real,
+separate small autoregressive draft model — not a single-shot head like MTP, so it can
+speculate deeper before its accuracy collapses) accepts `[1,15]`:
+
+| Backend | draft-tokens | Decode | MTP/DFlash acceptance |
+|---|---:|---:|---:|
+| mtp | 3 (this doc's old default) | 137.8 tok/s | 96.2% |
+| mtp | 5 (max) | 160.6 tok/s | 89.8% |
+| dflash2 | 8 | 194.4 tok/s | 97.2% |
+| **dflash2** | **12** | **210.9 tok/s** | 85.7% |
+| dflash2 | 15 (max) | 201.5 tok/s | 76.8% |
+
+**`--spec dflash2 --draft-tokens 12` is the fastest configuration found — 210.9 tok/s,
++53% over this doc's previous `mtp --draft-tokens 3` default.** Note the optimum is *not*
+the maximum allowed value for either backend: acceptance keeps falling as draft-tokens
+rises, and past a point the extra verification cost outweighs the extra accepted tokens
+(dflash2 peaks at 12, then drops back down by 15). Requires the artifact to actually ship
+DFlash2 weights (adds ~1.6 GiB to the load); the server auto-detects and requires them
+when `--spec dflash2` is passed.
