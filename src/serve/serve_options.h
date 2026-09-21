@@ -22,10 +22,11 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
+    std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
-    std::optional<std::string> model_id_override; // unset => artifact identity.model_id
+    std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::string slot_save_path;        // empty => /slots save/restore/erase disabled
     std::uint32_t max_context          = 8192;
@@ -61,9 +62,8 @@ struct ServeOptions {
     std::uint32_t vision_max_tokens = 8192;
     bool use_cuda_graph             = true;
     bool allow_prefix_reuse = true;
-    bool enable_thinking =
-        true; // default thinking mode for the generation prompt (--no-thinking opts out)
-    bool preserve_thinking = false;
+    std::optional<bool> enable_thinking;
+    std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
@@ -88,7 +88,7 @@ ServeOptions parse_serve_options(int argc, char** argv);
 std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
                                                 const ContextCacheOptions& resolved);
 std::string resolve_public_model_id(const ServeOptions& options,
-                                    std::string_view artifact_model_id);
+                                    std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
 
 } // namespace ninfer::serve

@@ -1,6 +1,7 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
@@ -23,11 +24,36 @@ namespace {
 
 } // namespace
 
-void launch_nvfp4_w4a4_quantize(const Tensor&, const Weight&, Nvfp4W4a4Workspace, cudaStream_t) {
+void launch_nvfp4_w4a4_quantize(const Tensor&, const Weight&, Nvfp4W4a4Workspace,
+                                Nvfp4ScaleLayout, cudaStream_t) {
     reject_nvfp4_a4();
 }
 
-void launch_nvfp4_w4a4(const Tensor&, const Weight&, Tensor&, Nvfp4W4a4Workspace, cudaStream_t) {
+// The A4 TMA GEMMs live in the sm_120a-only non-RDC archive. The per-shape A4 routes in
+// ops/linear/nvfp4/shapes reference the linear launcher from translation units that stay in
+// this build, so all four launchers are stubbed here.
+void launch_nvfp4_w4a4_tma_linear(Nvfp4GeometryId, const std::uint8_t*, const std::uint8_t*,
+                                  const std::uint8_t*, const std::uint8_t*, __nv_bfloat16*,
+                                  std::int32_t, float, cudaStream_t) {
+    reject_nvfp4_a4();
+}
+
+void launch_nvfp4_w4a4_tma_attention(const std::uint8_t*, const std::uint8_t*,
+                                     const std::uint8_t*, const std::uint8_t*, __nv_bfloat16*,
+                                     __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+                                     std::int32_t, float, cudaStream_t) {
+    reject_nvfp4_a4();
+}
+
+void launch_nvfp4_w4a4_tma_gdn(const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
+                               const std::uint8_t*, __nv_bfloat16*, __nv_bfloat16*, std::int32_t,
+                               float, cudaStream_t) {
+    reject_nvfp4_a4();
+}
+
+void launch_nvfp4_w4a4_tma_linear_add(Nvfp4GeometryId, const std::uint8_t*, const std::uint8_t*,
+                                      const std::uint8_t*, const std::uint8_t*, __nv_bfloat16*,
+                                      std::int32_t, float, cudaStream_t) {
     reject_nvfp4_a4();
 }
 

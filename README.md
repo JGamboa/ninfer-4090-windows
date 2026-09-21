@@ -7,9 +7,9 @@ The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and
 Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP
 speculative decoding, reasoning-effort control, and ReplaySSM state transactions.
 
-This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
-engine uses the same groupwise-int path as the 3090 base. The Windows path and the
-Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
+This fork targets `sm_89`. Blackwell-only NVFP4/W4A4 execution is unavailable; the
+engine uses the same groupwise-int path as the 3090 base. The Qwen3.6-35B-A3B target is
+inherited but untested on the RTX 4090.
 
 ## Measured results on the RTX 4090
 
@@ -248,6 +248,29 @@ For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
 GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
+Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
+the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
+Python 3 interpreter. Both presets use `build/` and explicitly reset the build options.
+Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`. See
+[build organization and configuration](docs/maintainer/build-system.md) for details.
+
+There is no install target or packaged binary distribution; run NInfer from its source build tree.
+Python tools run independently of CMake; the standalone HBM probe has its own
+[build command](tools/README.md#standalone-hbm-probe).
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [CLI](docs/cli.md)
+- [HTTP serving](docs/serving.md)
+- [Performance](docs/performance.md)
+- [Perplexity evaluation](docs/perplexity.md)
+- [Weight conversion and custom recipes](docs/weight-conversion.md)
+- [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
+- [Serve TTFT benchmark](tools/bench/ttft/)
+- [CLI examples](examples/cli/)
+- [Contributing](CONTRIBUTING.md)
+
 ## What this fork changes
 
 - **`sm_89` retarget.** The CMake architecture pin, the runtime compute-capability check, and the
@@ -379,6 +402,14 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 - The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
   no multi-GPU execution, no weight offload.
 
+The product boundary stays intentionally small: one RTX 4090 and one resident model per Engine;
+a startup-fixed capacity of one to eight active requests with bounded FIFO ingress; no request
+preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or distributed
+serving; one shared startup-fixed KV pool across active requests and retained prefixes; model
+architectures and format/shape combinations use explicitly implemented native paths; parsed tool
+calls are returned to the client, and NInfer does not execute tools; and the in-tree C++ headers
+are not distributed as an installed SDK.
+
 ## Artifact
 
 | Model | Artifact | Size |
@@ -387,6 +418,14 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
 The artifact is architecture-independent; the model card's RTX 5090 requirement describes the
 upstream engine, not the file. Verify the download against the SHA-256 published on the card.
+
+The v3 `.ninfer` container carries model configuration, encoded weights, logical bindings and
+frontend resources; the engine loads those facts against the implemented model and Op
+capabilities. You can also [convert your own weights](docs/weight-conversion.md), reuse an
+official recipe, or choose another supported mixture of formats. The engine requires v3
+artifacts; existing official v2 downloads can be
+[upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact) without downloading
+the weights again.
 
 ## Reasoning effort
 

@@ -95,8 +95,8 @@ struct PreparedRequest {
     int prompt_tokens    = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
-    std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
-    bool preserve_thinking = false;
+    std::optional<ninfer::ReasoningEffort> reasoning_effort;
+    std::optional<bool> preserve_thinking;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
@@ -199,7 +199,6 @@ private:
     std::shared_ptr<spdlog::logger> logger_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::uint32_t automatic_private_anchors_ = 0;
-    ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };
 

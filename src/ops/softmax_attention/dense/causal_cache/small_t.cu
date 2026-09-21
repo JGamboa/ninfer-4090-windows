@@ -61,12 +61,14 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         constexpr std::int32_t kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
         return div_up(window, kKeysPerSplit);
     }
-    // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
-    // one 170-SM wave after accounting for the geometry's KV-head count.
+    // Bc=64 is one CTA/SM on these model shapes and the grid is (KVHeads, splits, batch), so
+    // keep the 8K grid at or below one wave of the build's target device (see core/device.h).
+    // This mirrors causal_small_t_active_splits() in small_t.cuh exactly and therefore reads
+    // the same compile-time SM count -- the two must agree bit-for-bit.
     if (kv_storage_is_int8_family(storage) && tokens >= 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
-        constexpr std::int32_t kMax = 42 * Geometry::SmallTSplitScale;
+        constexpr std::int32_t kMax = kTargetSmCount / Geometry::KVHeads;
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }

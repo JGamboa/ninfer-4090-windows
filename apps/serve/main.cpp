@@ -113,13 +113,12 @@ void log_engine_capacity(const std::shared_ptr<spdlog::logger>& logger,
                  *cache.max_private_continuations, *cache.max_shared_prefixes,
                  *cache.max_long_anchors_per_continuation, service.automatic_private_anchors());
     logger->info(
-        "engine context_cost transfer_source={} prefill_source={} hardware_class={} model_id={} "
-        "weights_id={}",
+        "engine context_cost transfer_source={} prefill_source={} hardware_class={} "
+        "prefill_signature={}",
         ninfer::context_cost_preset_source_name(context_cost.transfer_source),
         ninfer::context_cost_preset_source_name(context_cost.prefill_source),
         quote_log_value(context_cost.hardware_class),
-        quote_log_value(context_cost.model_id),
-        quote_log_value(context_cost.weights_id));
+        quote_log_value(context_cost.prefill_signature));
     if (options.enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();
         logger->info(

@@ -11,6 +11,22 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+// Streaming-multiprocessor count of the device this process runs on, queried once and
+// cached. Launch geometry that deliberately fills exactly one resident wave reads the count
+// from here instead of a hardcoded literal -- several launchers used to assume 170 SMs
+// (the upstream RTX 5090 target), which on this fork's RTX 4090 (128 SMs) leaves a
+// straggler wave running at a fraction of the GPU's width. The product runs one resident
+// model on one device, so a single cached query is the whole device set.
+int device_sm_count();
+
+// Compile-time mirror of device_sm_count() for the architecture this build targets.
+// __device__ launch policies cannot query the runtime, and the host launcher that must
+// reproduce such a policy exactly has to agree with it at compile time; those two sites use
+// this constant, every other site uses device_sm_count(). The top-level CMakeLists.txt
+// enforces CMAKE_CUDA_ARCHITECTURES=89, so unlike upstream forks that also target sm_86,
+// this is just one literal, not an architecture switch.
+inline constexpr int kTargetSmCount = 128; // NVIDIA GeForce RTX 4090 (sm_89)
+
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
 // capacity. DeviceContext remains the owner and authoritative source of both values.
 struct DeviceExecutionView {

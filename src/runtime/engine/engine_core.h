@@ -5,12 +5,13 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
-#include "runtime/contract/types.h"
+#include "runtime/contract/execution.h"
+#include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
-#include "runtime/engine/resource_manager.h"
+#include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
-#include "runtime/generation/generation_budget.h"
-#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h"
+#include "runtime/engine/generation_budget.h"
+#include "models/qwen3_5/program/program.h"
 
 #include <algorithm>
 #include <functional>
@@ -42,17 +43,17 @@ template <class Instance>
 class EngineCore {
 
 public:
-    using Package            = typename Instance::Package;
-    using Program            = typename Package::Program;
-    using BasePlan           = typename Package::RequestBasePlan;
-    using Plan               = typename Package::AdmissionCandidate;
-    using SequenceHandle     = typename Package::SequenceHandle;
-    using CaptureOffer       = typename Package::CaptureOffer;
-    using PendingBatch       = typename Package::PendingBatch;
-    using PreparedPrompt     = typename Package::PreparedPrompt;
-    using OutputSession      = typename Package::OutputSession;
-    using PublishedOutput    = typename Package::PublishedOutput;
-    using Request            = RequestRecord<Package>;
+    using ModelContract      = typename Instance::ModelContract;
+    using Program            = typename ModelContract::Program;
+    using BasePlan           = typename ModelContract::RequestBasePlan;
+    using Plan               = typename ModelContract::AdmissionCandidate;
+    using SequenceHandle     = typename ModelContract::SequenceHandle;
+    using CaptureOffer       = typename ModelContract::CaptureOffer;
+    using PendingBatch       = typename ModelContract::PendingBatch;
+    using PreparedPrompt     = typename ModelContract::PreparedPrompt;
+    using OutputSession      = typename ModelContract::OutputSession;
+    using PublishedOutput    = typename ModelContract::PublishedOutput;
+    using Request            = RequestRecord<ModelContract>;
     using Scheduling         = Scheduler<Request>;
     using FifoSnapshot       = typename Scheduling::FifoSnapshot;
     using RoundMembership    = typename Scheduling::RoundMembership;
@@ -60,7 +61,7 @@ public:
     using ActiveAdmissionSet = typename Scheduling::ActiveAdmissionSet;
     using ExecutionAction    = typename Scheduling::ExecutionAction;
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
-    using ResourceManagement = ResourceManager<Package>;
+    using ResourceManagement = ResourceManager<ModelContract>;
     using ResourceInspection = typename ResourceManagement::Inspection;
     using Clock              = std::chrono::steady_clock;
 
@@ -217,7 +218,7 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            auto output = instance_.loaded->frontend.make_output_session(
+            auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking);
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
@@ -305,7 +306,7 @@ public:
     // session back (see spill_catalog_slot). The binding lives exactly as long as the catalog
     // entry that owns it - the resource manager's slot-release observer clears it - so it can
     // never outlive its session and be applied to the next one.
-    [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
+    [[nodiscard]] models::qwen3_5::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t slot, std::string_view model_binding,
                        std::string_view expected_digest, std::string_view session_path = {}) {
         std::scoped_lock lock(execution_mutex_);
@@ -400,7 +401,7 @@ public:
     // that receives (path, snapshot) for each spilled session and writes the file off-thread.
     void set_eviction_sink(
         std::string model_binding,
-        std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink) {
+        std::function<void(std::string, models::qwen3_5::RetainedSessionSnapshot&&)> sink) {
         std::scoped_lock lock(execution_mutex_);
         eviction_model_binding_ = std::move(model_binding);
         eviction_sink_          = std::move(sink);
@@ -441,7 +442,7 @@ private:
     // on the Engine's writer thread through the sink. Only sessions bound to a slot file are
     // spilled, and a spill failure never blocks the eviction itself.
     void spill_catalog_slot(std::uint32_t slot,
-                            const typename Package::ContinuationHandle& handle) noexcept {
+                            const models::qwen3_5::ContinuationHandle& handle) noexcept {
         if (!eviction_sink_ || slot >= slot_session_paths_.size() ||
             slot_session_paths_[slot].empty()) {
             return;
@@ -742,7 +743,7 @@ private:
         {
             // Session save/restore copies run outside the context-cache transactions, so the
             // populated transfer stats cannot see them; add the Program's snapshot counters.
-            const targets::qwen3_6::SessionSnapshotTraffic traffic =
+            const models::qwen3_5::SessionSnapshotTraffic traffic =
                 instance_.program->session_snapshot_traffic();
             snapshot.main_kv_d2h_pages += traffic.main_kv_d2h_pages;
             snapshot.main_kv_h2d_pages += traffic.main_kv_h2d_pages;
@@ -1440,7 +1441,7 @@ private:
             std::rethrow_exception(error);
         }
 
-        std::optional<typename Package::CommitResult> committed_storage;
+        std::optional<typename ModelContract::CommitResult> committed_storage;
         try {
             phase.pause_range();
             ProgramCallScope program_call(*this);
@@ -1610,7 +1611,7 @@ private:
 
     void
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
-                             typename Package::PrefillProgress&& progress,
+                             typename ModelContract::PrefillProgress&& progress,
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         ++cumulative_stats_.host_work.prefill_units;
@@ -2357,7 +2358,7 @@ private:
     // Auto-save sink installed by the Engine when auto_save_evicted is on; the writer thread
     // that drains it lives in Engine::Impl. Guarded by execution_mutex_.
     std::string eviction_model_binding_;
-    std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> eviction_sink_;
+    std::function<void(std::string, models::qwen3_5::RetainedSessionSnapshot&&)> eviction_sink_;
     // Fork-local session persistence, guarded by execution_mutex_: the session file each slot
     // is bound to (spill target on eviction) and the digest/checkpoint cache that keeps stats
     // publication from hashing a deep ledger every unit.

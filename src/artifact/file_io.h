@@ -1,0 +1,39 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <span>
+
+namespace ninfer::artifact {
+
+// Direct reads require aligned offsets and buffers. A short final direct block is allowed;
+// read_exact always requires the complete requested byte range.
+class InputFile {
+public:
+    explicit InputFile(std::filesystem::path path);
+    ~InputFile();
+    InputFile(const InputFile&)            = delete;
+    InputFile& operator=(const InputFile&) = delete;
+
+    [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
+
+    void read_exact(std::uint64_t offset, std::span<std::byte> destination) const;
+    [[nodiscard]] std::size_t read_direct(std::uint64_t offset,
+                                          std::span<std::byte> destination) const;
+
+private:
+    std::filesystem::path path_;
+#ifdef _WIN32
+    // Real type is HANDLE (== void*); kept as void* here so this header does not need
+    // <windows.h>. nullptr means "not open"; a Win32 HANDLE is never nullptr on success.
+    void* handle_                = nullptr;
+    mutable void* direct_handle_ = nullptr;
+#else
+    int fd_                = -1;
+    mutable int direct_fd_ = -1;
+#endif
+    std::uint64_t bytes_ = 0;
+};
+
+} // namespace ninfer::artifact

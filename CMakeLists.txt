@@ -15,7 +15,7 @@ endif()
 project(ninfer LANGUAGES C CXX CUDA)
 
 # --- Global settings ---------------------------------------------------------
-option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
+option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
@@ -26,9 +26,13 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  # /utf-8: the bundled fmt inside third_party/spdlog static_asserts on it, and every TU that
+  # includes spdlog's formatting headers inherits that requirement.
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options(/NODEFAULTLIB:LIBCMT)
@@ -38,8 +42,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(CMAKE_GENERATOR MATCHES "Ninja")
-  set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1)
-  set(CMAKE_JOB_POOL_LINK cuda_link)
+  set_property(GLOBAL PROPERTY JOB_POOLS ninfer_link=1)
+  set(CMAKE_JOB_POOL_LINK ninfer_link)
 endif()
 
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
@@ -48,19 +52,10 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
     "${CMAKE_CUDA_COMPILER_VERSION}")
 endif()
 
-set(NINFER_BUILD_MEDIA_ACQUIRE OFF)
+# Tests also exercise product input, logging and protocol adapters.
+set(NINFER_BUILD_PRODUCT_SUPPORT OFF)
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  set(NINFER_BUILD_MEDIA_ACQUIRE ON)
-endif()
-
-set(NINFER_BUILD_PROMPT_INPUT OFF)
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  set(NINFER_BUILD_PROMPT_INPUT ON)
-endif()
-
-set(NINFER_BUILD_SERVE OFF)
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  set(NINFER_BUILD_SERVE ON)
+  set(NINFER_BUILD_PRODUCT_SUPPORT ON)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
@@ -76,7 +71,9 @@ if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
   target_link_directories(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARY_DIRS})
   target_link_libraries(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARIES})
   set(NINFER_FFMPEG_TARGET ninfer_ffmpeg_dependencies)
-  if(NINFER_BUILD_MEDIA_ACQUIRE)
+  if(NINFER_BUILD_PRODUCT_SUPPORT)
+    # Media acquisition uses CURLOPT_PROTOCOLS_STR and CURLOPT_REDIR_PROTOCOLS_STR,
+    # introduced in libcurl 7.85 (not merely the version of the maintainer environment).
     find_package(CURL 7.85 REQUIRED)
     set(NINFER_CURL_TARGET CURL::libcurl)
   endif()
@@ -85,18 +82,31 @@ else()
   pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
   set(NINFER_FFMPEG_TARGET PkgConfig::FFMPEG)
-  if(NINFER_BUILD_MEDIA_ACQUIRE)
+  if(NINFER_BUILD_PRODUCT_SUPPORT)
     pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
     set(NINFER_CURL_TARGET PkgConfig::LIBCURL)
   endif()
 endif()
 find_package(Threads REQUIRED)
 
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
+# Repository-pinned header dependencies. No configure-time downloads.
+add_library(ninfer::json INTERFACE IMPORTED GLOBAL)
+target_include_directories(ninfer::json INTERFACE
+  ${PROJECT_SOURCE_DIR}/third_party)
+
+# Source base for the custom-template frontend; consumers will link it explicitly.
+add_subdirectory(third_party/llama-jinja EXCLUDE_FROM_ALL)
+
+if(NINFER_BUILD_PRODUCT_SUPPORT)
+  add_library(ninfer::httplib INTERFACE IMPORTED GLOBAL)
+  target_include_directories(ninfer::httplib INTERFACE
+    ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   # Product operational logging is an offline, repository-pinned dependency. Core-only builds do
   # not configure or link it.
   add_subdirectory(third_party/spdlog)
 endif()
+
+include(cmake/NinferTargets.cmake)
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
