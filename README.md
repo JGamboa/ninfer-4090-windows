@@ -1,5 +1,13 @@
 # NInfer-4090
 
+> ### 🪟 Native Windows port available
+> This branch (`winport-v2`) adds a **native Windows build (MSVC + CUDA, no WSL, no Docker
+> required)**. It's verified on RTX 4090 (sm_89), CUDA 13.4, Visual Studio Build Tools 2026, and
+> reaches **149 tok/s** decode on code generation — matching the Linux numbers below.
+>
+> **→ See [WINDOWS_PORT.md](WINDOWS_PORT.md) for build instructions, what was changed to make it
+> work, and the important note about needing a v2 (not v3) `.ninfer` artifact.**
+
 NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an `sm_89` port of
 [NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
 [Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine.
@@ -7,9 +15,9 @@ The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and
 Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP
 speculative decoding, reasoning-effort control, and ReplaySSM state transactions.
 
-This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
-engine uses the same groupwise-int path as the 3090 base. The Windows path and the
-Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
+This fork targets `sm_89`, on Linux natively or Windows via the native MSVC port above.
+Blackwell-only NVFP4/W4A4 execution is unavailable; the engine uses the same groupwise-int path
+as the 3090 base. The Qwen3.6-35B-A3B target is inherited but untested on the RTX 4090.
 
 ## Measured results on the RTX 4090
 
