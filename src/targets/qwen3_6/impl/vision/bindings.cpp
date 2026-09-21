@@ -3,9 +3,11 @@
 #include "artifact/materializer.h"
 #include "artifact/typed_binding.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -17,6 +19,15 @@ VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
     const auto bind = [&](std::string_view name, NumericFormat format,
                           std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, placement);
+    };
+    // v2 stores the QKV weight/bias as one fused object per layer; a v3 artifact instead
+    // gives each of query/key/value its own binding into that same shared object (see
+    // docs/artifact-v3-port-notes.md). bind_tensor_fused reconstructs the fused tensor from
+    // either representation.
+    const auto bind_fused = [&](std::string_view v2_name,
+                                std::span<const std::string_view> v3_leaf_names,
+                                NumericFormat format, std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor_fused(binder, v2_name, v3_leaf_names, format, shape, placement);
     };
 
     VisionBackbonePlan out;
@@ -31,10 +42,22 @@ VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
     for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
         VisionLayerPlan& target  = out.layers[layer];
         const std::string prefix = "vision/layers/" + std::to_string(layer) + "/";
-        target.qkv               = bind(prefix + "attention/qkv", NumericFormat::Q4G64_F16S,
-                                        {3 * VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
-        target.qkv_bias          = bind(prefix + "attention/qkv_bias", NumericFormat::BF16,
-                                        {3 * VisionBackboneConfig::hidden});
+        // Own the leaf name strings in this scope (not just string_views into temporaries):
+        // qkv_leaves/qkv_bias_leaves outlive the initializing expression, so they must view
+        // storage that does too.
+        const std::array<std::string, 3> qkv_leaf_names = {
+            prefix + "attention/query", prefix + "attention/key", prefix + "attention/value"};
+        const std::array<std::string_view, 3> qkv_leaves = {qkv_leaf_names[0], qkv_leaf_names[1],
+                                                             qkv_leaf_names[2]};
+        const std::array<std::string, 3> qkv_bias_leaf_names = {prefix + "attention/query_bias",
+                                                                 prefix + "attention/key_bias",
+                                                                 prefix + "attention/value_bias"};
+        const std::array<std::string_view, 3> qkv_bias_leaves = {
+            qkv_bias_leaf_names[0], qkv_bias_leaf_names[1], qkv_bias_leaf_names[2]};
+        target.qkv      = bind_fused(prefix + "attention/qkv", qkv_leaves, NumericFormat::Q4G64_F16S,
+                                     {3 * VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
+        target.qkv_bias = bind_fused(prefix + "attention/qkv_bias", qkv_bias_leaves,
+                                     NumericFormat::BF16, {3 * VisionBackboneConfig::hidden});
         target.output            = bind(prefix + "attention/output", NumericFormat::Q5G64_F16S,
                                         {VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
         target.output_bias       = bind(prefix + "attention/output_bias", NumericFormat::BF16,
@@ -47,14 +70,26 @@ VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
                                         {VisionBackboneConfig::hidden, VisionBackboneConfig::intermediate});
         target.fc2_bias =
             bind(prefix + "mlp/fc2_bias", NumericFormat::BF16, {VisionBackboneConfig::hidden});
+        // v3 spells these with an underscore ("norm1_weight") instead of v2's nested path
+        // ("norm1/weight").
+        const std::array<std::string, 1> norm1_weight_leaf = {prefix + "norm1_weight"};
+        const std::array<std::string, 1> norm1_bias_leaf   = {prefix + "norm1_bias"};
+        const std::array<std::string, 1> norm2_weight_leaf = {prefix + "norm2_weight"};
+        const std::array<std::string, 1> norm2_bias_leaf   = {prefix + "norm2_bias"};
         target.norm1_weight =
-            bind(prefix + "norm1/weight", NumericFormat::BF16, {VisionBackboneConfig::hidden});
-        target.norm1_bias =
-            bind(prefix + "norm1/bias", NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            bind_fused(prefix + "norm1/weight",
+                      std::array<std::string_view, 1>{norm1_weight_leaf[0]}, NumericFormat::BF16,
+                      {VisionBackboneConfig::hidden});
+        target.norm1_bias = bind_fused(prefix + "norm1/bias",
+                                       std::array<std::string_view, 1>{norm1_bias_leaf[0]},
+                                       NumericFormat::BF16, {VisionBackboneConfig::hidden});
         target.norm2_weight =
-            bind(prefix + "norm2/weight", NumericFormat::BF16, {VisionBackboneConfig::hidden});
-        target.norm2_bias =
-            bind(prefix + "norm2/bias", NumericFormat::BF16, {VisionBackboneConfig::hidden});
+            bind_fused(prefix + "norm2/weight",
+                      std::array<std::string_view, 1>{norm2_weight_leaf[0]}, NumericFormat::BF16,
+                      {VisionBackboneConfig::hidden});
+        target.norm2_bias = bind_fused(prefix + "norm2/bias",
+                                       std::array<std::string_view, 1>{norm2_bias_leaf[0]},
+                                       NumericFormat::BF16, {VisionBackboneConfig::hidden});
     }
     return out;
 }
@@ -77,15 +112,19 @@ VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder,
 VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,
                                              artifact::TensorPlacement placement) {
     using artifact::NumericFormat;
-    const auto bind = [&](std::string_view name, NumericFormat format,
-                          std::initializer_list<std::uint64_t> shape) {
-        return artifact::bind_tensor(binder, name, format, shape, placement);
+    const auto bind_fused = [&](std::string_view v2_name,
+                                std::span<const std::string_view> v3_leaf_names,
+                                NumericFormat format, std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor_fused(binder, v2_name, v3_leaf_names, format, shape, placement);
     };
+    // v3 spells these "norm_weight"/"norm_bias" instead of v2's "norm/weight"/"norm/bias".
+    static constexpr std::array<std::string_view, 1> kWeightLeaf = {"vision/merger/norm_weight"};
+    static constexpr std::array<std::string_view, 1> kBiasLeaf   = {"vision/merger/norm_bias"};
     return VisionMergerNormPlan{
-        .weight =
-            bind("vision/merger/norm/weight", NumericFormat::BF16, {VisionBackboneConfig::hidden}),
-        .bias =
-            bind("vision/merger/norm/bias", NumericFormat::BF16, {VisionBackboneConfig::hidden}),
+        .weight = bind_fused("vision/merger/norm/weight", kWeightLeaf, NumericFormat::BF16,
+                             {VisionBackboneConfig::hidden}),
+        .bias   = bind_fused("vision/merger/norm/bias", kBiasLeaf, NumericFormat::BF16,
+                             {VisionBackboneConfig::hidden}),
     };
 }
 

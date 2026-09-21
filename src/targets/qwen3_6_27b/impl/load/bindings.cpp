@@ -74,6 +74,26 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
                       .format = format};
 }
 
+// Like bind_weight, but for a tensor that a v2 artifact names as one whole fused object
+// (`v2_name`) while a v3 artifact may split into several logical bindings that jointly
+// cover it (`v3_leaf_names`). See artifact::bind_tensor_fused for how the two are told
+// apart, and docs/artifact-v3-port-notes.md for why this is needed at all (v3's
+// query/key/gate/value-style projections are fused matrices on disk in both artifact
+// versions; only how the fusion is *described* differs).
+WeightPlan bind_weight_fused(artifact::Binder& binder, std::string_view v2_name,
+                             std::initializer_list<std::string_view> v3_leaf_names,
+                             NumericFormat format, std::initializer_list<std::uint64_t> shape,
+                             artifact::TensorPlacement placement = artifact::TensorPlacement::Device) {
+    if (format == NumericFormat::NVFP4) {
+        throw std::logic_error("NVFP4 weight requires a paired input divisor");
+    }
+    return WeightPlan{
+        .object = artifact::bind_tensor_fused(
+            binder, v2_name, std::span<const std::string_view>(v3_leaf_names.begin(), v3_leaf_names.size()),
+            format, shape, placement),
+        .format = format};
+}
+
 WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, std::int32_t rows,
                              std::int32_t columns, std::string_view input_divisor_name) {
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
@@ -223,10 +243,14 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.projection = SplitAttentionProjectionPlan{
-                .query_key  = bind_weight(binder, prefix + "attention/query_key",
-                                          NumericFormat::Q4G64_F16S, {7168, 5120}),
-                .gate_value = bind_weight(binder, prefix + "attention/gate_value",
-                                          NumericFormat::Q5G64_F16S, {7168, 5120}),
+                .query_key = bind_weight_fused(
+                    binder, prefix + "attention/query_key",
+                    {prefix + "attention/query", prefix + "attention/key"}, NumericFormat::Q4G64_F16S,
+                    {7168, 5120}),
+                .gate_value = bind_weight_fused(
+                    binder, prefix + "attention/gate_value",
+                    {prefix + "attention/gate", prefix + "attention/value"}, NumericFormat::Q5G64_F16S,
+                    {7168, 5120}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
@@ -248,10 +272,12 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                             NumericFormat::BF16, {48, 5120}),
             };
             target.gdn.input_projection = SplitGdnInputProjectionPlan{
-                .query_key = bind_weight(binder, prefix + "gdn/query_key",
-                                         NumericFormat::Q4G64_F16S, {4096, 5120}),
-                .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::Q5G64_F16S,
-                                         {12288, 5120}),
+                .query_key = bind_weight_fused(binder, prefix + "gdn/query_key",
+                                               {prefix + "gdn/query", prefix + "gdn/key"},
+                                               NumericFormat::Q4G64_F16S, {4096, 5120}),
+                .value_z   = bind_weight_fused(binder, prefix + "gdn/value_z",
+                                              {prefix + "gdn/value", prefix + "gdn/z"},
+                                              NumericFormat::Q5G64_F16S, {12288, 5120}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
@@ -260,8 +286,9 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        target.mlp.gate_up =
-            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120});
+        target.mlp.gate_up = bind_weight_fused(binder, prefix + "mlp/gate_up",
+                                               {prefix + "mlp/gate", prefix + "mlp/up"},
+                                               NumericFormat::Q4G64_F16S, {34816, 5120});
         target.mlp.down =
             bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {5120, 17408});
     }
@@ -409,8 +436,14 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
         target.attention_conv.kernel_projection =
             bind_weight(binder, prefix + "attention_conv/kernel_projection", NumericFormat::BF16,
                         {1280, 5120}, placement);
-        target.query_key_value = bind_weight(binder, prefix + "attention/query_key_value",
-                                             NumericFormat::W8G32_F16S, {6144, 5120}, placement);
+        // v3 also exposes "attention/context_key"/"context_value" bindings into this same
+        // object, at the exact same ranges as "key"/"value" respectively (a tied/shared
+        // representation per container spec section 12.5, not additional distinct rows) --
+        // so the union that reconstructs the whole fused tensor is just query+key+value.
+        target.query_key_value = bind_weight_fused(
+            binder, prefix + "attention/query_key_value",
+            {prefix + "attention/query", prefix + "attention/key", prefix + "attention/value"},
+            NumericFormat::W8G32_F16S, {6144, 5120}, placement);
         target.query_norm =
             bind_tensor(prefix + "attention/query_norm", NumericFormat::BF16, {128});
         target.key_norm = bind_tensor(prefix + "attention/key_norm", NumericFormat::BF16, {128});
@@ -423,8 +456,9 @@ DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement pla
         target.mlp_conv.kernel_projection =
             bind_weight(binder, prefix + "mlp_conv/kernel_projection", NumericFormat::BF16,
                         {1280, 5120}, placement);
-        target.gate_up = bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S,
-                                     {34816, 5120}, placement);
+        target.gate_up = bind_weight_fused(binder, prefix + "mlp/gate_up",
+                                           {prefix + "mlp/gate", prefix + "mlp/up"},
+                                           NumericFormat::W8G32_F16S, {34816, 5120}, placement);
         target.down    = bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S,
                                      {5120, 17408}, placement);
     }
@@ -490,10 +524,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
-                                           {131072, 5120}, proposal_placement);
-    out.draft_head_token_ids = artifact::bind_tensor(
-        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
+    // v3 names these "proposal/head" / "proposal/token_ids" (container spec section 9.2)
+    // instead of v2's "text/draft_head" / "text/draft_head_token_ids".
+    static constexpr std::array<std::string_view, 1> kProposalHead    = {"proposal/head"};
+    static constexpr std::array<std::string_view, 1> kProposalTokenIds = {"proposal/token_ids"};
+    out.draft_head = artifact::bind_tensor_fused(binder, "text/draft_head", kProposalHead,
+                                                 NumericFormat::Q4G64_F16S, {131072, 5120},
+                                                 proposal_placement);
+    out.draft_head_token_ids =
+        artifact::bind_tensor_fused(binder, "text/draft_head_token_ids", kProposalTokenIds,
+                                    NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
     const artifact::TensorPlacement mtp_placement = features.mtp()
@@ -503,24 +543,49 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
+    // The single MTP draft layer's per-layer tensors live at "mtp/layer/..." in v2 but at
+    // "mtp/layers/0/..." in v3 (the top-level ones above/below, with no layer index, match
+    // in both). bind_mtp_fused handles both the path-prefix rename (a 1-element leaf list)
+    // and real fusions (query/key/gate/value are 4 separate v3 bindings that jointly cover
+    // the same fused matrix v2 calls "query_key_gate_value").
+    const auto bind_mtp_fused = [&](std::string_view v2_name,
+                                    std::initializer_list<std::string_view> v3_leaf_names,
+                                    NumericFormat format, std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor_fused(
+            binder, v2_name,
+            std::span<const std::string_view>(v3_leaf_names.begin(), v3_leaf_names.size()), format,
+            shape, mtp_placement);
+    };
     out.mtp.input_projection =
         bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
-    out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
-    out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
-    out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
-    out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                            NumericFormat::W8G32_F16S, {14336, 5120});
-    out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
-    out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
-    out.mtp.output =
-        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {5120, 6144});
+    out.mtp.embedding_norm = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
+    out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
+    out.mtp.input_norm     = bind_mtp_fused("mtp/layer/input_norm", {"mtp/layers/0/input_norm"},
+                                        NumericFormat::BF16, {5120});
+    out.mtp.query_key_gate_value = bind_mtp_fused(
+        "mtp/layer/attention/query_key_gate_value",
+        {"mtp/layers/0/attention/query", "mtp/layers/0/attention/key",
+         "mtp/layers/0/attention/gate", "mtp/layers/0/attention/value"},
+        NumericFormat::W8G32_F16S, {14336, 5120});
+    out.mtp.query_norm = bind_mtp_fused("mtp/layer/attention/query_norm",
+                                        {"mtp/layers/0/attention/query_norm"}, NumericFormat::BF16,
+                                        {256});
+    out.mtp.key_norm = bind_mtp_fused("mtp/layer/attention/key_norm",
+                                      {"mtp/layers/0/attention/key_norm"}, NumericFormat::BF16,
+                                      {256});
+    out.mtp.output = bind_mtp_fused("mtp/layer/attention/output", {"mtp/layers/0/attention/output"},
+                                    NumericFormat::W8G32_F16S, {5120, 6144});
     out.mtp.post_attention_norm =
-        bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
+        bind_mtp_fused("mtp/layer/post_attention_norm", {"mtp/layers/0/post_attention_norm"},
+                       NumericFormat::BF16, {5120});
     out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {34816, 5120}),
+        .object = bind_mtp_fused("mtp/layer/mlp/gate_up",
+                                 {"mtp/layers/0/mlp/gate", "mtp/layers/0/mlp/up"},
+                                 NumericFormat::W8G32_F16S, {34816, 5120}),
         .format = NumericFormat::W8G32_F16S};
     out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120, 17408}),
+        .object = bind_mtp_fused("mtp/layer/mlp/down", {"mtp/layers/0/mlp/down"},
+                                 NumericFormat::W8G32_F16S, {5120, 17408}),
         .format = NumericFormat::W8G32_F16S};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 

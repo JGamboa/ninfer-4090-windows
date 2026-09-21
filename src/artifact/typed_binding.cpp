@@ -165,6 +165,24 @@ ObjectHandle bind_device_tensor(Binder& binder, std::string_view name, NumericFo
     return bind_tensor(binder, name, format, shape, TensorPlacement::Device);
 }
 
+ObjectHandle bind_tensor_fused(Binder& binder, std::string_view v2_name,
+                               std::span<const std::string_view> v3_leaf_names,
+                               NumericFormat format, std::initializer_list<std::uint64_t> shape,
+                               TensorPlacement placement) {
+    const std::span<const std::uint64_t> shape_span(shape.begin(), shape.size());
+    const StorageLayout layout = storage_layout_for(format);
+    const ObjectHandle handle  = binder.has_object(v2_name)
+                                    ? binder.require_tensor(v2_name, format, layout, shape_span)
+                                    : binder.require_tensor_fused(v3_leaf_names, format, layout,
+                                                                  shape_span);
+    if (placement == TensorPlacement::Device) {
+        binder.materialize_on_device(handle);
+    } else {
+        binder.validate_only(handle);
+    }
+    return handle;
+}
+
 ObjectHandle bind_raw_resource(Binder& binder, std::string_view name) {
     const ObjectHandle handle = binder.require_resource(name, ResourceEncoding::RawBytesV1);
     binder.retain_on_host(handle);

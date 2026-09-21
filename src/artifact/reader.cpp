@@ -62,6 +62,17 @@ std::uint64_t tensor_elements(std::span<const std::uint64_t> shape) noexcept {
     return total;
 }
 
+// The element-count of one "row" for the purposes of reconstructing a v3 fused tensor from
+// row-range bindings (see parse_v3()/find_fused()): the last dimension for planar,
+// row-quantized layouts (where a range must therefore align to a whole row), or 1 for a
+// plain contiguous layout, which has no per-row plane structure to align to. Both call
+// sites below must agree on this, or a binding's row_begin/row_count (computed at parse
+// time) won't match the object's total row count (recomputed at find_fused time).
+std::uint64_t row_unit(const TensorDescriptor& tensor) noexcept {
+    if (tensor.layout == StorageLayout::ContiguousLeV1) { return 1; }
+    return tensor.shape.empty() ? 1 : tensor.shape.back();
+}
+
 std::uint64_t read_u64_le(const std::byte* data) noexcept {
     std::uint64_t value = 0;
     for (unsigned i = 0; i < 8; ++i) {
@@ -637,17 +648,23 @@ struct Reader::Impl {
             cursor = end;
         }
 
-        // "identity" has no v3 equivalent: v3 describes a model instance through
-        // components[*].config (architectures/model_type/...), not a flat model/weights id
-        // pair. This is enough for the reader itself; matching it to a WeightsProfile is a
-        // model-target concern (Target::resolve_weights) that is out of scope for this pass
-        // and still needs its own v3-aware update. Placeholder values below make that
-        // failure explicit and easy to grep for instead of silently misidentifying a model.
-        identity.model_id   = "v3-artifact";
-        identity.weights_id = "unresolved";
+        // v3 has no flat "identity" (model_id/weights_id) the way v2 does -- a model
+        // instance is described through components[*].config (architectures/model_type/...)
+        // instead. This fork's Target::resolve_weights() (see
+        // src/targets/qwen3_6_27b/impl/package.cpp) only distinguishes two weights_id
+        // values for a given model_id: "groupwise-int" (the q4/q5/q6/q8 row-split quant
+        // this fork normally ships) and "nvfp4" (the block-scale NVFP4 quant). Recover that
+        // distinction generically from which format actually appears in the objects, rather
+        // than hard-coding per-artifact metadata: real v3 artifacts don't mix the two.
+        identity.model_id = "v3-artifact";
         if (directory.contains("metadata") && directory.at("metadata").contains("name")) {
             identity.model_id = require_string(directory.at("metadata").at("name"), "metadata.name");
         }
+        const bool uses_nvfp4 = std::any_of(raw.begin(), raw.end(), [](const ObjectDescriptor& object) {
+            const auto* tensor = std::get_if<TensorDescriptor>(&object);
+            return tensor != nullptr && tensor->format == NumericFormat::NVFP4;
+        });
+        identity.weights_id = uses_nvfp4 ? "nvfp4" : "groupwise-int";
 
         const auto& raw_bindings = directory.at("bindings");
         if (!raw_bindings.is_object()) { throw ArtifactError("v3 bindings must be a JSON object"); }
@@ -709,9 +726,7 @@ struct Reader::Impl {
                                         ": partial bindings are only supported for tensors "
                                         "with at least one dimension");
                 }
-                const auto k = tensor_shape->layout == StorageLayout::ContiguousLeV1
-                                  ? std::uint64_t{1}
-                                  : tensor_shape->shape.back();
+                const auto k = row_unit(*tensor_shape);
                 if (k == 0 || begin % k != 0 || (end - begin) % k != 0) {
                     throw ArtifactError("v3 binding " + name +
                                         ": range does not align to a whole number of rows "
@@ -738,26 +753,27 @@ struct Reader::Impl {
             entries.push_back(renamed(raw[ref.object_index], name));
         }
 
-        // "components[*].resources" maps upstream frontend file roles (tokenizer.json, ...)
-        // straight to an object id, bypassing "bindings" entirely (see container spec
-        // section 9.1). This fork's frontend loader asks for them under the v2 convention
+        // "components[*].resources" maps upstream frontend file roles (tokenizer.json,
+        // preprocessor_config.json, ...) straight to an object id, bypassing "bindings"
+        // entirely (see container spec section 9.1). This fork's frontend loader asks for
+        // all of them, across every component (not just "text" -- e.g.
+        // preprocessor_config.json lives under "vision"), under the v2 convention
         // ("frontend/<role>"), so alias them the same way whole-object bindings are exposed.
-        if (directory.at("components").contains("text")) {
-            const auto& text = directory.at("components").at("text");
-            if (text.contains("resources")) {
-                for (const auto& [role, object_id_json] : text.at("resources").items()) {
-                    const auto object_id = require_string(object_id_json, "resource object id");
-                    const auto it        = index_by_id.find(object_id);
-                    if (it == index_by_id.end()) {
-                        throw ArtifactError("text resource " + role + " references unknown object " +
-                                            object_id);
-                    }
-                    const auto alias         = "frontend/" + role;
-                    const auto object_index  = entries.size();
-                    auto [_, inserted]       = index.emplace(alias, object_index);
-                    if (!inserted) { throw ArtifactError("duplicate binding name: " + alias); }
-                    entries.push_back(renamed(raw[it->second], alias));
+        for (const auto& [component_id, component] : directory.at("components").items()) {
+            if (!component.contains("resources")) { continue; }
+            for (const auto& [role, object_id_json] : component.at("resources").items()) {
+                const auto object_id = require_string(object_id_json, "resource object id");
+                const auto it        = index_by_id.find(object_id);
+                if (it == index_by_id.end()) {
+                    throw ArtifactError("component " + component_id + " resource " + role +
+                                        " references unknown object " + object_id);
                 }
+                const auto alias = "frontend/" + role;
+                if (index.contains(alias)) { continue; } // shared across components; first wins
+                const auto object_index = entries.size();
+                auto [_, inserted]      = index.emplace(alias, object_index);
+                if (!inserted) { throw ArtifactError("duplicate binding name: " + alias); }
+                entries.push_back(renamed(raw[it->second], alias));
             }
         }
 
@@ -794,16 +810,12 @@ struct Reader::Impl {
             return &entries[cached->second];
         }
 
-        auto expected = v3_names_by_object.at(object_index);
-        std::sort(expected.begin(), expected.end());
-        std::vector<std::string> requested(names.begin(), names.end());
-        std::sort(requested.begin(), requested.end());
-        if (requested != expected) {
-            throw ArtifactError("fused binding group for " + std::string(names.front()) +
-                                " does not match the artifact's actual split: requested " +
-                                std::to_string(requested.size()) + " name(s), object has " +
-                                std::to_string(expected.size()));
-        }
+        // Deliberately not checking `names` against every binding v3_names_by_object knows
+        // about for this object: a physical object can have more references than the ones
+        // being asked for here, e.g. a tied/shared representation (container spec section
+        // 12.5) where "context_key" is a separate logical name for the exact same range as
+        // "key". The tiling check below is the real invariant -- it fails just as loudly if
+        // `names` actually leaves a gap or gets a row twice.
 
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
         ranges.reserve(names.size());
@@ -820,7 +832,7 @@ struct Reader::Impl {
         if (tensor == nullptr) {
             throw ArtifactError("fused binding group targets a resource, not a tensor");
         }
-        const std::uint64_t k     = tensor->shape.empty() ? 1 : tensor->shape.back();
+        const std::uint64_t k     = row_unit(*tensor);
         const std::uint64_t rows  = k == 0 ? 0 : tensor_elements(tensor->shape) / k;
         std::uint64_t expected_row = 0;
         for (const auto& [begin, count] : ranges) {
