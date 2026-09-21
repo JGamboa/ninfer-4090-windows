@@ -143,6 +143,14 @@ public:
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
 
+    // v3 artifacts can split one physical (quantized) object across several logical
+    // parameter names (e.g. "attention/query" + "attention/key" both carved out of one
+    // fused weight matrix). find_fused() resolves such a group back to the single physical
+    // object, verifying that `names` together exactly tile it with no gaps or overlaps.
+    // For v2 artifacts, and for v3 artifacts where `names` is a single whole-object
+    // binding, this is equivalent to find(names[0]).
+    const ObjectDescriptor* find_fused(std::span<const std::string_view> names) const;
+
     std::uint64_t file_bytes() const noexcept;
     std::uint64_t payload_offset() const noexcept;
     PayloadSpan payload(const ObjectDescriptor& object) const;

@@ -18,6 +18,13 @@ target_include_directories(ninfer-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_logging)
 
+add_executable(ninfer-artifact-inspect artifact_inspect/main.cpp)
+target_include_directories(ninfer-artifact-inspect PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer-artifact-inspect PRIVATE ninfer_artifact)
+
 add_executable(ninfer-perplexity
   perplexity/main.cpp
   perplexity/corpus.cpp

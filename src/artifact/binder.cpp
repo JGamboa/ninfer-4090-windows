@@ -59,6 +59,46 @@ ObjectHandle Binder::require_tensor(std::string_view name, NumericFormat format,
     return handle;
 }
 
+ObjectHandle Binder::require_tensor_fused(std::span<const std::string_view> names,
+                                          NumericFormat format, StorageLayout layout,
+                                          std::span<const std::uint64_t> shape) {
+    if (names.empty()) { throw ArtifactError("require_tensor_fused requires at least one name"); }
+    // find_fused() may append a newly-synthesized fused entry to the reader's object list,
+    // so the objects() reference (and object.data()) must be taken AFTER it returns, not
+    // before -- otherwise a reallocation there would invalidate it before it's read below.
+    const ObjectDescriptor* object = reader_.find_fused(names);
+    if (object == nullptr) {
+        throw ArtifactError("required artifact object is missing: " + std::string(names.front()));
+    }
+    const auto& objects = reader_.objects();
+    const auto index    = static_cast<std::size_t>(object - objects.data());
+    // A fused lookup can be the first thing to reference a freshly-synthesized entry that
+    // did not exist when this Binder (and its consumed_/planned_ bookkeeping, sized off
+    // reader.objects() at construction time) was created.
+    if (index >= consumed_.size()) {
+        consumed_.resize(index + 1, false);
+        planned_.resize(index + 1, false);
+        materialization_.object_count = objects.size();
+    }
+    if (consumed_[index]) {
+        throw ArtifactError("artifact object was bound more than once: " +
+                            std::string(names.front()));
+    }
+    consumed_[index] = true;
+    const ObjectHandle handle{index};
+
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) {
+        throw ArtifactError("required tensor is a resource: " + std::string(names.front()));
+    }
+    if (tensor->format != format || tensor->layout != layout ||
+        !std::equal(tensor->shape.begin(), tensor->shape.end(), shape.begin(), shape.end())) {
+        throw ArtifactError("tensor descriptor does not match target contract: " +
+                            std::string(names.front()));
+    }
+    return handle;
+}
+
 ObjectHandle Binder::require_resource(std::string_view name, ResourceEncoding encoding) {
     const ObjectHandle handle = find_unconsumed(name);
     const auto* resource      = std::get_if<ResourceDescriptor>(&descriptor(handle));
