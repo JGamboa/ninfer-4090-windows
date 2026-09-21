@@ -44,46 +44,51 @@ same range as `"key"`, not an additional distinct row range -- container spec se
 bindings file (fixed by owning the leaf-name strings in a named array instead of
 inlining them where they'd only live for the wrong expression).
 
-## Known blocker (data, not code) -- currently bypassed for testing
+## Chat template: not a data bug -- this fork's checker was outdated (fixed)
 
-`ninfer-serve.exe` reached `initializing frontend` and failed there twice, on two
+`ninfer-serve.exe` initially failed at `initializing frontend`, on two checks around two
 resources this fork's frontend loader already reads correctly via the aliasing this port
 added:
 
 1. `tokenizer_config.json.chat_template does not match frontend/chat_template.jinja` --
-   `validate_tokenizer_config()` in `src/targets/qwen3_6/impl/frontend/frontend.cpp`.
-   Diffing the actual bytes: the standalone `chat_template.jinja` (9712 bytes) is this
-   fork's *modified* template (SPDX header, selects semantics by SHA-256 below); the one
-   embedded in `tokenizer_config.json` (8952 bytes) is the *unmodified upstream Qwen
-   template*. They were never supposed to match unless the v3 export's converter forgot to
-   re-embed the patched template into `tokenizer_config.json`.
+   `validate_tokenizer_config()` in `frontend.cpp`. The standalone `chat_template.jinja`
+   (9712 bytes) is this fork's *modified* template; the one embedded in
+   `tokenizer_config.json` (8952 bytes) is the *unmodified upstream Qwen template*.
 2. `unsupported frontend/chat_template.jinja (sha256 a497db9e...)` --
-   `CompiledChatTemplate::resolve()` in `chat_template.cpp` doesn't recognize this
-   artifact's `chat_template.jinja` as either known digest
-   (`kThinkingToggleTemplateDigest` / `kReasoningEffortTemplateDigest`).
+   `CompiledChatTemplate::resolve()` in `chat_template.cpp` didn't recognize this hash.
 
-Both are content bugs in the specific downloaded v3 artifact (or its converter), not in
-this port's reader/binder/bindings.cpp wiring, which resolved every resource's *bytes*
-correctly. **Both are currently bypassed** (search for `TEMPORARY` in `frontend.cpp` and
-`chat_template.cpp`) to validate the rest of the v3 path -- the mismatch check is `#if 0`'d
-out, and the digest resolver defaults to `ChatTemplateSemantics::ReasoningEffort` (matches
-every `enable_thinking`/`reasoning_effort` request already verified against this same
-model's v2 artifact) when neither known digest matches. **Revert both before merging** --
-they exist only to isolate the chat-template problem from everything downstream of it,
-and are not a fix for the actual data issue upstream (re-convert/re-download the v3
-artifact with matching, recognized resources).
+Checked both against upstream `Neroued/ninfer` (`master` branch) instead of guessing:
+
+- The artifact's `chat_template.jinja` hashes **byte-identical** to upstream's own
+  `tools/chat_templates/qwen3_8.jinja` (same SHA-256, same 9712 bytes) -- it is the
+  official, current template, not corrupted or mismatched data.
+- Upstream's own `validate_tokenizer_config()` (`src/models/qwen3_5/frontend/frontend.cpp`)
+  **no longer compares `chat_template` against the standalone `.jinja` file at all** --
+  they dropped that check. Their `tokenizer_config.json` legitimately carries the vanilla
+  HF template (for other tools like `transformers.apply_chat_template`); their own
+  serving path only ever reads `chat_template.jinja`.
+- Upstream also replaced the whole SHA-256-keyed-to-two-hardcoded-templates scheme with a
+  real Jinja interpreter (`text::JinjaTemplate`) that executes whatever template it's
+  given -- a bigger rewrite this fork hasn't picked up. Porting that is out of scope here;
+  instead, the exact digest is now a third registered constant
+  (`kQwen38ReasoningEffortTemplateDigest`), matching the semantics that were confirmed by
+  actually generating text with it (see below).
+
+Fixes applied (permanent, not a bypass): removed the `chat_template` equality check from
+`validate_tokenizer_config()` in this fork's `frontend.cpp` (matches upstream's decision),
+and added `kQwen38ReasoningEffortTemplateDigest` to `chat_template.cpp` mapped to
+`ChatTemplateSemantics::ReasoningEffort`.
 
 ## v3 end-to-end validation: PASSED
 
-With the two bypasses above, `ninfer-serve.exe` loads the real v3 artifact completely
-(`engine ready | qwen3.8-27b/groupwise-int`, CUDA graphs built, listening on
-`:8080`) and serves a real request correctly -- asked for a documented Fibonacci function
-with `enable_thinking:false`, got back correct Python with the right docstring/type hints,
-`reasoning_tokens: 0` (confirms the ReasoningEffort semantics fallback actually behaves
-correctly for this request shape), 131.85 tok/s decode at 90% MTP draft acceptance
-(145/161). This confirms the reader/binder/bindings.cpp work in this branch is
-functionally complete and correct for the real Qwen3.8-27B v3 artifact; the only remaining
-gap is the chat-template data problem above, which is not this port's bug to fix.
+`ninfer-serve.exe` loads the real v3 artifact completely (`engine ready |
+qwen3.8-27b/groupwise-int`, CUDA graphs built, listening on `:8080`) and serves real
+requests correctly with `enable_thinking:false` (`reasoning_tokens: 0` both times,
+confirming the ReasoningEffort semantics is right for this template): a documented
+Fibonacci function came back with correct Python/docstring/type hints at 131.85 tok/s
+decode, 90% MTP draft acceptance (145/161); a second, simpler prompt confirmed coherent
+generation at 91.76 tok/s, 56% acceptance. The reader/binder/bindings.cpp/frontend work in
+this branch is functionally complete and validated for the real Qwen3.8-27B v3 artifact.
 
 ## Why v3 isn't just a header/magic bump
 

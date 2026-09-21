@@ -218,19 +218,16 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template must contain the loaded chat template");
     }
-    // TEMPORARY: this specific v3 test artifact has tokenizer_config.json's embedded
-    // chat_template out of sync with the standalone chat_template.jinja resource (see
-    // docs/artifact-v3-port-notes.md, "Known blocker"). Bypassed here only to validate the
-    // rest of the v3 loading/serving path end-to-end; revert once the artifact is fixed or
-    // this is given a permanent decision (both resources ARE still read correctly --
-    // compile_chat_template() below uses chat_template_jinja, never the embedded copy).
-#if 0
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
-    }
-#endif
+    // Deliberately not checking tokenizer_config.json's embedded chat_template against the
+    // standalone frontend/chat_template.jinja resource used below: upstream Neroued/ninfer
+    // (src/models/qwen3_5/frontend/frontend.cpp) dropped this comparison too. The upstream
+    // HF tokenizer_config.json carries the vanilla template for other tools (e.g.
+    // transformers' apply_chat_template); this fork's own chat_template.jinja -- with its
+    // thinking/reasoning-effort additions -- is the one actually used to render prompts
+    // (compile_chat_template() below only ever reads chat_template_jinja), so the two are
+    // legitimately allowed to differ. Verified against the real Qwen3.8-27B v3 artifact,
+    // whose chat_template.jinja hashes identically to upstream's current
+    // tools/chat_templates/qwen3_8.jinja.
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {

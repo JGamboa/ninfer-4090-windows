@@ -27,6 +27,19 @@ constexpr Sha256Digest kReasoningEffortTemplateDigest{
     0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
 };
 
+// tools/chat_templates/qwen3_8.jinja from upstream Neroued/ninfer (sha256
+// a497db9e663941e6f7a05307c2bafa8374c12e142ad1fbea6229888d41f1ab16) -- the template real
+// v3 Qwen3.8-27B artifacts carry as chat_template.jinja. This fork predates upstream's move
+// to a full Jinja engine (CompiledChatTemplate::resolve() there just interprets the source
+// directly instead of matching known digests), so recognize this one explicitly rather
+// than porting that engine. Confirmed to render correctly with ReasoningEffort semantics:
+// requests with enable_thinking:false against a v3 artifact using this template correctly
+// produced reasoning_tokens:0.
+constexpr Sha256Digest kQwen38ReasoningEffortTemplateDigest{
+    0xa4, 0x97, 0xdb, 0x9e, 0x66, 0x39, 0x41, 0xe6, 0xf7, 0xa0, 0x53, 0x07, 0xc2, 0xba, 0xfa, 0x83,
+    0x74, 0xc1, 0x2e, 0x14, 0x2a, 0xd1, 0xfb, 0xea, 0x62, 0x29, 0x88, 0x8d, 0x41, 0xf1, 0xab, 0x16,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -413,13 +426,7 @@ RenderedFragment ChatMessage::rendered_content(bool add_vision_id, int* image_co
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     const Sha256Digest digest = sha256(source);
-    // TEMPORARY: the v3 test artifact's chat_template.jinja doesn't match either known
-    // digest below (see docs/artifact-v3-port-notes.md, "Known blocker") -- this fork's
-    // v2 artifacts of this same model use ReasoningEffort semantics (matches every
-    // enable_thinking/reasoning_effort request tested against the v2 file), so default to
-    // that instead of failing, purely to validate the rest of the v3 serving path. Revert
-    // once the template's real semantics are confirmed or a matching digest is added.
-    if (digest != kThinkingToggleTemplateDigest && digest != kReasoningEffortTemplateDigest) {
+    if (digest == kQwen38ReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
     if (digest == kThinkingToggleTemplateDigest) {
