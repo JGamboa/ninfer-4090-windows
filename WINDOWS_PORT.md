@@ -117,13 +117,19 @@ cmake --build build -j
 Products: `build/apps/ninfer.exe`, `build/apps/ninfer-serve.exe`,
 `build/apps/ninfer-perplexity.exe`. At runtime, put the vcpkg `bin` and CUDA `bin` on PATH.
 
-## Model artifact — use a v2 artifact
+## Model artifact — v2 and v3 both work (on `main`)
 
-**Important:** this engine reads **v2** `.ninfer` artifacts (magic `NINFER\0\2`). The
-HuggingFace repos have since migrated their `main` to **v3** (`NINFER\0\3`), which this
-build rejects with `artifact magic is not NInfer v2`.
+This branch reads both **v2** (`NINFER\0\2`) and **v3** (`NINFER\0\3`) `.ninfer`
+artifacts — the reader auto-detects the container version from the magic bytes, no build
+flag needed. HuggingFace repos originally shipped v2 and have since migrated their `main`
+to v3; either works here now. See
+[docs/artifact-v3-port-notes.md](docs/artifact-v3-port-notes.md) for what v3 changed and
+how this port reads it.
 
-Download a v2 revision instead of `main`. For Qwen3.8-27B the pre-v3 commit is `dc370fb`:
+If you're on the `winport-v2` branch instead (plain Windows port, no v3 support), that
+build only reads v2 and rejects v3 with `artifact magic is not NInfer v2` — download a v2
+revision instead of `main` from the HuggingFace repo. For Qwen3.8-27B the pre-v3 commit is
+`dc370fb`:
 
 ```
 https://huggingface.co/neroued/Qwen3.8-27B-NInfer/resolve/dc370fb/qwen3_8_27b.ninfer

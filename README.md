@@ -1,12 +1,20 @@
 # NInfer-4090
 
-> ### 🪟 Native Windows port available
-> This branch (`winport-v2`) adds a **native Windows build (MSVC + CUDA, no WSL, no Docker
-> required)**. It's verified on RTX 4090 (sm_89), CUDA 13.4, Visual Studio Build Tools 2026, and
-> reaches **149 tok/s** decode on code generation — matching the Linux numbers below.
+> ### 🪟 Native Windows port available — now reads v3 artifacts too
+> This project adds a **native Windows build (MSVC + CUDA, no WSL, no Docker required)**.
+> It's verified on RTX 4090 (sm_89), CUDA 13.4, Visual Studio Build Tools 2026, and reaches
+> **149 tok/s** decode on code generation — matching the Linux numbers below.
 >
-> **→ See [WINDOWS_PORT.md](WINDOWS_PORT.md) for build instructions, what was changed to make it
-> work, and the important note about needing a v2 (not v3) `.ninfer` artifact.**
+> **→ See [WINDOWS_PORT.md](WINDOWS_PORT.md)** for build instructions and what was changed
+> to make Windows work at all.
+>
+> **`main` also reads v3 `.ninfer` artifacts** (the format HuggingFace repos migrated to
+> after this engine originally shipped v2-only support) — no separate build flag needed,
+> the reader auto-detects the container version. **→ See
+> [docs/artifact-v3-port-notes.md](docs/artifact-v3-port-notes.md)** for what v3 changed,
+> how this port reads it, and what was fixed to get a real Qwen3.8-27B v3 artifact serving
+> end to end. The `winport-v2` branch has the plain Windows port without v3 support, if you
+> only need v2.
 
 NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an `sm_89` port of
 [NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
