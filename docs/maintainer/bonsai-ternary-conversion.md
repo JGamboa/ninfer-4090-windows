@@ -1,6 +1,8 @@
-# Bonsai-2-27B conversion: M0 findings (agent A)
+# Bonsai-2-27B conversion: M0 findings and M1 procedure (agent A)
 
-Status: M0 complete (design doc section 7). This records the numeric/order conventions
+Status: M0 complete (design doc section 7). M1 converter code complete and tested on
+synthetic inputs (section "M1 conversion" below); the real conversion run, the mapping
+check and the `inspect` output are still to be recorded on the Windows machine. This records the numeric/order conventions
 resolved by comparing `E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf` against
 `E:\LLM\qwen3_8_27b.ninfer` (same base architecture, per
 `docs/maintainer/bonsai-ternary-design.md` section 1.1). Reproduce with:
@@ -137,3 +139,54 @@ declared (tap-major) shape.
    `on` in `execution/text.cpp`) in that same grouped order at inference time -- that is
    section 5.3's `perm == nullptr` question for agent B, and can only be settled by reading
    the kernel or by M3's token-level comparison, per design doc section 8 risk #2.
+
+## M1 conversion (Brief A steps 2 and 3)
+
+Code: `t2_g128_fp16` / `ternary_row_k128_v1` (`tools/artifact/formats.py`, `layouts.py`,
+`codecs/ternary.py`, `tensor_output.py`), `import_encoded` for every encoded format
+(`tools/convert/methods.py`), `PrismCheckpoint` (`tools/convert/sources/prism_checkpoint.py`,
+the GGUF as an HF-named checkpoint), `NInferArtifactStore.parameter_source` (exact Q8 rows
+for the MTP copy), recipe `bonsai2_27b` (`tools/convert/official_recipes.py`) and
+`tools/convert/bonsai_base.py`.
+
+What the recipe writes:
+
+| parameters | format | source |
+|---|---|---|
+| layer attention q/k/gate/v, o; GDN q/k/v/z, out; MLP gate/up, down | `t2_g128_fp16`, one parent per fused group | rotated GGUF words, rows in NInfer order |
+| `text/token_embedding`, `text/output_head` | `q8_g32_fp16` (`grouped_absmax`) | primal-basis values `(W' @ H) * s` |
+| GDN `a_projection`, `b_projection` | bf16, separate parents | GGUF BF16, grouped head order |
+| norms, `a_log`, `dt_bias`, `convolution`, q/k norms | as the Qwen3.8 recipe | GGUF F32 with the M0 conventions |
+| `text/hadamard/signs_{5120,6144,17408}` | bf16 | `prism.hadamard.sign_values` |
+| `mtp/*` | as stored in the reference (Q8 words copied exactly) | `qwen3_8_27b.ninfer` |
+| `dflash2/*` | as the official recipes | DFlash2 HF companion |
+
+Run on Windows (venv of design doc section 6.5):
+
+```
+.venv\Scripts\python.exe -m tools.convert.bonsai_base --gguf E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --reference E:\LLM\qwen3_8_27b.ninfer --out E:\LLM\bonsai2-27b
+.venv\Scripts\python.exe -m tools.convert.bonsai_mapping_check --gguf E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --reference E:\LLM\qwen3_8_27b.ninfer --base E:\LLM\bonsai2-27b
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\bonsai2-27b --recipe bonsai2_27b ^
+  --components text,mtp,dflash2 --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --source mtp=E:\LLM\qwen3_8_27b.ninfer --source dflash2=E:\LLM\dflash2-src ^
+  --proposal --name bonsai2-27b --out E:\LLM\bonsai2_27b_t2.ninfer --device cuda
+.venv\Scripts\python.exe -m tools.artifact.inspect E:\LLM\bonsai2_27b_t2.ninfer
+```
+
+`bonsai_base` prints whether the reference chat template matches the GGUF's embedded one
+and saves the latter as `gguf_chat_template.jinja` (design doc risk 5).
+`bonsai_mapping_check` compares every logical parameter of layers 0 (GDN) and 3 (attention)
+plus the globals against the reference and exits non-zero if one falls below its bar
+(ternary median row cosine 0.80, direct 0.98). It covers the conventions M0 did not measure:
+`in_proj_qkv` value rows, `in_proj_a`/`in_proj_b` rows, `q_norm`/`k_norm`/final norm offsets,
+and the attention q/gate split. Run it before the full conversion; a NO row means that
+tensor's mapping in `prism_checkpoint.py` is wrong.
+
+Synthetic coverage (`tests/convert/test_bonsai_recipe.py`): a Bonsai-shaped PQ2_0 GGUF (4
+layers, nontrivial 2x2 head permutation) and a reference artifact with a Q8 MTP head go
+through `bonsai_base` and the CLI; the test rebuilds the expected t2 parents, primal Q8
+head/embedding, vectors and MTP words independently.
+
+Results of the real run: _pending (Windows machine)_.

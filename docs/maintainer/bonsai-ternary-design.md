@@ -234,24 +234,28 @@ order) are done exactly as the converter does them for bf16/q8 today: permute wh
 wants a tile-major layout, that becomes a second format (`t2r_…`) added later with a reorder pass
 in the converter; do not block M1 on it.
 
-Hadamard side data, stored once in the artifact (text component), all `bf16 [width]` in the
-primal index order of the activation NInfer feeds the projection:
+Hadamard side data, stored once in the artifact as direct `bf16 [width]` text parameters, in
+the primal index order of the activation NInfer feeds the projection (logical parameter names
+are what the loader binds; the converter writes exactly these):
 
-| tensor | width | used by |
+| parameter | width | used by |
 |---|---|---|
-| `hadamard.signs.5120` | 5120 | inputs of gdn in_proj (qkv+z fused), attention qkv fused, mlp gate+up fused, lm_head; inverse for embeddings |
-| `hadamard.signs.6144` | 6144 | inputs of gdn out_proj and attention o_proj |
-| `hadamard.signs.17408` | 17408 | input of mlp down_proj |
+| `text/hadamard/signs_5120` | 5120 | inputs of gdn in_proj (qkv+z fused), attention qkv fused, mlp gate+up fused, lm_head (M5); inverse for embeddings (M5) |
+| `text/hadamard/signs_6144` | 6144 | inputs of gdn out_proj and attention o_proj |
+| `text/hadamard/signs_17408` | 17408 | input of mlp down_proj |
 
-Text-config metadata (JSON, next to the existing config keys):
+Text-config metadata (`components.text.config.prism_hadamard`, next to the existing config
+keys; `rotated_inputs` lists the per-layer parameter suffixes stored as `t2_g128_fp16`):
 
 ```json
 "prism_hadamard": {
   "version": 1, "transform": "normalized-sylvester-walsh-hadamard", "block_size": 1024,
   "sign_mode": "explicit", "sign_widths": [5120, 6144, 17408],
-  "rotated_inputs": ["gdn/query", "gdn/key", "gdn/value", "gdn/z", "gdn/output",
-                     "attention/query", "attention/key", "attention/gate", "attention/value",
-                     "attention/output", "mlp/gate", "mlp/up", "mlp/down"],
+  "signs": {"5120": "text/hadamard/signs_5120", "6144": "text/hadamard/signs_6144",
+            "17408": "text/hadamard/signs_17408"},
+  "rotated_inputs": ["attention/gate", "attention/key", "attention/output", "attention/query",
+                     "attention/value", "gdn/key", "gdn/output", "gdn/query", "gdn/value",
+                     "gdn/z", "mlp/down", "mlp/gate", "mlp/up"],
   "embedding_inverse": false
 }
 ```
@@ -520,20 +524,27 @@ New files:
   `generation_config.json`, `chat_template.jinja` from `~/ninfer/models/qwen38-tokenizer` and
   `tools/chat_templates/qwen3_8.jinja`. No safetensors needed (`sources/safetensors.py:72-74`).
 
-Invocation (GUIDANCE):
+Invocation (implemented; the base directory comes from the reference artifact, so no HF
+config or tokenizer files have to be assembled by hand):
 
 ```
+E:\LLM\ninfer-4090-bonsai\.venv\Scripts\python.exe -m tools.convert.bonsai_base ^
+  --gguf E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf --reference E:\LLM\qwen3_8_27b.ninfer ^
+  --out E:\LLM\bonsai2-27b
 E:\LLM\ninfer-4090-bonsai\.venv\Scripts\python.exe -m tools.convert ^
   --model E:\LLM\bonsai2-27b --recipe bonsai2_27b --components text,mtp,dflash2 ^
   --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
   --source mtp=E:\LLM\qwen3_8_27b.ninfer ^
   --source dflash2=E:\LLM\dflash2-src ^
-  --name bonsai2-27b --out E:\LLM\bonsai2_27b_t2.ninfer --device cuda
+  --proposal --name bonsai2-27b --out E:\LLM\bonsai2_27b_t2.ninfer --device cuda
 ```
 
+`--source` opens `.gguf` paths as `PrismCheckpoint` and `.ninfer` paths as
+`NInferArtifactStore`; everything else stays a Safetensors source. `--proposal` works
+unchanged: the recipe points `text/output_head`'s logical source at the primal-basis GGUF
+values, so the proposal head is gathered from the folded head.
 (`E:\LLM\dflash2-src` is the DFlash2 HF companion; today it lives only on the WSL disk at
-`~/ninfer/models/dflash2-src`, copy it once to `E:\LLM`. `E:\LLM\qwen38-tokenizer` already holds
-the tokenizer files for the base dir.)
+`~/ninfer/models/dflash2-src`, copy it once to `E:\LLM`.)
 
 Pipeline (one invocation, one artifact):
 
@@ -551,7 +562,7 @@ Pipeline (one invocation, one artifact):
 5. Embedding: dequantize, `unrotate_embedding_rows`, emit as the existing embedding format.
    lm_head v1: dequantize, fold `(W' @ H) * s` per block, quantize to `q8_g32_fp16` with the
    existing q8 writer. (Both become `t2` in M5 behind a `--ternary-head` flag.)
-6. `hadamard.signs.{5120,6144,17408}` tensors (bf16) and the `prism_hadamard` config block.
+6. `text/hadamard/signs_{5120,6144,17408}` parameters (bf16) and the `prism_hadamard` config block.
 7. MTP component: every `mtp/*` parameter sourced from the `.ninfer` store (`--source
    mtp=.../qwen3_8_27b.ninfer`) with exact q8 pass-through where the recipe format matches, floats
    + `grouped_absmax` otherwise. DFlash2 from its HF companion exactly as the `qwen3_8_27b` recipe
@@ -576,7 +587,7 @@ bounded reads; the whole GGUF is 6 GB and must never be loaded into memory at on
    68-82`, and a geometry case in `tests/models/qwen3_5/test_loading.cpp:25-36`.
 2. Bindings and config: `src/models/qwen3_5/load/text.cpp:8-55, 100-117` (existing bindings are
    format-agnostic by name, so the projections need no new bindings; add `Bindings::direct()`
-   bindings for `hadamard.signs.{5120,6144,17408}` as bf16 like the norms at `:46-53`), parse the
+   bindings for `text/hadamard/signs_{5120,6144,17408}` as bf16 like the norms at `:46-53`), parse the
    `prism_hadamard` block in `src/models/qwen3_5/config.h` / the text-config loader and validate
    `rotated_inputs` against the bound formats (refuse a `t2` projection that is not listed and a
    listed projection that is not `t2`). Policy mapping stays as is (`load/prepare.cpp:26-62`; A4 is
@@ -680,7 +691,15 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 
 ## 9. Resolved during implementation (agents append here)
 
-- (B) format enum name / storage layout struct: _pending_
+- (A) Python side of the format, 2026-09-23: format string `t2_g128_fp16` (class
+  `TernaryFormat`, group 128), layout string `ternary_row_k128_v1` (alignment 256): plane 0
+  codes `N x K/4` bytes row-major, plane 1 FP16 scales `N x K/128` row-major starting at
+  `align_up(N*K/4, 256)`; `payload = scale_offset + N*K/128*2`; K must be a multiple of 128;
+  no weight divisor. `tools/artifact/layouts.py:ternary_geometry` is the byte geometry the
+  C++ `weight_geometry` must reproduce. Sign vectors are the direct bf16 parameters
+  `text/hadamard/signs_{5120,6144,17408}`; the config block carries a `signs` map to them
+  (section 2).
+- (B) format enum name / storage layout struct: _pending_ (C++ side; the strings above are fixed)
 - (B) GDN out_proj activation order: _pending_
 - (B+C) final launcher signatures: _pending_
 - (A) `ssm_a` convention: `ssm_a = -exp(a_log)` (`a_log = log(-ssm_a)`), the standard
@@ -699,6 +718,15 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   `E:\LLM\ninfer-4090-bonsai\.venv` per section 6.5; `numpy`, `safetensors`, `pytest` from
   PyPI, `torch` 2.11.0+cu128 from the cu128 index (GPU wheel installed successfully on the
   first attempt; no CPU fallback was needed). M0's checks themselves ran on CPU.
+
+- (A) GGUF-to-HF mapping, 2026-09-23 (`tools/convert/sources/prism_checkpoint.py`): the GGUF is
+  read as the equivalent HF checkpoint. Values are primal (`(W' @ H) * s` for every ternary
+  tensor, including the embedding), so the v1 Q8 head/embedding are plain `grouped_absmax` on
+  those values; ternary projections import the rotated words exactly. Beyond M0's tensors the
+  48-head tiled-to-grouped order is also applied to `in_proj_qkv` value rows, `in_proj_a` and
+  `in_proj_b` rows, and the `-1` norm offset to `q_norm`, `k_norm` and the final norm (llama.cpp's
+  Qwen3.5 export convention). These are covered by synthetic tests only until
+  `python -m tools.convert.bonsai_mapping_check` runs on the real files (conversion doc).
 
 ## Appendix: sources
 
