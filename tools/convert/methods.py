@@ -241,9 +241,13 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
+    """Preserve the source's exact codes, scales and, for NVFP4, weight divisor.
+
+    Accepts every encoded matrix format: NVFP4, row-scaled FP8, grouped integers
+    (for example Q8 rows copied from an existing artifact) and ternary.
+    """
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16")
+        isinstance(get_format(request.target.format), DirectFormat)
         or len(request.target.shape) != 2
     ):
         raise ValueError("import_encoded requires a known encoded matrix target")

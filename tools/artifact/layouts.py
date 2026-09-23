@@ -20,6 +20,7 @@ from .formats import (
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
+    TernaryFormat,
     get_format,
 )
 
@@ -77,6 +78,19 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class TernaryGeometry:
+    n: int
+    k: int
+    groups_per_row: int
+    code_row_bytes: int
+    scale_row_bytes: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
@@ -93,6 +107,11 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
+TERNARY_ROW_K128_V1 = Layout(
+    "ternary_row_k128_v1",
+    256,
+    frozenset(("t2_g128_fp16",)),
+)
 
 LAYOUTS = MappingProxyType(
     {
@@ -102,6 +121,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            TERNARY_ROW_K128_V1,
         )
     }
 )
@@ -246,6 +266,37 @@ def row_scale_geometry(
     )
 
 
+def ternary_geometry(
+    format: str | TernaryFormat, shape: Sequence[int]
+) -> TernaryGeometry:
+    """Row-major 2-bit code plane, then a 256-aligned row-major FP16 scale plane."""
+    spec = _format(format)
+    if not isinstance(spec, TernaryFormat):
+        raise ValueError("ternary_row_k128_v1 requires a ternary format")
+    n, k = _shape(shape, rank=2)
+    if k % K_ALIGNMENT or k % spec.group_size:
+        raise ValueError(
+            f"ternary_row_k128_v1 requires K divisible by {K_ALIGNMENT}, got {k}"
+        )
+    groups_per_row = k // spec.group_size
+    code_row_bytes = k // 4
+    scale_row_bytes = groups_per_row * 2
+    code_plane_bytes = n * code_row_bytes
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = n * scale_row_bytes
+    return TernaryGeometry(
+        n=n,
+        k=k,
+        groups_per_row=groups_per_row,
+        code_row_bytes=code_row_bytes,
+        scale_row_bytes=scale_row_bytes,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -276,4 +327,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is TERNARY_ROW_K128_V1:
+        if not isinstance(numeric_spec, TernaryFormat):
+            raise ValueError("ternary_row_k128_v1 requires a ternary format")
+        return ternary_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

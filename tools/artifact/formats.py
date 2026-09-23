@@ -43,7 +43,21 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class TernaryFormat:
+    """Ternary {-1, 0, +1} weights in 2-bit slots with one binary16 scale per K group.
+
+    Slot code ``c`` in ``{0, 1, 2}`` represents ``c - 1``; code 3 is invalid. Four codes
+    share a byte, weight ``k`` in bits ``2 * (k % 4)`` of byte ``k // 4``.
+    """
+
+    name: str
+    group_size: int
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | TernaryFormat
+)
 
 
 BF16 = DirectFormat("bf16", 2)
@@ -56,6 +70,7 @@ Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
+T2_G128_FP16 = TernaryFormat("t2_g128_fp16", 128)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -64,8 +79,15 @@ QUANT_FORMATS = MappingProxyType(
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
+TERNARY_FORMATS = MappingProxyType({T2_G128_FP16.name: T2_G128_FP16})
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {
+        **DIRECT_FORMATS,
+        **QUANT_FORMATS,
+        **NVFP4_FORMATS,
+        **FP8_ROW_FORMATS,
+        **TERNARY_FORMATS,
+    }
 )
 
 
@@ -147,15 +169,18 @@ __all__ = [
     "Q8_G32_FP16",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
+    "T2_G128_FP16",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
+    "TERNARY_FORMATS",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
+    "TernaryFormat",
     "NumericFormat",
     "get_format",
     "decode_e2m1_word",

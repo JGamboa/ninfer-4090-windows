@@ -9,6 +9,7 @@ import torch
 from tools.artifact.reader import Artifact
 from tools.artifact.codecs.row_split import decode_row_split_codes
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
+from tools.artifact.codecs.ternary import encode_ternary, pack_ternary_codes
 from tools.artifact.schema import binding_parts
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.methods import grouped_absmax, import_encoded
@@ -268,3 +269,90 @@ def test_private_component_storage_cannot_be_packed_with_target_weights():
     prepared = shared.prepare(device="cpu")
     assert len(prepared.weights) == 1
     assert prepared.bindings["draft"] == prepared.bindings["target"]
+
+
+def _ternary_source(name, rows, seed):
+    generator = torch.Generator().manual_seed(seed)
+    logical = torch.randint(0, 3, (rows, 256), dtype=torch.uint8, generator=generator)
+    codes = pack_ternary_codes(logical)
+    scales = torch.rand((rows, 2), generator=generator).to(torch.float16)
+
+    def no_values(begin, end):
+        raise AssertionError("encoded import must not require decoded source values")
+
+    source = LogicalSource(
+        (rows, 256),
+        name,
+        no_values,
+        lambda begin, end: EncodedRows(
+            "t2_g128_fp16", codes[begin:end], scales[begin:end]
+        ),
+    )
+    return source, codes, scales
+
+
+def test_ternary_import_fuses_packing_group_rows_exactly(tmp_path):
+    model = Model({"text": {"config": {}}})
+    parts = {
+        name: _ternary_source(name, rows, seed)
+        for seed, (name, rows) in enumerate((("query", 3), ("key", 5), ("z", 7)))
+    }
+    for name, (source, _, _) in parts.items():
+        model.add(Parameter(name, source.shape, source, inputs=("input",)))
+    model.packing_groups = [("query", "key", "z")]
+    recipe = Recipe(model)
+    recipe.assign("*", format="t2_g128_fp16", method=import_encoded)
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=4)
+    assert len(prepared.weights) == 1
+    spec = prepared.weights[0].spec
+    assert (spec.shape, spec.layout) == ((15, 256), "ternary_row_k128_v1")
+    path = tmp_path / "t2.ninfer"
+    _write(path, model, prepared)
+    expected = encode_ternary(
+        torch.cat([codes for _, codes, _ in parts.values()]),
+        torch.cat([scales for _, _, scales in parts.values()]),
+        (15, 256),
+    )
+    with Artifact(path) as artifact:
+        assert artifact.read_object(spec.id) == expected
+        parts_z = binding_parts(
+            artifact.directory.bindings["z"],
+            {obj.id: obj for obj in artifact.directory.objects},
+            "z",
+        )
+        assert parts_z == ((spec.id, 8 * 256, 15 * 256),)
+
+
+def test_encoded_import_refuses_a_different_source_format():
+    model = Model({"text": {"config": {}}})
+    source, _, _ = _ternary_source("proj", 2, 0)
+    model.add(Parameter("proj", source.shape, source))
+    recipe = Recipe(model)
+    recipe.assign("proj", format="q8_g32_fp16", method=import_encoded)
+    with pytest.raises(ValueError, match="differs from target"):
+        recipe.prepare(device="cpu")
+
+
+def test_q8_rows_import_exactly_from_encoded_source(tmp_path):
+    generator = torch.Generator().manual_seed(3)
+    codes = torch.randint(-127, 128, (4, 4, 32), dtype=torch.int8, generator=generator)
+    scales = torch.rand((4, 4), generator=generator).to(torch.float16)
+    source = LogicalSource(
+        (4, 128),
+        "q8",
+        lambda begin, end: torch.zeros(end - begin),
+        lambda begin, end: EncodedRows("q8_g32_fp16", codes[begin:end], scales[begin:end]),
+    )
+    model = Model({"text": {"config": {}}})
+    model.add(Parameter("proj", source.shape, source))
+    recipe = Recipe(model)
+    recipe.assign("proj", format="q8_g32_fp16", method=import_encoded)
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=3)
+    path = tmp_path / "q8.ninfer"
+    _write(path, model, prepared)
+    with Artifact(path) as artifact:
+        obj_id = prepared.weights[0].spec.id
+        decoded_scales, decoded_codes = decode_row_split_codes(
+            artifact.read_object(obj_id), "q8_g32_fp16", (4, 128)
+        )
+    assert torch.equal(decoded_codes, codes) and torch.equal(decoded_scales, scales)

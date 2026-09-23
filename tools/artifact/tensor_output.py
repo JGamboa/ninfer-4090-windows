@@ -12,17 +12,20 @@ from .codecs.direct import encode_direct
 from .codecs.fp8_row import encode_fp8_row_scaled
 from .codecs.nvfp4 import encode_nvfp4
 from .codecs.row_split import encode_row_split, split_row_planes
+from .codecs.ternary import encode_ternary
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
     Nvfp4Format,
     QuantFormat,
+    TernaryFormat,
     get_format,
 )
 from .layouts import (
     block_scale_geometry,
     row_scale_geometry,
     row_split_geometry,
+    ternary_geometry,
 )
 from .schema import TensorObject
 from .writer import ArtifactWriter
@@ -67,6 +70,9 @@ class TensorOutput:
         elif isinstance(self.format, Nvfp4Format):
             g = block_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
+        elif isinstance(self.format, TernaryFormat):
+            g = ternary_geometry(self.format, obj.shape)
+            gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         else:
             gaps = ()
         for begin, end in gaps:
@@ -104,6 +110,17 @@ class TensorOutput:
             self.write_bytes(row_begin * k, block[: local.code_plane_bytes])
             self.write_bytes(
                 g.scale_plane_offset + row_begin * 2, block[local.scale_plane_offset :]
+            )
+        elif isinstance(self.format, TernaryFormat):
+            g = ternary_geometry(self.format, obj.shape)
+            local = ternary_geometry(self.format, (rows, k))
+            block = memoryview(encode_ternary(codes, scales, (rows, k)))
+            self.write_bytes(
+                row_begin * g.code_row_bytes, block[: local.code_plane_bytes]
+            )
+            self.write_bytes(
+                g.scale_plane_offset + row_begin * g.scale_row_bytes,
+                block[local.scale_plane_offset :],
             )
         elif isinstance(self.format, Nvfp4Format):
             if row_begin % 128 or rows % 128 or weight_divisor is None:
