@@ -1,6 +1,6 @@
 # Ternary Bonsai 2 27B on NInfer (sm_89): design contract
 
-Status: DRAFT v1, 2026-09-23. Branch `feat/bonsai-ternary`, worktree `E:\LLM\ninfer-4090-bonsai`,
+Status: v1 (all three code surveys folded in), 2026-09-23. Branch `feat/bonsai-ternary`, worktree `E:\LLM\ninfer-4090-bonsai`,
 based on `sync-upstream` @ `49dab0f7` (upstream `neroued/master` `9e163eee` merged into the
 sm_89 Windows port). This document is the shared contract for three implementation agents
 (A converter, B artifact+model, C kernels). Every section marked **CONTRACT** is binding;
@@ -9,7 +9,9 @@ sections marked **GUIDANCE** are recommendations the owner may change if they do
 Read first: `AGENTS.md`, `WINDOWS_PORT.md`, `docs/maintainer/tensor-formats.md`,
 `docs/maintainer/storage-layouts.md`, `docs/maintainer/artifact-container.md`,
 `docs/maintainer/model-weight-execution.md`, `docs/maintainer/op-development.md`,
-`docs/maintainer/qwen3.8-27b-artifact.md`, `docs/maintainer/linear-benchmark.md`.
+`docs/maintainer/qwen3_5-model.md`, `docs/weight-conversion.md`,
+`docs/maintainer/linear-benchmark.md`, `bench/README.md` (sections "linear" and the fused-op
+benches), `tests/README.md`.
 
 ---
 
@@ -314,11 +316,11 @@ fixed by the 27B and match the existing per-shape kernel files of q8/nvfp4:
 
 | family | (N, K) | consumer | existing template to copy | admission to extend |
 |---|---|---|---|---|
-| gdn_input_proj | 16384 × 5120 | GDN in_proj qkv+z, single parent (also the `conv_snapshot` / `conv_record` forms, `include/ninfer/ops/gdn_input_proj.h:89-228`) | `src/ops/gdn_input_proj/q8/*` | `src/ops/weight_input.cpp:115-148` (single-parent dense list), `src/ops/wrapper/gdn_input_proj.cpp:697-746` |
-| attn_input_proj | 14336 × 5120 | attention q/k/gate/v, single parent | `src/ops/attn_input_proj/q8/*` | `weight_input.cpp:115-148`, `src/ops/wrapper/attn_input_proj.cpp:201-227` |
-| linear_add | 5120 × 6144 | gdn/output and attention/output + residual | `src/ops/linear_add/q8/*` (plan pattern: `linear_add/q5/q5_linear_add_plan.h:13-46`) | `src/ops/wrapper/linear_add.cpp:30-37, 104-107, 174-184` |
-| linear_swiglu | 34816 × 5120 | mlp/gate+up, silu·up epilogue | `src/ops/linear_swiglu/q8/*` (plan: `linear_swiglu/q4/q4_linear_swiglu_plan.h:13-47`) | `src/ops/wrapper/linear_swiglu.cpp:48-50, 98-131` |
-| linear_add | 5120 × 17408 | mlp/down + residual | `src/ops/linear_add/q8/*` | as above |
+| gdn_input_proj | 16384 × 5120 | GDN in_proj qkv+z, single parent; prefill form writes `qkv [10240,T]` + `z`, decode/verify forms `conv_snapshot` / `conv_record` also update the causal-conv state (`include/ninfer/ops/gdn_input_proj.h:89-228`, `execution/gdn.cpp:61-124`) | plan/routes: `src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp:81-110` (the 27B pair); single-parent shape of `gdn_input_proj/q8/*` (35B only today) | `src/ops/weight_input.cpp:115-152` (single-parent dense list), `src/ops/wrapper/gdn_input_proj.cpp:697-746` |
+| attn_input_proj | 14336 × 5120 | attention q/k/gate/v, single parent, four output tensors | `src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp:39-52` (27B pair routes); output split pattern `linear/q8/q8_rowsplit_output.cuh:9-27` (`Q8SplitOutput{2,3,4}`) | `weight_input.cpp:115-152`, `src/ops/wrapper/attn_input_proj.cpp:201-227` |
+| linear_add | 5120 × 6144 | gdn/output and attention/output + in-place residual (`text.cpp:924, 1059`) | `src/ops/linear_add/q5/q5_linear_add_plan.cpp:13-150` (closed route catalog, this exact shape) and `linear_add/q4/q4_linear_add.cu:12-80` (GEMV + K-split with `KSplitResidualEpilogue`) | `src/ops/wrapper/linear_add.cpp:30-37, 104-107, 174-184` |
+| linear_swiglu | 34816 × 5120 | mlp/gate+up, silu·up epilogue → `[17408,T]` (`ffn.cpp:82-86`) | `src/ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp:35-58, 99-143` (this shape); q8 plan `linear_swiglu/q8/q8_linear_swiglu_plan.cpp:23-40` | `src/ops/wrapper/linear_swiglu.cpp:48-50, 98-131` |
+| linear_add | 5120 × 17408 | mlp/down + residual (`ffn.cpp:87`) | `linear_add/q5/*` (Q5 is the only 27B format here today) | as above |
 | linear (generic) | all of the above + 248320 × 5120 | `ops::linear` fallback, tests, bench, lm_head prefill (`program/prefill.cpp:151`, `program_impl.cpp:399`) | `src/ops/linear/q8/shapes/n*_k*.cu`, `q8_dispatch.cpp:22-35`, `q8_geometry.h` | `src/ops/linear/linear.cpp:78-150` (`dispatch_linear` + `linear_workspace_capacity_bytes`) |
 | linear_topk (M5) | 248320 × 5120 | speculative lm_head (`execution/draft.cpp:357-367`) | `src/ops/linear_topk/q8*.cu` | `src/ops/linear_topk/linear_topk.cpp:37-51` (full head Q8/FP8 only today) |
 | embedding (M5) | 248320 × 5120 | token gather (+ inverse Hadamard) | `src/ops/wrapper/embedding.cpp:95-236`, `src/ops/launcher/embed_gather.*` | `include/ninfer/ops/embedding.h:16-22` |
@@ -382,7 +384,21 @@ void hadamard_1024_launch(const Tensor& x, const Tensor& signs, const std::int32
 Graph-capture safe (no host sync, grid = tokens × width/1024). v1 uses it as a standalone kernel
 before every rotated projection. Building block already in the tree: `src/ops/kv_cache/
 hadamard_d256.cuh:10-47` (warp-shuffle in-place H32/H64/H256); H1024 = four H256 butterflies
-followed by two cross-warp stages through shared memory, then `* 0.03125f`. The fused variants (Hadamard prologue inside the t2 GEMV that
+followed by two cross-warp stages through shared memory, then `* 0.03125f`.
+
+Where each rotated activation is produced today (owner of the buffer is the model's
+`WorkspaceArena`, `src/models/qwen3_5/execution/workspace.h:59-138`; the ops never allocate their
+input), and the M4 fusion target for each:
+
+| projection input | width | produced by | v1 | M4 fusion |
+|---|---|---|---|---|
+| attention q/k/gate/v | 5120 | `ops::rmsnorm(x, input_norm, …, h)` (`execution/text.cpp:848-864`; d = 5120 CTA kernel `src/ops/launcher/rmsnorm.cu:22-48`, epilogue enum `RmsEpilogue{Offset,Plain,Gated}` in `src/ops/kernel/rmsnorm.cuh:14-26`) | standalone | new `RmsEpilogue::Hadamard` (one CTA already holds the whole 5120 row = 5 blocks) |
+| mlp gate/up | 5120 | `rmsnorm(x, post_attention_norm) → h` (`text.cpp:1069-1073`) | standalone | same rmsnorm epilogue |
+| gdn q/k/v/z | 5120 | `ops::gdn_norm_gating_proj` fuses the input norm with the A/B control dots and writes `h` (`execution/gdn.cpp:71-83`, kernel `src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu:14-60`) | standalone on `h` | second output `h_rot` from that kernel; `g`/`beta` keep the primal `n` |
+| gdn output | 6144 | `ops::gated_rmsnorm(o, norm, z, eps, on)`, `on` is `[128, 48 heads, T]` in artifact `gdn/value` row order = HF `in_proj_qkv` order (`text.cpp:1057-1060`, `load/text.cpp:44`) | standalone | epilogue of `gated_rmsnorm` or prologue of the `t2` linear_add. Expected `perm == nullptr`: HF value-head order is the grouped order Prism folded (`repeat_interleave`, k_head = j / 3); B confirms by reading the GDN kernel's head indexing |
+| attention output | 6144 | `sigmoid_mul(gate, a)` `[6144, T]` (`text.cpp:924`) | standalone | epilogue of `sigmoid_mul` or prologue of the `t2` linear_add |
+| mlp down | 17408 | the swiglu epilogue writes `[17408, T]` in ≤ 64-row tiles (`linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cuh`), so a 1024-wide rotation cannot live there | standalone | prologue inside the `t2` down-proj kernel (stage 1024-K blocks of `x` in smem; the q4 GEMV `CtaSharedFullK` mode already stages the whole K row, `q4_rowsplit_gemv.cuh:432-443`) |
+| lm_head | 5120 | `text/final_norm` rmsnorm (`text.cpp:57`) | none in v1 (head is pre-folded q8) | M5: rmsnorm epilogue | The fused variants (Hadamard prologue inside the t2 GEMV that
 already stages `x` in shared memory; Hadamard epilogue in rmsnorm / silu_mul) are M4 work by C.
 
 ### 3.3 t2 linear launchers (owner C)
@@ -412,20 +428,49 @@ into section 9 once both sides have read them; until then the q8 header is the s
 
 ### 3.4 Kernel design (GUIDANCE for C)
 
-- Decode GEMV (T ≤ 8): one warp per R rows (R = 2..4), each lane loads 16 B of codes = 64
-  weights per step, unpacks with shifts/LUT to bf16 pairs (`(q-1)` ∈ {-1,0,1} → the multiply
-  degenerates to add/sub/skip; a 4-bit LUT into `bf16x2` as bonsai-vllm does is fine), FMA against
-  `x` staged in shared memory (bf16 or fp32), accumulate 128-wide partials in fp32 and apply the
-  fp16 group scale once per group. Bandwidth target: ≥ 85 % of the q4 GEMV's effective GB/s on the
-  same shape (q4 reads 2.3× more bytes, so ~2× its tok/s).
-- Small-T (8 < T ≤ 64) and prefill: dequantize a `[BlockN × BlockK]` weight tile to bf16 in
-  shared memory and run `mma.sync.m16n8k16` bf16 like `q8_rowsplit_gemm_mma`; the int8 variant
-  (`mma.s8` with int8-quantized activations, ternary codes are exact int8) is an optional
-  optimization after M4, never a requirement.
-- Split-K for the K = 17408 and K = 6144 shapes at low T, as q8 does.
-- Every launch must be CUDA-graph capturable (no host-visible sync, static grids per token band,
-  workspace from `WorkspaceArena`). PDL usage as in the q8 kernels (`src/core/pdl.cuh`), guarded
-  by `NINFER_SM86` like the existing code.
+Kernel cores to copy (all header-only templates instantiated per shape TU; q8 has NO T = 1 GEMV
+for the 5120-wide shapes, so q4 is the GEMV template):
+
+| band | copy from | what changes for `t2` |
+|---|---|---|
+| decode GEMV, T ≤ 8 | `src/ops/linear/q4/q4_rowsplit_gemv.cuh:405-517` kernel, R1W8 byte path `:259-307` (`Q4GemvR1Q8DirectSchedule`, `:96-105`), launcher `q4_gemv_launch.cuh:10-27`, storage constants `q4_rowsplit_storage.cuh:12-32` | storage = group 128, 32 code bytes + 2 scale bytes per group; replace `Q4SimtDecodeAtom::decode_eight` by a 2-bit unpack of 16 codes per 32-bit word (`(q-1)` ∈ {-1,0,1}: the FMA degenerates to add/sub/skip, or use a 4-bit LUT into `bf16x2` as bonsai-vllm does); fp32 accumulation per 128-group, scale once per group |
+| small-T K-split MMA, T ≤ 64 | `src/ops/linear/q4/q4_ksplit_mma.cuh:59-263` (decodes codes → bf16 A-fragments per 64-K warp slice, per-group fp16 scale folded in fp32 `:181-189`, cross-warp reduction `:201-241`), launcher `q4_ksplit_launch.cuh:9-24`, strided epilogue `q4_ksplit_strided_store.cuh:19-48` | `kGroupK` 64 → 128 (two warp slices per scale group) and the 2-bit unpack |
+| prefill MMA, T > 64 | `src/ops/linear/q8/q8_rowsplit_gemm_mma.cuh` (`Q8RowSplitMmaGemmSchedule<BM,BN,WM,WN,MinBlocks,Stages=2,BK=64|128,…>`, sm_89 48 KiB static-smem assert `:79-84`) or `q4_rowsplit_gemm_mma.cuh:93-414` (`decode_weight` smem dequant `:276-295`), instances `q4_rowsplit_gemm_mma.cu:41-142` | dequant tile to bf16 in smem, `ldmatrix` + `mma_bf16` (`src/ops/common/mma.cuh:33-40`); `mma_s8` (`:62-68`) with int8 activations is an optional post-M4 optimization, never a requirement |
+| per-shape selector | `src/ops/linear/q8/shapes/n5120_k6144.cu:1-34`, `q8_shapes.h:8-43`, `q8_dispatch.cpp:22-32`, `q8/sources.cmake`; band rationale documented in `q4/shapes/n34816_k5120.cu:17-49` | one TU per (N,K) returning a launch fn-pointer per token band; capacity-bounded tiles take live T as a kernel argument (`q8_ksplit_launch.cuh:27`), never a host branch inside capture |
+| fused families | `linear_add/q4/q4_linear_add.cu:12-80`, `linear_add/q5/q5_linear_add_plan.cpp:13-150`, `linear_swiglu/q4/q4_linear_swiglu_plan.cpp:35-58, 99-143`, `attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp:39-52`, `gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp:81-110` | same route-catalog/plan shape (`Problem`, `Plan{schedule, workspace_bytes}`, `admits/resolve_plan/capacity_workspace_bytes/execute_plan/dispatch`), `static_assert(catalog_is_closed(...))` |
+
+Rules every kernel follows (verified across `src/ops`):
+
+- Split-K for K = 17408 and K = 6144 at low T, as q4/q5 do.
+- Workspace only from `WorkspaceArena` (`src/core/arena.h:44-111`, bump allocator, `Scope` RAII);
+  q4/q5/q6/q8 `linear` report 0 workspace (`linear.cpp:119-134`); tests assert `peak_used() <=
+  capacity && used() == 0` after every call (`tests/ops/linear/linear_test_common.cpp:374-377,
+  450-470`).
+- CUDA-graph capturable: plain `<<<>>>` + `CUDA_CHECK(cudaGetLastError())`, grids depend only on
+  (N, T-band), host token-slice loops emit static launches (`src/ops/common/token_slices.h`), no
+  `cudaMemcpy`/sync anywhere under `src/ops`; graph replay is part of the linear tests
+  (`linear_test_common.cpp:343-372`).
+- PDL: `src/core/pdl.cuh:20-57` compiles to plain launches under `NINFER_SM86`; keep the
+  `TriggerPdl/JoinPdl` template flags of the q4 GEMV so the fused GDN paths can use them later.
+- 48 KiB static shared memory cap on sm_89 (`q8_ksplit_mma.cuh:108-113`,
+  `q8_rowsplit_gemm_mma.cuh:79-84`); sm_89 K-split defaults `q8_ksplit_config.h:49-56`.
+- Baseline first: no per-shape T = 1 numbers exist for the 4090 in the tree (only RTX 5090 figures
+  in `docs/performance/qwen3.8-27b.md` and `docs/maintainer/linear-benchmark.md:473-507`). Before
+  writing `t2`, record `build/bench/ninfer_linear_bench --qtype q4|q5|q8 --n … --k … --sweep
+  1:32:1 --execution graph` for the six shapes; the `t2` acceptance in section 7 is relative to
+  those numbers.
+- Bench: `bench/ops/linear_bench.cu` (cold-cache `measure_cold_launch` / `measure_cold_graph`,
+  `bench/ops/ninfer_bench_common.h:187-256`; weight fixture `bench/ops/quantized_weight.cuh:43-56,
+  93-164` needs a `t2` geometry entry); fused-op benches `q5_linear_add_bench.cu`,
+  `q4_linear_swiglu_bench.cu`, `attn_input_proj_bench.cu`, `gdn_input_proj_bench.cu`, registered in
+  `bench/ops/benchmarks.cmake` via `ninfer_add_op_bench` (`bench/cmake/NinferBenchmarks.cmake:1-10`).
+- Tests: `ninfer_add_op_test` (`tests/cmake/NinferTests.cmake:31-35`; oracles compiled with
+  `-fno-fast-math`), registrations `tests/ops/linear/tests.cmake:1-41`, `linear_add/tests.cmake`,
+  `linear_swiglu/tests.cmake`, fused projections `tests/ops/tests.cmake:111-131`; reference =
+  FP64 accumulation over FP32-dequantized rows (`linear_test_common.cpp:251-291`), tolerance A16 =
+  rel-L2 1/256 (`:35-52`); shape/T matrix example `tests/ops/linear/test_q4_a16.cpp:20-172`;
+  fixture codec branch in `tests/ops/quantized_weight.h:320, 730` (`make_patterned_weight`,
+  `materialize_rows_fp32`).
 - Expected ceiling: ~5.6 GB read per decode token at ~850 GB/s effective ≈ 150 tok/s at T = 1 with
   no speculation; MTP acceptance ~3 tokens/round moves the practical target to 200–300 tok/s.
 
@@ -687,11 +732,13 @@ Goal: sm_89 kernels for `t2_g128_fp16` at the 27B shapes (table in section 3) pl
 kernel, graph-capturable, tested against CPU references and benchmarked against q4/q8. Deliver in
 this order:
 1. Headers + throwing stubs for every launcher in 3.2/3.3 and the `t2/sources.cmake` manifests
-   (one commit, so B can compile).
+   (one commit, so B can compile). Then record the q4/q5/q8 baselines of the six shapes with
+   `ninfer_linear_bench` (section 3.4) in `docs/maintainer/bonsai-ternary-kernels.md`.
 2. `hadamard_1024_launch` (bf16 in/out, signs before butterfly, 1/32) with a test against the
-   numpy definition in 1.5.
+   numpy definition in 1.5 (build on `src/ops/kv_cache/hadamard_d256.cuh`).
 3. Decode GEMV (T ≤ 8) for 5120×6144 and 5120×17408 (`linear` + `linear_add` families), test
-   with synthetic `Weight` views, bench in `bench/ops` vs the q4 and q8 kernels of the same shape.
+   with synthetic `Weight` views (`tests/ops/quantized_weight.h` codec branch +
+   `make_t2_g128_fp16_weight`), bench in `bench/ops` vs the q4 and q5 kernels of the same shape.
 4. Remaining decode shapes: 16384×5120 (`gdn_input_proj`), 14336×5120 (`attn_input_proj`),
    34816×5120 (`linear_swiglu`).
 5. Small-T and prefill GEMMs (bf16 mma, dequant tile in smem, split-K where q8 uses it), then the
