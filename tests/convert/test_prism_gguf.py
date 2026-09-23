@@ -190,3 +190,42 @@ def test_assert_prism_ternary_gguf_validates_required_metadata(tmp_path):
     with GgufStore(path2) as store:
         with pytest.raises(ValueError):
             assert_prism_ternary_gguf(store)
+
+
+def test_ternary_rows_repack_the_stored_codes_exactly(tmp_path):
+    from tools.artifact.codecs.ternary import dequantize_ternary_words
+    from tools.convert.sources.prism_gguf import ternary_rows
+
+    rng = random.Random(99)
+    ptq = _random_blocks(rng, 28, 6, d_high_byte_offset=27)  # 3 rows, K = 256
+    pq_codes = [rng.randrange(3) for _ in range(3 * 256)]
+    pq = b""
+    for block in range(6):
+        codes = pq_codes[block * 128 : (block + 1) * 128]
+        qs = bytes(
+            codes[4 * i] | codes[4 * i + 1] << 2 | codes[4 * i + 2] << 4 | codes[4 * i + 3] << 6
+            for i in range(32)
+        )
+        pq += struct.pack("<e", 0.25 * (block + 1)) + qs
+    path = tmp_path / "rows.gguf"
+    path.write_bytes(
+        build_gguf({}, [("ptq.weight", (256, 3), 143, ptq), ("pq.weight", (256, 3), 142, pq)])
+    )
+    with GgufStore(path) as store:
+        for name in ("ptq.weight", "pq.weight"):
+            codes, scales = ternary_rows(store, name, 1, 3)
+            assert codes.shape == (2, 64) and scales.shape == (2, 2)
+            np.testing.assert_array_equal(
+                dequantize_ternary_words(codes, scales).numpy(),
+                dequantize_rows(store, name, 1, 3).numpy(),
+            )
+
+
+def test_ternary_rows_reject_the_invalid_pq2_0_code(tmp_path):
+    from tools.convert.sources.prism_gguf import ternary_rows
+
+    path = tmp_path / "bad.gguf"
+    path.write_bytes(build_gguf({}, [("pq.weight", (128, 1), 142, struct.pack("<e", 1.0) + bytes([0xFF]) * 32)]))
+    with GgufStore(path) as store:
+        with pytest.raises(ValueError, match="0, 1 or 2"):
+            ternary_rows(store, "pq.weight", 0, 1)

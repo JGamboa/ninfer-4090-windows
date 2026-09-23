@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import torch
+
+from tools.artifact.formats import DirectFormat, get_format
 from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
+from .model import Parameter
+from .sources.logical import array_source
+from .sources.ninfer_artifact import NInferArtifactStore
+from .sources.prism_checkpoint import TERNARY_FORMAT, PrismCheckpoint
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -174,10 +183,145 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+_BONSAI_TERNARY = (
+    "/attention/query",
+    "/attention/key",
+    "/attention/gate",
+    "/attention/value",
+    "/attention/output",
+    "/gdn/query",
+    "/gdn/key",
+    "/gdn/value",
+    "/gdn/z",
+    "/gdn/output",
+    "/mlp/gate",
+    "/mlp/up",
+    "/mlp/down",
+)
+_MTP_CONFIG_FIELDS = (
+    "hidden_size",
+    "vocab_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "intermediate_size",
+    "rms_norm_eps",
+)
+
+
+def _bonsai_geometry(model, gguf: PrismCheckpoint) -> None:
+    config = model.config
+    meta = gguf.metadata
+    expected = {
+        "hidden_size": meta.get("qwen35.embedding_length"),
+        "num_hidden_layers": meta.get("qwen35.block_count"),
+        "intermediate_size": meta.get("qwen35.feed_forward_length"),
+        "num_attention_heads": meta.get("qwen35.attention.head_count"),
+        "num_key_value_heads": meta.get("qwen35.attention.head_count_kv"),
+        "head_dim": meta.get("qwen35.attention.key_length"),
+        "linear_num_key_heads": meta.get("qwen35.ssm.group_count"),
+        "linear_key_head_dim": meta.get("qwen35.ssm.state_size"),
+        "linear_num_value_heads": meta.get("qwen35.ssm.time_step_rank"),
+        "linear_conv_kernel_dim": meta.get("qwen35.ssm.conv_kernel"),
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise ValueError(f"bonsai: config {key}={config.get(key)!r}, GGUF says {value!r}")
+    interval = meta.get("qwen35.full_attention_interval")
+    layers = [
+        "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+        for i in range(config["num_hidden_layers"])
+    ]
+    if config["layer_types"] != layers:
+        raise ValueError("bonsai: config layer_types differ from the GGUF attention interval")
+    if config["tie_word_embeddings"]:
+        raise ValueError("bonsai: the Prism GGUF has an untied output head")
+
+
+def _bonsai_mtp(model, recipe, reference: NInferArtifactStore) -> None:
+    """Copy MTP exactly: grouped-integer parents as stored words, direct values as stored."""
+    component = reference.directory.components.get("text", {}).get("config", {})
+    for key in _MTP_CONFIG_FIELDS:
+        if component.get(key) != model.config.get(key):
+            raise ValueError(f"bonsai: MTP reference {key} differs from the target config")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("mtp/"):
+            continue
+        source = reference.parameter_source(name, parameter.shape)
+        format = reference.stored_format(name)
+        if isinstance(get_format(format), DirectFormat):
+            recipe.assign(name, format=format, method=cast_direct, source=source)
+        else:
+            recipe.assign(name, format=format, method=import_encoded, source=source)
+
+
+def bonsai2_27b(model, recipe, sources):
+    """Prism Ternary Bonsai 2: t2 layer projections, primal Q8 embedding/head, copied MTP.
+
+    Sources: ``gguf`` (the PTQ1_0/PQ2_0 GGUF) and, with the ``mtp`` component, ``mtp``
+    (an existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word).
+    """
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    if "vision" in model.components:
+        raise ValueError("the Bonsai GGUF has no Vision tower")
+    gguf = sources["gguf"]
+    if not isinstance(gguf, PrismCheckpoint):
+        raise ValueError("bonsai2_27b requires --source gguf=PATH.gguf")
+    _bonsai_geometry(model, gguf)
+    _optional(model, recipe)
+    rotated = set()
+    for name, parameter in list(model.parameters.items()):
+        if not name.startswith("text/"):
+            continue
+        source = model.source(name, gguf)
+        # The output head and --proposal read the primal-basis GGUF values.
+        model.parameters[name] = replace(parameter, source=source)
+        if name in ("text/token_embedding", "text/output_head"):
+            recipe.assign(name, format=Q8, method=grouped_absmax, source=source)
+        elif name.startswith("text/layers/") and name.endswith(_BONSAI_TERNARY):
+            recipe.assign(
+                name,
+                format=TERNARY_FORMAT,
+                method=import_encoded,
+                source=model.source(name, gguf, TERNARY_FORMAT),
+            )
+            rotated.add(name.split("/", 3)[3])
+        else:
+            if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+                recipe.separate(name)
+            recipe.assign(name, source=source)
+    signs = {}
+    for width, values in sorted(gguf.signs.items()):
+        name = f"text/hadamard/signs_{width}"
+        model.add(
+            Parameter(
+                name,
+                (width,),
+                array_source(values.to(torch.bfloat16), f"{gguf.path}:signs[{width}]"),
+            )
+        )
+        recipe.add_parameter(name)
+        signs[str(width)] = name
+    model.config["prism_hadamard"] = {
+        "version": 1,
+        "transform": "normalized-sylvester-walsh-hadamard",
+        "block_size": 1024,
+        "sign_mode": "explicit",
+        "sign_widths": sorted(gguf.signs),
+        "signs": signs,
+        "rotated_inputs": sorted(rotated),
+        "embedding_inverse": False,
+    }
+    if "mtp" in model.components:
+        _bonsai_mtp(model, recipe, sources["mtp"])
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
+    "bonsai2_27b": bonsai2_27b,
 }

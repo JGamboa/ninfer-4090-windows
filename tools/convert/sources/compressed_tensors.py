@@ -139,7 +139,14 @@ def matrix_source(
     shape: tuple[int, int],
     format: str | None = None,
 ) -> LogicalSource:
-    """Resolve the selected matrix's encoding lazily, after recipe source overrides."""
+    """Resolve the selected matrix's encoding lazily, after recipe source overrides.
+
+    A store that interprets its own encodings (for example a Prism GGUF) supplies
+    ``matrix_source`` itself.
+    """
+    custom = getattr(store, "matrix_source", None)
+    if custom is not None:
+        return custom(name, shape, format)
     prefix = name.removesuffix(".weight")
     resolved: LogicalSource | None = None
 

@@ -6,16 +6,17 @@ PR #29077). Do not re-derive the output order independently; `tests/convert/
 test_prism_gguf.py` checks the vectorized decoders here against a literal scalar
 transliteration of the same C loops.
 
-Both codecs dequantize directly to floats, exactly like the reference
-`dequantize_row_ptq1_0`/PQ2_0 C functions: nothing here returns intermediate {0,1,2} codes.
-Extracting a `t2_g128_fp16` codes/scales pair for the artifact writer is a separate,
-not-yet-implemented step (design doc section 4, Brief A step 2).
+Both codecs first produce the stored codes {0, 1, 2} and FP16 block scales;
+:func:`ternary_rows` repacks them exactly into `t2_g128_fp16` words (design doc section 2)
+and :func:`dequantize_rows` reproduces the reference C dequantization `(code - 1) * d`.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
+
+from tools.artifact.codecs.ternary import pack_ternary_codes
 
 from .gguf_reader import GgufStore
 
@@ -30,19 +31,20 @@ _POW3 = (1, 3, 9, 27, 81, 243)
 
 def _trit(byte_column: np.ndarray, n: int) -> np.ndarray:
     """`(uint8_t)(byte * pow3[n])` truncation, then the `((uint16_t)q*3)>>8` trit
-    extraction, mapped to a signed {-1, 0, 1} value. `byte_column` is any-shaped uint32."""
+    extraction: the stored code in {0, 1, 2} (value `code - 1`). `byte_column` is any-shaped
+    uint32."""
     q = (byte_column * np.uint32(_POW3[n])) & np.uint32(0xFF)
-    xi = (q * np.uint32(3)) >> np.uint32(8)
-    return xi.astype(np.int32) - 1
+    return ((q * np.uint32(3)) >> np.uint32(8)).astype(np.uint8)
 
 
-def dequantize_ptq1_0_blocks(raw: bytes | bytearray | memoryview) -> np.ndarray:
-    """Vectorized, order-preserving port of `dequantize_row_ptq1_0`.
+def ptq1_0_block_codes(raw: bytes | bytearray | memoryview) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized, order-preserving port of `dequantize_row_ptq1_0`, stopping at codes.
 
-    `raw` must hold a whole number of 28-byte `block_ptq1_0` records. Returns float32
-    values of shape `(nblocks, 128)`, one row per block, in exactly the reference order:
-    the stage loop emits 5 trits x 16 bytes (`qs[0:16]`, n outer/m inner), then 5 trits x
-    8 bytes (`qs[16:24]`, n outer/m inner), then 4 trits x 2 `qh` bytes (n outer/h inner).
+    `raw` must hold a whole number of 28-byte `block_ptq1_0` records. Returns uint8 codes
+    in {0, 1, 2} of shape `(nblocks, 128)` and the float16 block scales `(nblocks,)`, in
+    exactly the reference order: the stage loop emits 5 trits x 16 bytes (`qs[0:16]`, n
+    outer/m inner), then 5 trits x 8 bytes (`qs[16:24]`, n outer/m inner), then 4 trits x
+    2 `qh` bytes (n outer/h inner).
     """
     if len(raw) % _PTQ1_0_BLOCK_BYTES:
         raise ValueError("PTQ1_0 raw byte length is not a multiple of the 28-byte block")
@@ -51,35 +53,46 @@ def dequantize_ptq1_0_blocks(raw: bytes | bytearray | memoryview) -> np.ndarray:
     blocks = np.frombuffer(raw, dtype=block_dtype, count=nblocks)
     qs = blocks["qs"].astype(np.uint32)  # [nblocks, 24]
     qh = blocks["qh"].astype(np.uint32)  # [nblocks, 2]
-    d = blocks["d"].astype(np.float32)  # [nblocks]
 
     stage16 = np.concatenate([_trit(qs[:, 0:16], n) for n in range(5)], axis=1)  # [nblocks, 80]
     stage8 = np.concatenate([_trit(qs[:, 16:24], n) for n in range(5)], axis=1)  # [nblocks, 40]
     stageh = np.concatenate([_trit(qh, n) for n in range(4)], axis=1)  # [nblocks, 8]
     codes = np.concatenate([stage16, stage8, stageh], axis=1)  # [nblocks, 128]
     assert codes.shape[1] == BLOCK_ELEMENTS
-    return codes.astype(np.float32) * d[:, None]
+    return codes, blocks["d"].copy()
 
 
-def dequantize_pq2_0_blocks(raw: bytes | bytearray | memoryview) -> np.ndarray:
-    """Vectorized port of PQ2_0 dequantization: `value = (q - 1) * d`, `q` a 2-bit code.
+def pq2_0_block_codes(raw: bytes | bytearray | memoryview) -> tuple[np.ndarray, np.ndarray]:
+    """PQ2_0 codes `(qs[j/4] >> ((j%4)*2)) & 3` and float16 block scales.
 
     `raw` must hold a whole number of 34-byte `block_pq2_0` records (`ggml_half d` then
-    `qs[32]`). Weight `j`'s code is `(qs[j/4] >> ((j%4)*2)) & 3`.
+    `qs[32]`). Code 3 is returned as stored (the reference dequantizes it to `2 * d`);
+    :func:`ternary_rows` rejects it when packing `t2_g128_fp16` words.
     """
     if len(raw) % _PQ2_0_BLOCK_BYTES:
         raise ValueError("PQ2_0 raw byte length is not a multiple of the 34-byte block")
     nblocks = len(raw) // _PQ2_0_BLOCK_BYTES
     block_dtype = np.dtype([("d", "<f2"), ("qs", np.uint8, 32)])
     blocks = np.frombuffer(raw, dtype=block_dtype, count=nblocks)
-    d = blocks["d"].astype(np.float32)  # [nblocks]
-    qs = blocks["qs"].astype(np.uint32)  # [nblocks, 32]
+    qs = blocks["qs"]  # [nblocks, 32]
 
-    codes = np.empty((nblocks, BLOCK_ELEMENTS), dtype=np.int32)
+    codes = np.empty((nblocks, BLOCK_ELEMENTS), dtype=np.uint8)
     for shift in range(4):
         # j = 4*byte_index + shift, so this fills columns shift, shift+4, shift+8, ...
-        codes[:, shift::4] = ((qs >> np.uint32(shift * 2)) & np.uint32(0x3)).astype(np.int32) - 1
-    return codes.astype(np.float32) * d[:, None]
+        codes[:, shift::4] = (qs >> np.uint8(shift * 2)) & np.uint8(0x3)
+    return codes, blocks["d"].copy()
+
+
+def dequantize_ptq1_0_blocks(raw: bytes | bytearray | memoryview) -> np.ndarray:
+    """`(code - 1) * d` per block, float32 `(nblocks, 128)`; see :func:`ptq1_0_block_codes`."""
+    codes, d = ptq1_0_block_codes(raw)
+    return (codes.astype(np.float32) - 1.0) * d.astype(np.float32)[:, None]
+
+
+def dequantize_pq2_0_blocks(raw: bytes | bytearray | memoryview) -> np.ndarray:
+    """`(code - 1) * d` per block, float32 `(nblocks, 128)`; see :func:`pq2_0_block_codes`."""
+    codes, d = pq2_0_block_codes(raw)
+    return (codes.astype(np.float32) - 1.0) * d.astype(np.float32)[:, None]
 
 
 _DECODERS = {
@@ -104,6 +117,33 @@ def dequantize_rows(store: GgufStore, name: str, row_begin: int, row_end: int) -
     decoded = decode(raw)
     rows = row_end - row_begin
     return torch.from_numpy(decoded.reshape(rows, k).copy())
+
+
+_CODE_DECODERS = {
+    PTQ1_0_TYPE: ptq1_0_block_codes,
+    PQ2_0_TYPE: pq2_0_block_codes,
+}
+
+
+def ternary_rows(
+    store: GgufStore, name: str, row_begin: int, row_end: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact `t2_g128_fp16` words for a row range: packed uint8 codes `[rows, K/4]` and
+    float16 scales `[rows, K/128]`. Nothing is expanded to floats."""
+    info = store.tensor(name)
+    try:
+        decode = _CODE_DECODERS[info.ggml_type]
+    except KeyError:
+        raise ValueError(
+            f"{name}: unsupported Prism ternary type {info.type_name} (id {info.ggml_type})"
+        ) from None
+    k = info.shape[0]
+    if k % BLOCK_ELEMENTS:
+        raise ValueError(f"{name}: K={k} is not a multiple of the ternary block size {BLOCK_ELEMENTS}")
+    rows = row_end - row_begin
+    codes, scales = decode(store.read_rows_raw(name, row_begin, row_end))
+    packed = pack_ternary_codes(torch.from_numpy(codes.reshape(rows, k)))
+    return packed, torch.from_numpy(scales.reshape(rows, k // BLOCK_ELEMENTS))
 
 
 def sign_vectors(store: GgufStore) -> dict[int, torch.Tensor]:
@@ -152,6 +192,9 @@ __all__ = [
     "dequantize_ptq1_0_blocks",
     "dequantize_pq2_0_blocks",
     "dequantize_rows",
+    "ptq1_0_block_codes",
+    "pq2_0_block_codes",
+    "ternary_rows",
     "sign_vectors",
     "assert_prism_ternary_gguf",
 ]

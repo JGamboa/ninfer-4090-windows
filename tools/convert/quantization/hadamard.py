@@ -17,6 +17,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 import numpy as np
+import torch
 
 DEFAULT_BLOCK = 1024
 
@@ -58,4 +59,34 @@ def unrotate_embedding_rows(
     return (z.reshape(z.shape[0], -1, block) @ h.T).reshape(z.shape) * signs[None, :]
 
 
-__all__ = ["DEFAULT_BLOCK", "sylvester_hadamard", "rotate_rows", "unrotate_embedding_rows"]
+@lru_cache(maxsize=4)
+def _hadamard_fp32(block: int) -> torch.Tensor:
+    return torch.from_numpy(sylvester_hadamard(block).astype(np.float32))
+
+
+def unrotate_rows(
+    z: torch.Tensor, signs: torch.Tensor, block: int = DEFAULT_BLOCK
+) -> torch.Tensor:
+    """Float32 torch form of :func:`unrotate_embedding_rows`: `signs * H_blk(z)`.
+
+    Recovers primal-basis weights from Prism-folded rows (`W = (W' @ H) * s` per block) and
+    primal embeddings from the rotated table. `z` is `[rows, K]`; entries of `H` are exactly
+    `+-1/32` for the 1024 block, so only the FP32 accumulation order rounds.
+    """
+    if z.dim() != 2 or z.shape[1] % block:
+        raise ValueError(f"unrotate_rows requires [rows, K] with K % {block} == 0")
+    if tuple(signs.shape) != (z.shape[1],):
+        raise ValueError(f"signs must have shape ({z.shape[1]},), got {tuple(signs.shape)}")
+    rows, k = z.shape
+    h = _hadamard_fp32(block).to(z.device)
+    rotated = (z.float().reshape(rows, k // block, block) @ h).reshape(rows, k)
+    return rotated * signs.to(device=z.device, dtype=torch.float32)[None, :]
+
+
+__all__ = [
+    "DEFAULT_BLOCK",
+    "sylvester_hadamard",
+    "rotate_rows",
+    "unrotate_embedding_rows",
+    "unrotate_rows",
+]

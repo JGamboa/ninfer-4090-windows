@@ -14,7 +14,18 @@ from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
 from .recipe import Recipe
+from .sources.ninfer_artifact import NInferArtifactStore
+from .sources.prism_checkpoint import PrismCheckpoint
 from .sources.safetensors import SafetensorsSource
+
+
+def open_source(path: Path):
+    """Open a named source by its file type: GGUF, NInfer artifact or Safetensors."""
+    if path.suffix == ".gguf":
+        return PrismCheckpoint(path)
+    if path.suffix == ".ninfer":
+        return NInferArtifactStore(path)
+    return SafetensorsSource(path)
 
 
 class SourceInputs(Mapping):
@@ -32,7 +43,7 @@ class SourceInputs(Mapping):
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
             self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
+                open_source(self._paths[name])
             )
         return self._sources[name]
 
@@ -106,7 +117,8 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="named source such as quantized, dflash or dflash2",
+        help="named source such as quantized, dflash, dflash2, gguf or mtp "
+        "(.gguf and .ninfer paths open their own readers)",
     )
     parser.add_argument(
         "--components",
