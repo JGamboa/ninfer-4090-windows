@@ -29,9 +29,9 @@ Build/test on Windows: configure with the flags in `winport_configure.bat` (VS 1
 `vcvars64`, CUDA v13.4, vcpkg `E:/LLM/vcpkg`, triplet `x64-windows`, `-DBUILD_TESTING=ON`) into
 `E:\LLM\ninfer-4090-bonsai\build` (already configured). Build single targets with
 `ninja -C E:\LLM\ninfer-4090-bonsai\build <target>` from a `vcvars64` shell (run `.bat` files from
-PowerShell, not from Git Bash). There is no Python on Windows; Python lives in WSL (`wsl -e bash
--lc '...'`, paths `/mnt/e/LLM/...`), the system `python3` there has neither `pip` nor `numpy`, and
-previous conversions ran in a Docker image under `~/ninfer` on the WSL ext4 disk (see section 6.5).
+PowerShell, not from Git Bash). Everything, including the converter, runs on Windows: Python 3.12
+(Microsoft Store, `python3` / `python` from PowerShell, pip available) in a venv at
+`E:\LLM\ninfer-4090-bonsai\.venv` (section 6.5). WSL and Docker are NOT used for this work.
 
 ---
 
@@ -486,9 +486,19 @@ The v3 converter (`tools/convert/__main__.py` → `qwen3_5.build_model` → `Rec
 
 New files:
 
+- `tools/artifact/os_compat.py` (Windows layer, first deliverable of agent A): the converter and
+  writer use nine POSIX-only calls in three files: `tools/artifact/file_io.py:9,14,18,36`
+  (`os.sysconf("SC_PAGE_SIZE")`, `os.posix_fadvise`, `os.fdatasync`), `tools/artifact/reader.py:
+  38,47,103,148` and `tools/convert/sources/safetensors.py:149` (`os.pread`), `tools/artifact/
+  writer.py:185,270` (`os.pwrite`, `os.link`). Provide `pread(fd, n, offset)` / `pwrite(fd, buf,
+  offset)` (Windows: `os.lseek` + `os.read`/`os.write` under a per-fd lock; POSIX: the native
+  calls), `fadvise_dontneed` (no-op on Windows), `fsync_data` (`os.fdatasync` or `os.fsync`),
+  `page_bytes` (`mmap.PAGESIZE`); `os.link` works on NTFS unchanged. Route the nine call sites
+  through it; run `python -m pytest tests/artifact tests/convert` on Windows before anything
+  else. Keep POSIX behaviour identical so upstream merges stay trivial.
 - `tools/convert/sources/gguf_reader.py` (seeded; a dependency-free GGUF v3 header/tensor-table
-  parser) → extend into a store with bounded `read_flat`-style reads (`os.pread`, like
-  `sources/safetensors.py:114-154`).
+  parser) → extend into a store with bounded `read_flat`-style reads through `os_compat.pread`,
+  like `sources/safetensors.py:114-154`.
 - `tools/convert/sources/prism_gguf.py`: `prism_matrix_source(store, gguf_name, shape) ->
   LogicalSource` exposing `read_values` (dequantized floats, needed by `grouped_absmax` for the q8
   head/embedding paths) and `read_encoded` returning `EncodedRows(format="t2_g128_fp16", codes
@@ -513,13 +523,17 @@ New files:
 Invocation (GUIDANCE):
 
 ```
-python3 -m tools.convert --model /models/bonsai2-27b --recipe bonsai2_27b \
-  --components text,mtp,dflash2 \
-  --source gguf=/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-  --source mtp=/models/qwen3_8_27b.ninfer \
-  --source dflash2=/models/dflash2-src \
-  --name bonsai2-27b --out /out/bonsai2_27b_t2.ninfer
+E:\LLM\ninfer-4090-bonsai\.venv\Scripts\python.exe -m tools.convert ^
+  --model E:\LLM\bonsai2-27b --recipe bonsai2_27b --components text,mtp,dflash2 ^
+  --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --source mtp=E:\LLM\qwen3_8_27b.ninfer ^
+  --source dflash2=E:\LLM\dflash2-src ^
+  --name bonsai2-27b --out E:\LLM\bonsai2_27b_t2.ninfer --device cuda
 ```
+
+(`E:\LLM\dflash2-src` is the DFlash2 HF companion; today it lives only on the WSL disk at
+`~/ninfer/models/dflash2-src`, copy it once to `E:\LLM`. `E:\LLM\qwen38-tokenizer` already holds
+the tokenizer files for the base dir.)
 
 Pipeline (one invocation, one artifact):
 
@@ -610,21 +624,25 @@ compile against C's headers as soon as C lands the header + a throwing stub (C's
 
 ### 6.5 Python environment for A
 
-No Python on Windows, and the converter is POSIX-only anyway (`os.pread`, `posix_fadvise`,
-`os.link`). WSL Ubuntu's system `python3.14` has neither `pip` nor `numpy`. The recorded Qwen3.8
-conversion ran in Docker on WSL with `pytorch/pytorch:latest` (torch 2.2.1, py3.10) plus
-`pip install safetensors`; the image is still present (`docker images`). Use it:
+Windows only. Python 3.12.10 (Microsoft Store) is on PATH as `python3` and `python` from
+PowerShell (there is no `py` launcher); pip 25 works. Create the venv once:
 
 ```
-wsl -e bash -lc 'docker run --rm --gpus all -v ~/ninfer:/models -v /mnt/e/LLM/ninfer-4090-bonsai:/src \
-  -w /src pytorch/pytorch:latest bash -lc "pip install -q safetensors && python -m tools.convert ..."'
+python3 -m venv E:\LLM\ninfer-4090-bonsai\.venv
+E:\LLM\ninfer-4090-bonsai\.venv\Scripts\python.exe -m pip install numpy safetensors pytest
+E:\LLM\ninfer-4090-bonsai\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Inputs already on the WSL ext4 disk: `~/ninfer/models/dflash2-src` (DFlash2 HF companion),
-`~/ninfer/models/qwen38-tokenizer`, `~/ninfer/models/coldfusion-src` (a ColdFusion fine-tune, NOT
-the Qwen3.8 base; do not take the MTP head from it). Copy `E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf`
-and `E:\LLM\qwen3_8_27b.ninfer` to `~/ninfer/models` first; reading `/mnt/e` is 5.6× slower.
-Python tests: `python3 -m pytest tests/artifact tests/convert` (`tests/README.md:103-106`).
+`torch` is mandatory (quantization and codecs); the CUDA wheel lets `grouped_absmax` for the q8
+head/embedding run on the 4090 (`--device cuda`), the `t2` import path is CPU-bound either way.
+The converter needs the Windows compatibility shim described in section 4 (`tools/artifact/
+os_compat.py`) before it runs at all; that shim is agent A's first deliverable and is validated by
+`python -m pytest tests/artifact tests/convert` (`tests/README.md:103-106`). Historical note: the
+previous Qwen3.8 conversion ran in Docker on WSL; that path is retired for this work.
+Inputs on `E:\LLM`: `Ternary-Bonsai-2-27B-PTQ1_0.gguf`, `qwen3_8_27b.ninfer`, `qwen38-tokenizer`;
+`dflash2-src` must be copied from the WSL disk once (`wsl -e bash -lc 'cp -r ~/ninfer/models/
+dflash2-src /mnt/e/LLM/'`). Do NOT use `~/ninfer/models/coldfusion-src` for anything (a
+ColdFusion fine-tune, not the Qwen3.8 base).
 
 ---
 
@@ -685,17 +703,20 @@ Common preamble for all three: "Work in `E:\LLM\ninfer-4090-bonsai` (git worktre
 `feat/bonsai-ternary`, base `sync-upstream` 49dab0f7). Read `AGENTS.md`, `WINDOWS_PORT.md` and
 `docs/maintainer/bonsai-ternary-design.md` (the contract) completely before touching anything.
 Own only the paths listed for you in section 6; never edit other agents' paths. Commit your own
-paths only, small commits, messages `feat(<area>): …`. No Python on Windows: run Python in WSL
-(`wsl -e bash -lc '…'`, section 6.5). Build with `ninja -C E:\LLM\ninfer-4090-bonsai\build
-<target>` from a `vcvars64` shell (VS 18 BuildTools, CUDA 13.4; run `.bat` files from
-PowerShell). Append what you resolved to section 9 of the design doc. Report back with: files
-changed, tests run with their output, open questions."
+paths only, small commits, messages `feat(<area>): …`. Everything runs on Windows, never in WSL
+or Docker: Python is the venv `E:\LLM\ninfer-4090-bonsai\.venv` (section 6.5). Build with
+`ninja -C E:\LLM\ninfer-4090-bonsai\build <target>` from a `vcvars64` shell (VS 18 BuildTools,
+CUDA 13.4; run `.bat` files from PowerShell). Append what you resolved to section 9 of the design
+doc. Report back with: files changed, tests run with their output, open questions."
 
 ### Brief A — converter (M0, M1, later M5)
 
 Goal: `python -m tools.convert … --recipe bonsai2_27b` produces `bonsai2_27b_t2.ninfer` from
 `Ternary-Bonsai-2-27B-PTQ1_0.gguf` + `qwen3_8_27b.ninfer` (MTP) + `dflash2-src`, per sections 1,
-2, 4, 6.5. Deliver in this order, each with tests under `tests/convert` / `tests/artifact`:
+2, 4, 6.5, entirely on Windows. Deliver in this order, each with tests under `tests/convert` /
+`tests/artifact`:
+0. `tools/artifact/os_compat.py` and the nine call-site changes (section 4) so the existing
+   converter test suite passes on Windows; commit that alone first.
 1. `sources/gguf_reader.py` store (bounded reads) and `sources/prism_gguf.py` decoders for
    PTQ1_0/PQ2_0 (port the loop in 1.4 verbatim) + `quantization/hadamard.py`. M0 test: reconstruct
    `W ≈ (W' @ H) * s` for three tensors (K = 5120, 6144, 17408) and compare with the same tensors
