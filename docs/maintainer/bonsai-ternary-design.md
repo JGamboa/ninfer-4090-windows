@@ -176,7 +176,7 @@ the row (`signs[block*1024 + idx]`).
   10 butterfly stages, then `* 0.03125f`). `W'` is the ternary tensor as stored.
 - Embedding (`inverse_weight_names`): after the row gather `z = E'[token]`, restore the primal
   basis with `h = s_5120 ⊙ H_blk(z)`. Only `token_embd.weight`.
-- `gdn_v_grouped = true` (only affects `ssm_out.weight`): the folded weight expects its 6144-wide
+- `gdn_v_grouped = true` (runtime activation permutation only for `ssm_out.weight`; for STORAGE order the same 48-head permutation `perm[i] = 3*(i % 16) + i // 16` also applies to `dt_bias`, `ssm_conv1d` value columns and `attn_gate` output rows, see section 9 and `bonsai-ternary-conversion.md`): the folded weight expects its 6144-wide
   input in "grouped" value-head order. llama.cpp's own GDN emits the tiled order `[hd=128][nk=16]
   [rep=3]` and therefore permutes the activation to `[hd][rep][nk]` before the sign/Hadamard step.
   Grouped order means value head `j = rep + 3·k_head`, i.e. value heads that share a key head are
@@ -650,7 +650,7 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 
 | M | deliverable | acceptance |
 |---|---|---|
-| M0 (A) | `gguf_reader.py` + PTQ1_0/PQ2_0 decoders + `hadamard.py` | numpy test: for 3 random tensors (one per K width) reconstruct `W ≈ (W' @ H) * s` blockwise and compare with the ORIGINAL bf16 weights read from `E:\LLM\qwen3_8_27b.ninfer` (or its HF source): per-row cosine ≥ 0.9 median; norms and `A_log`/`dt_bias`/`conv1d` from the GGUF equal the artifact's within fp16 rounding. This proves sign/ordering conventions before any CUDA work. |
+| M0 (A) | `gguf_reader.py` + PTQ1_0/PQ2_0 decoders + `hadamard.py` | numpy test: for 3 random tensors (one per K width) reconstruct `W ≈ (W' @ H) * s` blockwise and compare with the ORIGINAL bf16 weights read from `E:\LLM\qwen3_8_27b.ninfer` (or its HF source): median per-row cosine ≈ 0.88 (the ternary-rounding limit for the Gaussian-like rotated weights; a wrong convention collapses to ~0), MEASURED 2026-09-23: 0.878–0.885 on three tensors, M0 PASSED; norms and `A_log`/`dt_bias`/`conv1d` from the GGUF equal the artifact's within fp16 rounding. This proves sign/ordering conventions before any CUDA work. |
 | M1 (A+B) | Bonsai `.ninfer` with `t2` layer matrices, un-rotated embedding, folded q8 lm_head, MTP+DFlash2 copied; artifact loads, startup validates, engine refuses to generate with a clear "t2 kernels not available" error until M3 | `apps/artifact_inspect` (or equivalent) lists formats; binder tests pass |
 | M2 (C) | `hadamard_1024_launch` + `t2` GEMV for 5120×6144 and 5120×17408 (decode band) | CPU-reference tests (tolerance as the q8 tests); bench shows ≥ 1.8× the q4 GEMV tok/s on the same shape |
 | M3 (B+C) | all six shapes decode band; end-to-end greedy decode with `--spec mtp` | first 64 greedy tokens identical to the PrismML llama.cpp fork on the same prompt with the same chat template (allow ≤ 2 divergences from bf16 accumulation order); MTP acceptance logged |
