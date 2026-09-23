@@ -725,7 +725,7 @@ Goal: `python -m tools.convert … --recipe bonsai2_27b` produces `bonsai2_27b_t
    section 9.
 2. Format/layout/codec/`write_codes` registration for `t2_g128_fp16` on the Python side (table in
    3.1); `import_encoded` extension for `t2_g128_fp16` and `q8_g32_fp16` pass-through.
-3. Recipe `bonsai2_27b` (section 4), base model dir, full conversion run in the Docker image;
+3. Recipe `bonsai2_27b` (section 4), base model dir, full conversion run on Windows with the venv;
    `python -m tools.artifact.inspect` output and the `.conversion.json` go into
    `docs/maintainer/bonsai-ternary-conversion.md`.
 Coordinate with B only through the format name, plane layout and `prism_hadamard` JSON in
