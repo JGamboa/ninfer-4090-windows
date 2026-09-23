@@ -683,8 +683,22 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 - (B) format enum name / storage layout struct: _pending_
 - (B) GDN out_proj activation order: _pending_
 - (B+C) final launcher signatures: _pending_
-- (A) `ssm_a` convention: _pending_
-- (A) Python environment used: _pending_
+- (A) `ssm_a` convention: `ssm_a = -exp(a_log)` (`a_log = log(-ssm_a)`), the standard
+  Mamba2/GDN parameterization. Resolved together with a 48-head index permutation
+  (`perm[i] = 3*(i % 16) + (i // 16)`, GDN's 16 key heads x 3 value-head repeats) that is
+  ALSO needed for `dt_bias`, `ssm_conv1d.weight`'s value columns, and `attn_gate.weight`'s
+  output rows (`gdn/z`) -- i.e. `gdn_v_grouped` is not limited to `ssm_out.weight`'s input
+  columns as section 1.5 states; every GDN tensor shaped by the 48 value heads needs it.
+  Full numeric evidence, the norm `-1` offset convention, and the `ssm_conv1d.weight`
+  transposed-`ne` gotcha are in `docs/maintainer/bonsai-ternary-conversion.md`. M0's ternary
+  reconstruction (design doc section 7) reaches median per-row cosine ~0.88 once these
+  conventions are applied -- clearly the correct convention (every alternative tested
+  collapses to ~0), but short of "well above 0.9"; flagged as open in the conversion doc for
+  confirmation against a second oracle before M1 gates on it.
+- (A) Python environment used: Microsoft Store Python 3.12.10, venv at
+  `E:\LLM\ninfer-4090-bonsai\.venv` per section 6.5; `numpy`, `safetensors`, `pytest` from
+  PyPI, `torch` 2.11.0+cu128 from the cu128 index (GPU wheel installed successfully on the
+  first attempt; no CPU fallback was needed). M0's checks themselves ran on CPU.
 
 ## Appendix: sources
 
