@@ -12,6 +12,7 @@ import struct
 
 import torch
 
+from tools.artifact import os_compat
 from tools.artifact.file_io import discard_cached_pages
 from .logical import LogicalSource
 
@@ -119,7 +120,7 @@ class SafetensorsSource:
             _, fd = self._fds.popitem(last=False)
             discard_cached_pages(fd)
             os.close(fd)
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | os_compat.BINARY_FLAG)
         self._fds[path] = fd
         return fd
 
@@ -146,7 +147,7 @@ class SafetensorsSource:
         count = (end - begin) * word_bytes
         fd = self._file(info.file)
         offset = info.offset + begin * word_bytes
-        raw = os.pread(fd, count, offset)
+        raw = os_compat.pread(fd, count, offset)
         if len(raw) != count:
             raise ValueError(f"{name}: short source read")
         self.bytes_read += count

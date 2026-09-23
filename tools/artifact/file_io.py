@@ -1,21 +1,21 @@
-"""Keep large offline transfers from retaining whole artifacts in Linux's page cache."""
+"""Keep large offline transfers from retaining whole artifacts in the page cache."""
 
 from __future__ import annotations
 
-import os
+from . import os_compat
 
 IO_CHUNK_BYTES = 8 * 1024 * 1024
 WRITEBACK_BYTES = 64 * 1024 * 1024
-_PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+_PAGE_BYTES = os_compat.page_bytes()
 
 
 def discard_cached_pages(fd: int, offset: int = 0, count: int | None = None) -> None:
     if count is None:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os_compat.fadvise_dontneed(fd)
     elif count > 0:
         begin = offset // _PAGE_BYTES * _PAGE_BYTES
         end = (offset + count + _PAGE_BYTES - 1) // _PAGE_BYTES * _PAGE_BYTES
-        os.posix_fadvise(fd, begin, end - begin, os.POSIX_FADV_DONTNEED)
+        os_compat.fadvise_dontneed(fd, begin, end - begin)
 
 
 class Writeback:
@@ -33,7 +33,7 @@ class Writeback:
 
     def flush(self) -> None:
         for fd in self._fds:
-            os.fdatasync(fd)
+            os_compat.fsync_data(fd)
             discard_cached_pages(fd)
         self._fds.clear()
         self._bytes = 0

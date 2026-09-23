@@ -62,7 +62,10 @@ def _function(value: str):
     if value in RECIPES:
         return RECIPES[value]
     filename, separator, function = value.rpartition(":")
-    if not separator:
+    if not separator or not function.isidentifier():
+        # No "path:function" suffix, or the segment after the last ":" is not an
+        # identifier: on Windows an absolute path's own drive-letter colon (e.g.
+        # "C:\recipe.py") would otherwise be misread as this separator.
         filename, function = value, "configure"
     path = Path(filename).resolve()
     spec = importlib.util.spec_from_file_location("ninfer_user_recipe", path)
