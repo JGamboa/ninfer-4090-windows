@@ -5,8 +5,8 @@ natively on **Windows** (MSVC + CUDA, no WSL, no Docker) and on Linux. It runs t
 of the same architecture:
 
 - **[Prism ML Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)**
-  — Qwen3.8-27B compressed to ternary weights {−1, 0, +1}. This branch adds it: **~141–178
-  tok/s decode** (prompt-dependent) from a 6.6 GB artifact with image input. That is 1.8–2.3x the
+  — Qwen3.8-27B compressed to ternary weights {−1, 0, +1}. This branch adds it: **~145–187
+  tok/s decode** (prompt-dependent) from a 6.6 GB artifact with image input. That is 1.9–2.4x the
   decode speed of Prism's own llama.cpp fork on the same card, at the same perplexity.
 - **Qwen3.8-27B** (the official NInfer groupwise artifact), inherited from the upstream 4090
   port: 148.6 tok/s code decode, 262K context. See [Qwen3.8-27B on the RTX 4090](#qwen38-27b-on-the-rtx-4090).
@@ -30,18 +30,19 @@ Same machine for every row: RTX 4090 at stock clocks, Core i9-13900K, Windows 11
 
 | Measurement | NInfer (this branch) | Prism llama.cpp fork |
 |---|---:|---:|
-| Decode, short story (MTP) | **142 tok/s** | — |
-| Decode, Python code (MTP) | **178 tok/s** | — |
-| Decode, mean of six prompts (MTP) | **163 tok/s** | — |
+| Decode, short story (MTP) | **146 tok/s** | — |
+| Decode, Python code (MTP) | **187 tok/s** | — |
+| Decode, mean of six prompts (MTP) | **167 tok/s** | — |
 | Decode, no speculation (`tg128`) | **101 tok/s** | 77 tok/s |
-| Prefill (`pp512`) | **2,428 tok/s** | 1,363 tok/s |
+| Prefill (`pp512`) | **3,061 tok/s** | 1,363 tok/s |
+| Prefill (`pp2048`) | **3,349 tok/s** | — |
 | Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
 | Weights in VRAM, text only | 5.52 GiB | 5.53 GiB |
 | Weights in VRAM with the MTP head | ~6.5 GiB | — |
 | Vision tower | 22 ms per image | via `--mmproj` |
 
 - The decode rows depend on the text: MTP drafts are accepted more often in predictable output
-  (code, math: 170–178 tok/s) than in free prose (141–142 tok/s).
+  (code, math: 176–187 tok/s) than in free prose (145–146 tok/s).
 - Perplexity: wikitext and code are the two corpora where both tools score comparable text.
   NInfer's quick run over four corpora gives an overall 5.8556 (Qwen3.8-27B Q4/Q5: 4.80).
 - The fork's prefill figure uses the PTQ1_0 packing; Prism's model card says its PQ2_0 packing
@@ -66,7 +67,8 @@ three reasons:
    to int8 and multiplies with `dp4a`; prefill uses int8 tensor cores. Prism's Hadamard rotation
    is fused into the activation quantization, and the whole decode round replays as one CUDA
    Graph.
-3. **Prefill in large tiles.** The int8 tensor-core GEMM reads the weights once per 64 tokens.
+3. **Prefill in large tiles.** The int8 tensor-core GEMM decodes each weight tile once per 128
+   tokens and loads its operands with `ldmatrix`.
 
 The costs: about 1 GB of VRAM for the MTP head, and an MTP head that was trained for Qwen3.8, not
 for Bonsai, so acceptance varies with the content.
