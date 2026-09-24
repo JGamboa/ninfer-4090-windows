@@ -23,7 +23,7 @@ from tools.convert.sources.safetensors import SafetensorsSource
 
 from .gguf_fixtures import build_gguf
 
-H, INTER, VOCAB, LAYERS = 1024, 2048, 8, 4
+H, INTER, VOCAB, LAYERS = 1024, 2048, 272, 4
 NK, NV, DK, DV = 2, 4, 256, 256
 HEADS, KV, HEAD_DIM = 4, 1, 256
 KG, VG = NK * DK, NV * DV
@@ -54,14 +54,33 @@ def config():
     }
 
 
+SPECIAL_TOKENS = (
+    "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>",
+    "<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>",
+)
+
+
+def _added(index, content):
+    return {"id": index, "content": content, "special": True, "single_word": False,
+            "lstrip": False, "rstrip": False, "normalized": False}
+
+
 def write_resources(path):
+    """Config plus a byte-level BPE tokenizer the C++ frontend accepts (as test_loading.cpp)."""
     path.mkdir()
     (path / "config.json").write_text(json.dumps(config()))
-    (path / "tokenizer.json").write_text(
-        json.dumps({"model": {"vocab": {str(i): i for i in range(6)}}})
-    )
-    (path / "tokenizer_config.json").write_text("{}")
-    (path / "generation_config.json").write_text("{}")
+    vocab, extra = {}, 256
+    for byte in range(256):
+        visible = 33 <= byte <= 126 or 161 <= byte <= 172 or byte >= 174
+        codepoint = byte if visible else extra
+        extra += 0 if visible else 1
+        vocab[chr(codepoint)] = byte
+    specials = [_added(256 + i, token) for i, token in enumerate(SPECIAL_TOKENS)]
+    tokenizer = {"model": {"type": "BPE", "vocab": vocab, "merges": []}, "added_tokens": specials[:8]}
+    decoder = {str(token["id"]): token for token in specials}
+    (path / "tokenizer.json").write_text(json.dumps(tokenizer))
+    (path / "tokenizer_config.json").write_text(json.dumps({"added_tokens_decoder": decoder}))
+    (path / "generation_config.json").write_text(json.dumps({"eos_token_id": [256, 258]}))
     (path / "chat_template.jinja").write_text("{{ messages }}")
 
 

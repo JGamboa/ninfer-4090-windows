@@ -40,6 +40,7 @@ def main() -> int:
     executable = sys.argv[1]
     with tempfile.TemporaryDirectory(prefix="ninfer-prism-loading-") as temporary:
         root = Path(temporary)
+        (root / "valid").mkdir()
         *_, out, _ = convert_bonsai(root / "valid")
         if subprocess.run([executable, str(out)]).returncode:
             return 1
