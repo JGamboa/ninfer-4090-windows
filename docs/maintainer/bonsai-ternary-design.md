@@ -942,6 +942,18 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   `ninfer_linear_t2_test` (explicit FP64 Sylvester matrix, signs after the butterfly).
   Requires reconversion; MTP and DFlash read the same table through `ops::embedding`.
 
+  Validated 2026-09-24 on the RTX 4090 (`fa71467`, display at 60 Hz): full MSVC build,
+  `ninfer_linear_t2_test` and `prism_loading` interop pass. `E:\LLM\bonsai2_27b_vl.ninfer`
+  reconverted with the same command: 8.68 -> 7.74 GB on disk, `weights ready` 8.39 -> 7.45 GiB
+  with MTP (text only 7.64 -> 6.70 GiB); the Q8-embedding build is kept as
+  `bonsai2_27b_vl_q8emb.ninfer`. Quick perplexity 8.0873 / 9.2868 / 8.1833 / 1.8948, overall
+  5.8556 (Q8 table 5.8545, +0.02 %, every domain within +0.03 %). Six-prompt MTP acceptance,
+  Q8 -> t2 table: 36.7/74.1/57.8/49.6/55.3/67.9 -> 39.8/65.4/58.3/42.1/58.4/67.9 %, mean 56.9 ->
+  55.3 % (two up, three down, one equal: within the greedy-divergence noise).
+  `t2_embedding_kernel` costs 2.8 us x 3 per MTP round (the Q8 gather 2.3 us), so decode speed
+  is unchanged; tok/s differences between the two builds followed the display activity (the
+  same Q8 build measured 121 and 131 tok/s on the lighthouse prompt minutes apart).
+
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also
   drives a 3840x2160 120 Hz desktop), PCIe 4.0 x16, Core i9-13900K, CUDA 13.4.
@@ -956,8 +968,10 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 
 State: t2 conversion (`bonsai2_27b`, t2 head, `AllowA8`), A16 and A8 t2 routes, weight-owned
 rotation fused into the A8 quantization, two-warp A8 GEMV CTAs, Vision tower from Prism's
-mmproj, full MSVC build and test suite passing. Artifacts: `E:\LLM\bonsai2_27b_a8.ninfer`
-(text, MTP, DFlash2) and `E:\LLM\bonsai2_27b_vl.ninfer` (text, Vision, MTP). On the RTX 4090
+mmproj, ternary token embedding, full MSVC build and test suite passing. Reference artifact:
+`E:\LLM\bonsai2_27b_vl.ninfer` (text with the t2 embedding, Vision, MTP; 7.74 GB). Older:
+`bonsai2_27b_vl_q8emb.ninfer` (Q8 embedding) and `bonsai2_27b_a8.ninfer` (Q8 embedding,
+DFlash2, no Vision). On the RTX 4090
 (section 9): MTP decode 116 tok/s on the lighthouse prompt, 165 on Python and 158 on the train
 problem (draft 2, `--lm-head-draft`, ~15.1 ms per round); pp512 2648 tok/s and tg128 85 tok/s
 against the fork's 1363 and 77.1; quick perplexity overall 5.8545.
