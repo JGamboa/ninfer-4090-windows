@@ -233,7 +233,8 @@ int attention_case(const Ternary& w, std::int32_t t,
     int failures = 0, first = 0;
     const std::array<const char*, 4> names{"query", "key", "gate", "value"};
     for (int i = 0; i < 4; ++i) {
-        failures += verify_reduction(std::string("t5 attn_input_proj ") + names[i] +
+        failures += verify_reduction(std::string("t5 attn_input_proj ") + names[i] + " T=" +
+                                         std::to_string(t) +
                                          policy_name(policy),
                                      from_device_bf16(outputs[i].p, std::size_t(rows[i]) * t),
                                      oracle(w, first, rows[i], x, t), criterion(policy));
@@ -287,7 +288,8 @@ int main() {
     int failures = 0;
     {
         // GEMV templates T = 1..4 and the T = 5..8 route, a partial row block (odd N), a row
-        // view of a fused parent, graph replay, and the prefill GEMM with partial 64-token tiles.
+        // view of a fused parent, graph replay, and the prefill GEMMs: 64-token CTAs for
+        // T <= 64, 128-token CTAs beyond, both with partial tiles.
         const Ternary small(301, 3072, 15u);
         for (std::int32_t t : {1, 2, 3, 4, 5, 8, 9}) failures += linear_case(small, 0, 301, t, t == 3);
         failures += linear_case(small, 44, 200, 6, false);
@@ -305,9 +307,15 @@ int main() {
         if (n == 5120) failures += linear_add_case(w, 3);
     }
     {
+        // 128-token prefill GEMM at the longest K (mlp down), accumulating into a residual.
+        const Ternary down(5120, 17408, 3100u);
+        failures += linear_add_case(down, 72);
+    }
+    {
         const Ternary attention(14336, 5120, 78u);
         failures += attention_case(attention, 3);
         failures += attention_case(attention, 6);
+        failures += attention_case(attention, 72); // four outputs from the 128-token GEMM
     }
     {
         // Rotated weights: the projection rotates its primal input inside the quantization.
