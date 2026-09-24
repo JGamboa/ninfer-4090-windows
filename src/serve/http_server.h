@@ -103,6 +103,7 @@ private:
     ServeOptions options_;
     std::string public_model_id_;
     ServeMetrics::MonitorContext monitor_context_; // resolved by attach()
+    ninfer::RuntimeStats monitor_baseline_;        // Engine stats at attach, after warmup
     OpenAIResponsesStore openai_responses_store_;
     ServeMetrics metrics_;
     // Fork-local: the slot routes are ours and have no OperationalLog equivalent, so they

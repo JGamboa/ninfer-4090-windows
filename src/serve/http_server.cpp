@@ -475,7 +475,8 @@ void HttpServer::register_routes() {
         }
         std::vector<ninfer::SlotState> slots = service_->slot_states();
         slots.resize(service_->slot_count());
-        res.set_content(metrics_.render_monitor(monitor_context_, service_->runtime_stats(), slots),
+        res.set_content(metrics_.render_monitor(monitor_context_, service_->runtime_stats(),
+                                                monitor_baseline_, slots),
                         "application/json");
     });
     // llama.cpp-shaped slot detail, read from the Engine's continuation catalog: one slot per
@@ -714,12 +715,13 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::MemorySummary memory = service.memory_summary();
     monitor_context_ = {public_model_id_,
                         options_.max_context,
-                        service.slot_count(),
+                        options_.max_concurrency,
                         memory.kv_capacity,
                         memory.kv_capacity_page_groups,
                         options_.speculative.backend != ninfer::SpeculativeBackend::None
                             ? options_.speculative.draft_tokens
                             : 0u};
+    monitor_baseline_ = service.runtime_stats();
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,

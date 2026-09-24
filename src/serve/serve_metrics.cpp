@@ -50,7 +50,8 @@ void ServeMetrics::record(const GenerationOutcome& outcome) {
 
     const std::lock_guard<std::mutex> lock(mutex_);
     requests_total_ += 1;
-    prefix_cache_hit_tokens_total_ += cached;
+    prompt_tokens_total_ += prompt;
+    prefix_cache_hit_tokens_total_ += std::min(cached, prompt);
     speculative_draft_tokens_total_ += m.speculative_draft_tokens;
     speculative_accepted_tokens_total_ += m.speculative_accepted_tokens;
     last_completed_.prompt_tokens = static_cast<int>(prompt);
@@ -81,7 +82,9 @@ std::vector<ServeMetrics::RecentRequest> ServeMetrics::recent_requests() const {
 
 std::string ServeMetrics::render_monitor(const MonitorContext& context,
                                          const ninfer::RuntimeStats& live,
+                                         const ninfer::RuntimeStats& baseline,
                                          const std::vector<ninfer::SlotState>& slots) const {
+    const auto since = [](auto now, auto then) { return now > then ? now - then : decltype(now){}; };
     nlohmann::json slot_rows = nlohmann::json::array();
     for (std::size_t i = 0; i < slots.size(); ++i) {
         const ninfer::SlotState& slot = slots[i];
@@ -110,7 +113,7 @@ std::string ServeMetrics::render_monitor(const MonitorContext& context,
     const nlohmann::json body{
         {"model", context.model},
         {"max_context", context.max_context},
-        {"max_concurrency", context.max_concurrency},
+        {"lanes", context.lanes},
         {"draft_window", context.draft_window},
         {"kv",
          {{"capacity_tokens", context.kv_capacity_tokens},
@@ -125,10 +128,11 @@ std::string ServeMetrics::render_monitor(const MonitorContext& context,
           {"waiting", live.waiting_requests}}},
         {"totals",
          {{"requests", requests_total_},
-          {"prefill_tokens", live.computed_prefill_tokens},
-          {"prefill_seconds", live.prefill_seconds_total},
-          {"decode_tokens", live.committed_decode_tokens},
-          {"decode_seconds", live.decode_seconds_total},
+          {"prefill_tokens", since(live.computed_prefill_tokens, baseline.computed_prefill_tokens)},
+          {"prefill_seconds", since(live.prefill_seconds_total, baseline.prefill_seconds_total)},
+          {"decode_tokens", since(live.committed_decode_tokens, baseline.committed_decode_tokens)},
+          {"decode_seconds", since(live.decode_seconds_total, baseline.decode_seconds_total)},
+          {"prompt_tokens", prompt_tokens_total_},
           {"cached_prompt_tokens", prefix_cache_hit_tokens_total_},
           {"drafted", speculative_draft_tokens_total_},
           {"accepted", speculative_accepted_tokens_total_}}},

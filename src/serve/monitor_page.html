@@ -104,7 +104,7 @@ tbody tr:last-child td { border-bottom: none; }
   </section>
 
   <section class="panel" style="margin-bottom:12px">
-    <h2>Slots</h2>
+    <h2>Cached conversations</h2>
     <div class="table-wrap"><table>
       <thead><tr><th>Slot</th><th class="left">State</th><th>Context tokens</th><th>From cache</th><th>Checkpoints</th><th class="left">Context use</th></tr></thead>
       <tbody id="slots"></tbody>
@@ -141,7 +141,8 @@ function setTile(id, text, sub, idle) {
 
 function update(s) {
   $("model").textContent = s.model || "NInfer";
-  $("facts").textContent = num(s.max_context) + " context \u00b7 " + s.max_concurrency + " slots" +
+  $("facts").textContent = num(s.max_context) + " context \u00b7 " + s.lanes + " concurrent requests \u00b7 " +
+    s.slots.length + " cached conversations" +
     (s.draft_window ? " \u00b7 MTP " + s.draft_window + " drafts" : "");
   const t = s.totals;
   let decode = 0, prefill = 0, accept = null;
@@ -173,9 +174,13 @@ function update(s) {
   } else {
     setTile("t-accept", "off", "no speculative decoding", true);
   }
-  const promptTotal = t.cached_prompt_tokens + t.prefill_tokens;
-  setTile("t-cache", promptTotal > 0 ? fixed(100 * t.cached_prompt_tokens / promptTotal, 1) + "<small>%</small>" : "\u2013",
-          num(t.cached_prompt_tokens) + " reused \u00b7 " + num(t.prefill_tokens) + " computed");
+  // Completed requests plus the prompts of the requests in flight.
+  const running = s.slots.filter((slot) => slot.processing);
+  const promptTotal = t.prompt_tokens + running.reduce((sum, slot) => sum + slot.prompt_tokens, 0);
+  const cachedTotal = t.cached_prompt_tokens + running.reduce((sum, slot) => sum + slot.cached_tokens, 0);
+  setTile("t-cache", promptTotal > 0 ? fixed(100 * cachedTotal / promptTotal, 1) + "<small>%</small>" : "\u2013",
+          num(cachedTotal) + " of " + num(promptTotal) + " prompt tokens reused" +
+          (running.length ? " \u00b7 incl. " + running.length + " in flight" : ""));
   setTile("t-req", num(t.requests), s.scheduler.in_flight + " in flight \u00b7 " +
           num(t.decode_tokens) + " tokens generated");
 
@@ -195,7 +200,7 @@ function update(s) {
 
   $("slots").innerHTML = s.slots.map((slot) => {
     const state = slot.processing ? '<span class="pill run">processing</span>' :
-                  slot.retained ? '<span class="pill keep">retained</span>' : '<span class="pill">idle</span>';
+                  slot.retained ? '<span class="pill keep">retained</span>' : '<span class="pill">empty</span>';
     const use = s.max_context > 0 ? Math.min(100, 100 * slot.prompt_tokens / s.max_context) : 0;
     return "<tr><td>" + slot.id + '</td><td class="left">' + state + "</td><td>" + num(slot.prompt_tokens) +
            "</td><td>" + num(slot.cached_tokens) + "</td><td>" + slot.checkpoints +

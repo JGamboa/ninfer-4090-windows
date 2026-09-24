@@ -78,15 +78,18 @@ public:
     struct MonitorContext {
         std::string model;
         std::uint32_t max_context        = 0;
-        std::uint32_t max_concurrency    = 0;
+        std::uint32_t lanes              = 0; // concurrent requests (--max-concurrency)
         std::uint32_t kv_capacity_tokens = 0;
         std::uint32_t kv_pages           = 0;
         std::uint32_t draft_window       = 0; // 0 without speculative decoding
     };
 
-    // The GET /monitor/stats JSON body.
+    // The GET /monitor/stats JSON body. `slots` are the retained-conversation cells of /slots
+    // (at least one per lane). The Engine totals are reported relative to `baseline`, the stats
+    // at attach, so the startup warmup generation does not count as served traffic.
     [[nodiscard]] std::string render_monitor(const MonitorContext& context,
                                              const ninfer::RuntimeStats& live,
+                                             const ninfer::RuntimeStats& baseline,
                                              const std::vector<ninfer::SlotState>& slots) const;
 
     // One complete Prometheus text body, without HTTP framing. In-flight
@@ -101,6 +104,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::uint64_t requests_total_                    = 0;
+    std::uint64_t prompt_tokens_total_               = 0;
     std::uint64_t prefix_cache_hit_tokens_total_     = 0;
     std::uint64_t speculative_draft_tokens_total_    = 0;
     std::uint64_t speculative_accepted_tokens_total_ = 0;

@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -113,19 +114,27 @@ int main() {
     failures += check(residue.prompt_tokens == 10 && residue.cached_tokens == 10,
                       "last completed cache clamped to prompt");
 
-    // Monitor snapshot: the static context, live KV/scheduler gauges and totals, one row per
-    // slot, and the completed requests newest first.
+    // Monitor snapshot: the static context, live KV/scheduler gauges, Engine totals since the
+    // attach baseline (the warmup generation excluded), one row per retained-conversation cell,
+    // and the completed requests newest first.
     ServeMetrics::MonitorContext context{"bonsai-27b", 262144, 3, 262144, 4096, 2};
+    ninfer::RuntimeStats baseline;
+    baseline.computed_prefill_tokens = 60;
+    baseline.prefill_seconds_total   = 0.1;
+    baseline.committed_decode_tokens = 3;
+    baseline.decode_seconds_total    = 0.02;
     live.device_main_kv_occupied_pages = 1400;
     live.running_requests              = 1;
     live.waiting_requests              = 2;
-    std::vector<ninfer::SlotState> slots(3);
+    std::vector<ninfer::SlotState> slots(6);
     slots[0].processing    = true;
     slots[0].prompt_tokens = 86266;
     slots[0].cached_tokens = 85133;
     slots[1].retained      = true;
-    const auto monitor = nlohmann::json::parse(metrics.render_monitor(context, live, slots));
-    failures += check(monitor.at("model") == "bonsai-27b" && monitor.at("draft_window") == 2,
+    const auto monitor =
+        nlohmann::json::parse(metrics.render_monitor(context, live, baseline, slots));
+    failures += check(monitor.at("model") == "bonsai-27b" && monitor.at("lanes") == 3 &&
+                          monitor.at("draft_window") == 2,
                       "monitor context");
     failures += check(monitor.at("kv").at("pages") == 4096 &&
                           monitor.at("kv").at("occupied_pages") == 1400,
@@ -133,12 +142,17 @@ int main() {
     failures += check(monitor.at("scheduler").at("running") == 1 &&
                           monitor.at("scheduler").at("waiting") == 2,
                       "monitor scheduler gauges");
-    failures += check(monitor.at("totals").at("requests") == 3 &&
-                          monitor.at("totals").at("decode_tokens") == 300 &&
-                          monitor.at("totals").at("cached_prompt_tokens") == 950,
-                      "monitor totals");
+    const auto& totals = monitor.at("totals");
+    failures += check(totals.at("requests") == 3 && totals.at("prefill_tokens") == 1240 &&
+                          totals.at("decode_tokens") == 297 &&
+                          std::abs(totals.at("decode_seconds").get<double>() - 5.98) < 1e-9,
+                      "monitor totals exclude the warmup baseline");
+    // Completed prompts 1000 + 1200 + 10; reuse clamped to each prompt: 0 + 900 + 10.
+    failures += check(totals.at("prompt_tokens") == 2210 &&
+                          totals.at("cached_prompt_tokens") == 910,
+                      "monitor prompt reuse totals");
     const auto& slot_rows = monitor.at("slots");
-    failures += check(slot_rows.size() == 3 && slot_rows[0].at("processing") == true &&
+    failures += check(slot_rows.size() == 6 && slot_rows[0].at("processing") == true &&
                           slot_rows[0].at("prompt_tokens") == 86266 &&
                           slot_rows[1].at("retained") == true,
                       "monitor slot rows");

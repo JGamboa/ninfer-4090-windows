@@ -117,10 +117,13 @@ save. Sessions never saved or restored have no binding and are not spilled; an e
 
 `GET /monitor` serves one self-contained page (`src/serve/monitor_page.html`, compiled into the
 server) that polls `GET /monitor/stats` once per second from the same origin, so it needs no
-`--cors`. The snapshot carries cumulative counters (prefill and decode tokens and unit seconds,
-reused prompt tokens, drafted and accepted tokens); the page differences consecutive snapshots
-into decode and prefill tok/s, the current MTP acceptance and a two-minute throughput chart. KV
-occupancy is the Engine's occupied Main KV pages against the resolved page capacity. The recent
+`--cors`. The snapshot carries cumulative counters (prefill and decode tokens and unit seconds
+since the server attached, so the startup warmup is excluded; prompt and reused prompt tokens of
+completed requests; drafted and accepted tokens); the page differences consecutive snapshots into
+decode and prefill tok/s, the current MTP acceptance and a two-minute throughput chart. Prompt
+reuse adds the requests in flight from their slot rows. `lanes` is `--max-concurrency`; the
+slot rows are the retained-conversation cells of `/slots`, of which there may be more than
+lanes. KV occupancy is the Engine's occupied Main KV pages against the resolved page capacity. The recent
 list keeps the last 32 completed requests with their prompt, reused, output and thinking tokens,
 time to first token, decode seconds, draft counts and finish reason.
 
