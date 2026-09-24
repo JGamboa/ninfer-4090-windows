@@ -74,6 +74,20 @@ void launch_gemm(const QuantizedX& q, const Weight& w, int tokens, const t5_a8::
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Short prefills (MTP/DFlash2 tails, chunk remainders) keep 64-token CTAs; longer ones share
+// each decoded weight stage across 128 tokens. The exception is a 128-token grid that leaves SMs
+// idle over a short K: one eight-warp CTA per SM then runs longer than the 64-token CTAs it
+// replaces (o_proj 5120 x 6144 at T = 128: 80 CTAs, +14 %), while a long K still gains (down
+// 5120 x 17408, -3 %) and grids of at least one CTA per SM gain 25-30 % (design 9.1).
+bool use_small_gemm_tile(const Weight& w, int tokens) {
+    using Large = t5_a8::GemmConfig<4>;
+    if (tokens <= t5_a8::GemmConfig<2>::kTokens) return true;
+    constexpr int kLongK = 16384;
+    const std::int64_t large_ctas =
+        std::int64_t(w.n / t5_a8::kGemmRows) * ((tokens + Large::kTokens - 1) / Large::kTokens);
+    return large_ctas < device_sm_count() && w.k < kLongK;
+}
+
 } // namespace
 
 void validate_t5_weight(const Weight& w, const char* op) {
@@ -137,9 +151,7 @@ void t5_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     auto scope         = workspace->scope();
     const QuantizedX q = quantize(x, w.input_signs, *workspace, stream);
     if (tokens > kMaxTile && w.n % t5_a8::kGemmRows == 0) {
-        // Short prefills (MTP/DFlash2 tails, chunk remainders) keep 64-token CTAs; longer ones
-        // share each decoded weight stage across 128 tokens.
-        if (tokens <= t5_a8::GemmConfig<2>::kTokens) {
+        if (use_small_gemm_tile(w, tokens)) {
             launch_gemm<2>(q, w, tokens, packed, accumulate, stream);
         } else {
             launch_gemm<4>(q, w, tokens, packed, accumulate, stream);

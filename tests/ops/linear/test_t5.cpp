@@ -288,8 +288,8 @@ int main() {
     int failures = 0;
     {
         // GEMV templates T = 1..4 and the T = 5..8 route, a partial row block (odd N), a row
-        // view of a fused parent, graph replay, and the prefill GEMMs: 64-token CTAs for
-        // T <= 64, 128-token CTAs beyond, both with partial tiles.
+        // view of a fused parent, graph replay, and the 64-token prefill GEMM with partial
+        // tiles (this short-K, few-row weight keeps 64-token CTAs beyond T = 64 as well).
         const Ternary small(301, 3072, 15u);
         for (std::int32_t t : {1, 2, 3, 4, 5, 8, 9}) failures += linear_case(small, 0, 301, t, t == 3);
         failures += linear_case(small, 44, 200, 6, false);
@@ -307,7 +307,8 @@ int main() {
         if (n == 5120) failures += linear_add_case(w, 3);
     }
     {
-        // 128-token prefill GEMM at the longest K (mlp down), accumulating into a residual.
+        // 128-token prefill GEMM at the longest K (mlp down, 80 CTAs), accumulating into a
+        // residual.
         const Ternary down(5120, 17408, 3100u);
         failures += linear_add_case(down, 72);
     }
