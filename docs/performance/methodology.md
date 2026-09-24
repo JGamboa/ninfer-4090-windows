@@ -36,6 +36,12 @@ These are recorded experimental settings, not promises about current executable 
 `K` denotes draft tokens; block size is `K+1`. Weight format, backend, draft count, and proposal
 head are separate experimental dimensions.
 
+Record whether the measured GPU drives a display, with its resolution and refresh rate, and
+compare only runs with the same display setup. On Windows the desktop compositor preempts CUDA
+every display frame: an RTX 4090 driving a 3840x2160 desktop lost 18 % of each MTP decode round
+at 120 Hz and 15 % at 60 Hz. Prefer a GPU that renders no display for published measurements
+(see [When the 4090 also drives the display](../../README.md#when-the-4090-also-drives-the-display)).
+
 ## Workloads and measurement boundaries
 
 ### Single-request phases

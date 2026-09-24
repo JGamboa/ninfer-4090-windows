@@ -402,6 +402,19 @@ Python tools run independently of CMake; the standalone HBM probe has its own
 - The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
   no multi-GPU execution, no weight offload.
 
+### When the 4090 also drives the display
+
+If the RTX 4090 also drives your monitor, the Windows desktop compositor takes the GPU from CUDA
+on every display frame, and decode slows down. With a 3840x2160 desktop this cost 18 % of each
+MTP decode round at 120 Hz and 15 % at 60 Hz. For the best decode speed:
+
+- connect the monitor to the motherboard (integrated graphics) or to another GPU, so the 4090
+  renders nothing;
+- otherwise lower the refresh rate to 60 Hz and keep animated windows (browsers, video, chat
+  apps) still while generating.
+
+Compare tok/s figures only between runs taken with the same display setup.
+
 The product boundary stays intentionally small: one RTX 4090 and one resident model per Engine;
 a startup-fixed capacity of one to eight active requests with bounded FIFO ingress; no request
 preemption, priority/QoS, active-request swapping, weight offload, multi-GPU, or distributed
