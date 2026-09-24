@@ -870,30 +870,78 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   Qwen3.8 Vision formats (the only registered Vision kernels). `bonsai_vision_check`
   compares the tower with a Qwen3.8 reference. No runtime change: the tower is Qwen3.8's.
 
+  Validated 2026-09-24 on the RTX 4090 (`b1ece6a`): `bonsai_vision_check` against
+  `qwen3_8_27b.ninfer` reports the same weights (norms and position embedding exact, merger
+  relative L2 0.0017 Q8 vs Q8, patch embedding 0.025 against the reference Q6, block
+  projections 0.05-0.16 against its Q4/Q5). `bonsai_base --mmproj` found the preprocessor
+  resources in the reference (no download). Conversion with `--components text,vision,mtp`:
+  `E:\LLM\bonsai2_27b_vl.ninfer`, 8.68 GB, 173 s (the older `bonsai2_27b_a8.ninfer`, 10.48 GB,
+  also carries `dflash2`). With `--vision --greedy` both `examples/cli/media` images are read
+  correctly (sign 24, sun on the right; `NIFER VISION 731; 3; left`), Vision encoder ~23 ms per
+  image, text prefill 2.3k tok/s. Without `--vision` the text path matches the older artifact
+  (111.2 tok/s, 36.7 % acceptance on the lighthouse prompt).
+
+- (C) MTP round profile, 2026-09-24, RTX 4090, `9573282`, lighthouse prompt (draft 2,
+  `--lm-head-draft`), `nsys profile --cuda-graph-trace=node` (the 2026.3 CLI has no
+  `--force-export`): 15.9 ms per round, kernels busy 15.3 ms (96 %). t2 GEMV 10.8 ms (70 %,
+  257 calls: 64 layers x 4 projections + head; ~6.8 GB of t2 weights at ~630 GB/s), MTP layer
+  Q8 (`q8_ksplit_mma`) 1.3 ms, Q4 proposal head 1.0 ms, `rotate_quantize_kernel` 0.75 ms (257
+  launches of ~2.9 us), GDN recurrence, attention, norms and the rest ~1.5 ms.
+
+  Acceptance across six prompts (story, Python, transformer explanation, Spanish history,
+  energy tips, train problem), pre-fusion `a3e9083` -> fused: 40.8/70.2/59.7/50.8/60.2/71.7 ->
+  36.7/74.1/57.8/49.6/55.3/67.9 %, mean 58.9 -> 56.9 %. Lower on 5 of 6 but not significant
+  (sign test p ~ 0.11, each greedy trajectory diverges); perplexity is unchanged. The
+  lighthouse prompt is the worst case on both binaries.
+
+  Draft window (six prompts, idle machine, tok/s): draft 2 -> 3 is 111.5 -> 110.8, 158.5 ->
+  171.5, 137.1 -> 140.4, 127.5 -> 114.3, 135.7 -> 142.7, 151.1 -> 178.7 (harmonic mean +2.5 %):
+  a gain on code and math, a loss on low-acceptance prose (Spanish -10 %). Draft 4 (T = 5)
+  falls to the 8-token GEMV tile and loses (83 tok/s on the lighthouse prompt).
+
+  `ninfer_bench` (spec none, `-r 5`): pp512 2648 tok/s, tg128 84.9 tok/s, against the fork's
+  1363 and 77.1: prefill is not a bottleneck.
+
+- (C) A8 GEMV with two-warp CTAs (four rows per CTA instead of sixteen). At N = 5120 (o_proj,
+  mlp down) 320 eight-warp CTAs ran as a full wave plus a mostly idle second one; 1280 small
+  CTAs fill whole waves. The kernel now takes any rows-per-warp count (rows past n alias the
+  last row and are not stored); the test's A8 small case uses 301 rows (partial CTA, one live
+  row in a warp). Results are bitwise unchanged (same per-row summation order; identical
+  acceptance). `ninfer_t2_bench`, median of five runs, sum over one MTP round's projections
+  (without the head), CTA threads/rows per warp at T = 3: 256/2 9.06 ms, 128/2 8.61, 128/4
+  8.77, 256/4 9.55, 64/2 8.48; T = 8 at 64/2: gdn in_proj 52 -> 41 us, qkvg 54 -> 37, gate+up
+  121 -> ~86. End to end (two runs each, draft 2): lighthouse 110.8 -> 116.3 tok/s, Python
+  158.2 -> 165.3, train 149.2 -> 157.7 (+5 %). In the round profile the t2 GEMV falls from
+  10.8 to 9.9 ms and the round from 15.9 to 15.1 ms; N = 5120 projections 29.2 -> 24.1 us. The
+  t2 head is 40 us slower with small CTAs (475 us). In the round gate+up still takes 66.6 us
+  against 57.5 us in the bench (~0.6 ms per round, cause open).
+
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also
   drives a 3840x2160 120 Hz desktop), PCIe 4.0 x16, Core i9-13900K, CUDA 13.4.
 
 ### 9.1 Current state and next steps (living; update in place)
 
-State at `9573282`: t2 conversion (`bonsai2_27b`, t2 head, `AllowA8`), A16 and A8 t2 routes,
-weight-owned rotation fused into the A8 quantization, MSVC test-build fixes. Working artifact:
-`E:\LLM\bonsai2_27b_a8.ninfer` (no reconversion needed for the fused rotation). The fused
-rotation is validated on the RTX 4090 (section 9): decode 111 tok/s (MTP draft 2,
-`--lm-head-draft`, 36.7 % acceptance, ~15.6 ms per round), quick perplexity 8.0854 / 9.2865 /
-8.1811 / 1.8945, overall 5.8545 at 1347 tok/s. Fork reference: pp512 1363 tok/s, tg128 77.1
-tok/s.
+State: t2 conversion (`bonsai2_27b`, t2 head, `AllowA8`), A16 and A8 t2 routes, weight-owned
+rotation fused into the A8 quantization, two-warp A8 GEMV CTAs, Vision tower from Prism's
+mmproj, full MSVC build and test suite passing. Artifacts: `E:\LLM\bonsai2_27b_a8.ninfer`
+(text, MTP, DFlash2) and `E:\LLM\bonsai2_27b_vl.ninfer` (text, Vision, MTP). On the RTX 4090
+(section 9): MTP decode 116 tok/s on the lighthouse prompt, 165 on Python and 158 on the train
+problem (draft 2, `--lm-head-draft`, ~15.1 ms per round); pp512 2648 tok/s and tg128 85 tok/s
+against the fork's 1363 and 77.1; quick perplexity overall 5.8545.
 
 Next steps, in order:
 
-1. Whole-round profile with A8 (`nsys profile --cuda-graph-trace=node --force-export=true`
-   around the lighthouse generation) to attribute the ~15.6 ms MTP round: attention, GDN
-   recurrence, MTP layer, output head, quantization kernels. Also check whether the acceptance
-   drop (41.4 -> 36.7 %) is prompt-specific by measuring acceptance on a few other prompts.
-2. Prefill against the fork (pp512 1363 tok/s): measure a 512-token prompt; if the A8 GEMM
-   (64 x 64 tiles, `t2_a8.cuh`) dominates, try 128-row tiles or a deeper cp.async pipeline.
-3. From the profile, fuse what remains cheap to fuse (SwiGLU into the down quantization,
-   residual/norm neighbours), each with an oracle test and a bench before/after.
+1. Why gate+up runs ~9 us slower inside the round than in `ninfer_t2_bench` (66.6 vs 57.5 us,
+   ~0.6 ms per round): compare the artifact's gate/up parent layout and the round's DRAM
+   neighbours with the bench, then try staging the activation in shared memory and 16-byte
+   weight loads with a deeper prefetch (the remaining GEMV headroom is ~750-830 -> ~900 GB/s).
+2. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
+   quantization): 257 launches, ~0.75 ms per round, each with an oracle test and a bench.
+3. MTP layer (Q8, 1.3 ms per round) and Q4 proposal head (1.0 ms): measure acceptance with a
+   Q5/Q4 MTP layer before changing the recipe.
+4. Draft 3 wins on code and math and loses on low-acceptance prose; revisit once the T = 4
+   round is cheaper.
 
 ## Appendix: sources
 
