@@ -1,6 +1,7 @@
 #include "ops/linear/t2/t2_project.h"
 
 #include "core/device.h"
+#include "ops/linear/t2/t2_mma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -173,7 +174,8 @@ void validate_t2_weight(const Weight& w, const char* op) {
     if (w.qtype != QType::T2_G128_FP16 || w.layout != QuantLayout::TernaryRowK128 ||
         w.scale_dtype != DType::FP16 || w.group_size != 128 || w.n <= 0 || w.k % 1024 ||
         w.qdata == nullptr || w.qhigh != nullptr || w.scales == nullptr ||
-        (reinterpret_cast<std::uintptr_t>(w.qdata) & 7) || w.scale_nb[1] != w.k / 64) {
+        (reinterpret_cast<std::uintptr_t>(w.qdata) & 15) ||
+        (reinterpret_cast<std::uintptr_t>(w.scales) & 15) || w.scale_nb[1] != w.k / 64) {
         throw std::invalid_argument(std::string(op) +
                                     ": weight must be T2_G128_FP16 ternary rows with K%1024=0");
     }
@@ -208,6 +210,22 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     }
     if (end != w.n) {
         throw std::invalid_argument("t2_project: output rows must cover the weight rows");
+    }
+    if (tokens >= 2 && w.n % t2_mma::kRows == 0) {
+        // Tensor cores keep the cost per weight byte flat in T (MTP verification, prefill).
+        t2_mma::Outputs mma_outputs{};
+        for (int i = 0; i < kMaxOutputs; ++i) {
+            mma_outputs.data[i] = packed.data[i];
+            mma_outputs.end[i]  = packed.end[i];
+        }
+        const dim3 grid(static_cast<unsigned>(w.n / t2_mma::kRows),
+                        static_cast<unsigned>((tokens + t2_mma::kTokens - 1) / t2_mma::kTokens));
+        t2_mma::t2_mma_kernel<<<grid, t2_mma::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, mma_outputs,
+            accumulate);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     switch (tokens) {
     case 1: launch<1>(x, w, packed, accumulate, stream); break;

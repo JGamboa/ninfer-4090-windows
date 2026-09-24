@@ -188,6 +188,13 @@ int main() {
         for (std::int32_t t : {1, 3, 8, 9, 17, 33}) failures += linear_case(small, 0, 300, t, t == 9);
         failures += linear_case(small, 44, 200, 5, false);
     }
+    {
+        // Rows a multiple of 16 take the tensor-core route for T >= 2: several token tiles, a
+        // partial last tile and a row view that starts inside the parent.
+        const Ternary tiled(320, 3072, 6u);
+        for (std::int32_t t : {2, 5, 8, 9, 17, 40}) failures += linear_case(tiled, 0, 320, t, t == 17);
+        failures += linear_case(tiled, 32, 256, 7, false);
+    }
     // Bonsai decode shapes (N, K) at decode and MTP-verify widths.
     for (const auto [n, k] : std::array<std::pair<int, int>, 3>{{{5120, 6144}, {5120, 17408}, {16384, 5120}}}) {
         const Ternary w(n, k, 1000u + n + k);
