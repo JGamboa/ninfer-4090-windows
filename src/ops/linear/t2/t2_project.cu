@@ -59,45 +59,51 @@ __global__ void __launch_bounds__(kThreads)
         float scale[kRowsPerWarp];
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
-            bits[r]  = __ldg(row_codes[r] + slice);
-            scale[r] = __half2float(__ldg(row_scales[r] + slice / 4));
+            // Weights are read once: stream them past L1 so the reused x stays resident.
+            bits[r]  = __ldcs(row_codes[r] + slice);
+            scale[r] = __half2float(__ldcs(row_scales[r] + slice / 4));
         }
-        // Decode the 32 weights of each row once; every token reuses them.
-        float weight[kRowsPerWarp][32];
+        const int column = slice * 32;
+        float partial[kRowsPerWarp][Tile];
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
 #pragma unroll
-            for (int j = 0; j < 32; ++j) {
-                const std::uint32_t word = j < 16 ? bits[r].x : bits[r].y;
-                weight[r][j] = static_cast<float>(static_cast<int>((word >> ((j % 16) * 2)) & 3u) - 1);
-            }
+            for (int t = 0; t < Tile; ++t) partial[r][t] = 0.0f;
         }
-        const int column = slice * 32;
+        // Eight columns at a time: load them for every token, then decode each weight once and
+        // apply it to all tokens (the loop order, not the compiler, guarantees the reuse).
 #pragma unroll
-        for (int t = 0; t < Tile; ++t) {
-            if (t < live) {
-                const uint4* xv = reinterpret_cast<const uint4*>(xt + std::int64_t(t) * k + column);
-                float partial[kRowsPerWarp] = {};
+        for (int q = 0; q < 4; ++q) {
+            uint4 xs[Tile];
 #pragma unroll
-                for (int q = 0; q < 4; ++q) {
-                    const uint4 packed = __ldg(xv + q);
-                    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+            for (int t = 0; t < Tile; ++t) {
+                xs[t] = t < live ? __ldg(reinterpret_cast<const uint4*>(xt + std::int64_t(t) * k +
+                                                                        column) + q)
+                                 : make_uint4(0, 0, 0, 0);
+            }
 #pragma unroll
-                    for (int h = 0; h < 4; ++h) {
-                        // Two BF16 values per word; the low half is the lower column.
-                        const float x0 = __uint_as_float(words[h] << 16);
-                        const float x1 = __uint_as_float(words[h] & 0xffff0000u);
-                        const int j    = q * 8 + h * 2;
+            for (int h = 0; h < 8; ++h) {
+                const int j = q * 8 + h; // code index within the 32-code slice
 #pragma unroll
-                        for (int r = 0; r < kRowsPerWarp; ++r) {
-                            partial[r] = fmaf(weight[r][j], x0, partial[r]);
-                            partial[r] = fmaf(weight[r][j + 1], x1, partial[r]);
-                        }
+                for (int r = 0; r < kRowsPerWarp; ++r) {
+                    const std::uint32_t word = j < 16 ? bits[r].x : bits[r].y;
+                    const float weight =
+                        static_cast<float>(static_cast<int>((word >> ((j % 16) * 2)) & 3u) - 1);
+#pragma unroll
+                    for (int t = 0; t < Tile; ++t) {
+                        const std::uint32_t pairs[4] = {xs[t].x, xs[t].y, xs[t].z, xs[t].w};
+                        const std::uint32_t pair     = pairs[h / 2];
+                        // BF16 pair: the low half is the lower column.
+                        const float value = __uint_as_float(h % 2 ? pair & 0xffff0000u : pair << 16);
+                        partial[r][t]     = fmaf(weight, value, partial[r][t]);
                     }
                 }
-#pragma unroll
-                for (int r = 0; r < kRowsPerWarp; ++r) acc[r][t] = fmaf(scale[r], partial[r], acc[r][t]);
             }
+        }
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+#pragma unroll
+            for (int t = 0; t < Tile; ++t) acc[r][t] = fmaf(scale[r], partial[r][t], acc[r][t]);
         }
     }
 
