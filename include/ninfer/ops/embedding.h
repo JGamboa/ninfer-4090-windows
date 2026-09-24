@@ -14,8 +14,8 @@ namespace ninfer::ops {
  *
  * `ids` is contiguous I32 [T], `out` is contiguous BF16 [D,T], and every id is in
  * [0,vocab). `table` has logical shape [vocab,D] and is contiguous BF16, Q6_G64_FP16
- * RowSplit, Q8_G32_FP16 RowSplit, FP8_E4M3FN_ROW_BF16 RowScale, or T2_G128_FP16 TernaryRowK128
- * (D % 1024 == 0). A T2 table with `Weight::input_signs` is stored in the Prism-rotated basis:
+ * RowSplit, Q8_G32_FP16 RowSplit, FP8_E4M3FN_ROW_BF16 RowScale, or T5_G128_FP16 TernaryRowK128
+ * (D % 1024 == 0). A T5 table with `Weight::input_signs` is stored in the Prism-rotated basis:
  * its logical rows are signs * H_1024(z') / 32 per 1024-column block of the stored rows z',
  * computed in FP32 (the oracle applies an explicit FP64 Sylvester matrix). Dense BF16 values are copied
  * bit-exactly. For quantized tables, the oracle independently decodes each code and multiplies it

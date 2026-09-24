@@ -62,5 +62,4 @@ ninfer_add_op_bench(ninfer_context_kv_materialize_bench
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_variants_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q4_linear_swiglu_variants_bench.cu")
-ninfer_add_op_bench(ninfer_t2_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/t2_bench.cu")
-ninfer_add_op_bench(ninfer_t5_proto_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/t5_proto_bench.cu")
+ninfer_add_op_bench(ninfer_t5_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/t5_bench.cu")

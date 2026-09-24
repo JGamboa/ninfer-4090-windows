@@ -69,7 +69,7 @@ struct PrismHadamardConfig {
     std::map<std::uint64_t, std::string> signs; // input width -> BF16 sign-vector parameter
     // Per-layer projections ("gdn/query", "mlp/down", ...) and "output_head" (text/output_head).
     std::set<std::string, std::less<>> rotated_inputs;
-    // text/token_embedding stores rotated t2 rows; the gather applies signs * H_1024 z' / 32.
+    // text/token_embedding stores rotated t5 rows; the gather applies signs * H_1024 z' / 32.
     bool embedding_inverse = false;
 };
 

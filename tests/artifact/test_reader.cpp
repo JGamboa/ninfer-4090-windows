@@ -115,29 +115,15 @@ void geometry_and_views() {
 }
 
 void ternary_geometry_and_row_views() {
-    // Byte counts equal tools/artifact/layouts.py ternary_geometry (tests/artifact/test_ternary.py).
-    const std::array<std::pair<std::array<std::uint64_t, 2>, std::uint64_t>, 6> sizes{{
-        {{3, 256}, 268},
-        {{16384, 5120}, 22282240},
-        {{5120, 6144}, 8355840},
-        {{14336, 5120}, 19496960},
-        {{34816, 5120}, 47349760},
-        {{5120, 17408}, 23674880},
-    }};
-    for (const auto& [shape, bytes] : sizes) {
-        require(weight_geometry(QType::T2_G128_FP16, QuantLayout::TernaryRowK128, shape).bytes ==
-                    bytes,
-                "ternary geometry differs from the Python writer");
-    }
     rejects<std::invalid_argument>(
         [] {
-            (void)weight_geometry(QType::T2_G128_FP16, QuantLayout::TernaryRowK128,
+            (void)weight_geometry(QType::T5_G128_FP16, QuantLayout::TernaryRowK128,
                                   std::array<std::uint64_t, 2>{1, 192});
         },
         "ternary layout accepted K that is not a multiple of 128");
     rejects<std::invalid_argument>(
         [] {
-            (void)weight_geometry(QType::T2_G128_FP16, QuantLayout::RowSplit,
+            (void)weight_geometry(QType::T5_G128_FP16, QuantLayout::RowSplit,
                                   std::array<std::uint64_t, 2>{1, 128});
         },
         "RowSplit accepted the ternary format");
@@ -147,7 +133,8 @@ void ternary_geometry_and_row_views() {
                                   std::array<std::uint64_t, 2>{1, 128});
         },
         "ternary layout accepted a grouped integer format");
-    // Base-3 T5: 13-byte units per 64 columns, same scale plane (sizes from the Python writer).
+    // 13-byte base-3 units per 64 columns, then the FP16 scale plane (sizes from the Python writer,
+    // tools/artifact/layouts.py ternary_geometry).
     const std::array<std::pair<std::array<std::uint64_t, 2>, std::uint64_t>, 6> t5_sizes{{
         {{3, 256}, 268},
         {{16384, 5120}, 18350080},
@@ -162,22 +149,19 @@ void ternary_geometry_and_row_views() {
                 "t5 geometry differs from the Python writer");
     }
     require(artifact::parse_format("t5_g128_fp16") == QType::T5_G128_FP16 &&
-                artifact::format_name(QType::T5_G128_FP16) == "t5_g128_fp16",
-            "t5 spelling is not registered");
-    require(artifact::parse_format("t2_g128_fp16") == QType::T2_G128_FP16 &&
                 artifact::parse_layout("ternary_row_k128_v1") == QuantLayout::TernaryRowK128 &&
-                artifact::format_name(QType::T2_G128_FP16) == "t2_g128_fp16",
+                artifact::format_name(QType::T5_G128_FP16) == "t5_g128_fp16",
             "ternary spellings are not registered");
 
     std::vector<std::byte> payload(268);
-    const WeightParent parent{weight_geometry(QType::T2_G128_FP16, QuantLayout::TernaryRowK128,
+    const WeightParent parent{weight_geometry(QType::T5_G128_FP16, QuantLayout::TernaryRowK128,
                                               std::array<std::uint64_t, 2>{3, 256}),
                               payload.data()};
     const WeightView rows{{2, 256}, {{&parent, 256, 768}}};
     const auto weight = native_weight(rows);
-    require(weight.qtype == QType::T2_G128_FP16 && weight.layout == QuantLayout::TernaryRowK128 &&
+    require(weight.qtype == QType::T5_G128_FP16 && weight.layout == QuantLayout::TernaryRowK128 &&
                 weight.n == 2 && weight.k == 256 && weight.padded_shape[1] == 256 &&
-                weight.qdata == payload.data() + 64 && weight.qhigh == nullptr &&
+                weight.qdata == payload.data() + 52 && weight.qhigh == nullptr &&
                 weight.scales == payload.data() + 256 + 4 && weight.group == 128 &&
                 weight.scale_dtype == DType::FP16 && weight.scale_ne[0] == 2 &&
                 weight.scale_ne[1] == 2 && weight.scale_nb[1] == 4,

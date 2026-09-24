@@ -1,4 +1,4 @@
-// Plans a Python-written Bonsai (Prism t2 or t5) artifact; tests/models/qwen3_5/prism_loading.py
+// Plans a Python-written Bonsai (Prism t5) artifact; tests/models/qwen3_5/prism_loading.py
 // writes the valid artifact and the invalid variants and passes the expected refusal.
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
@@ -37,9 +37,9 @@ void valid(const std::filesystem::path& path) {
     const auto& gdn = std::get<qwen::GdnWeights>(plan.weights().text.layers[0].mixer);
     const auto& attention = std::get<qwen::AttentionWeights>(plan.weights().text.layers[3].mixer);
     const auto& mlp       = std::get<qwen::DenseWeights>(plan.weights().text.layers[3].ffn);
-    // One ternary format (t2 or t5) for every rotated weight.
+    // Every rotated weight is stored in the base-3 ternary format.
     const std::string ternary = format_of(plan, reader, plan.weights().text.output_head);
-    require(ternary == "t2_g128_fp16" || ternary == "t5_g128_fp16", "output head is not ternary");
+    require(ternary == "t5_g128_fp16", "output head is not ternary");
     for (const auto id : {gdn.query, gdn.z, gdn.output, attention.gate, attention.output, mlp.down}) {
         require(format_of(plan, reader, id) == ternary, "rotated projection is not ternary");
     }

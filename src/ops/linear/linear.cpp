@@ -8,7 +8,7 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
-#include "ops/linear/t2/t2_project.h"
+#include "ops/linear/t5/t5_project.h"
 
 #include <cstdint>
 #include <limits>
@@ -99,10 +99,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
-    case QType::T2_G128_FP16:
     case QType::T5_G128_FP16: {
         Tensor* outputs[] = {&out};
-        detail::t2_project(x, w, outputs, /*accumulate=*/false, policy, workspace, stream);
+        detail::t5_project(x, w, outputs, /*accumulate=*/false, policy, workspace, stream);
         return;
     }
     case QType::FP32:
@@ -149,10 +148,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
-    case QType::T2_G128_FP16:
     case QType::T5_G128_FP16:
-        if (output_rows <= 0) { throw std::invalid_argument("linear workspace: t2 rows"); }
-        return detail::t2_workspace_capacity_bytes(policy, input_rows, max_tokens);
+        if (output_rows <= 0) { throw std::invalid_argument("linear workspace: t5 rows"); }
+        return detail::t5_workspace_capacity_bytes(policy, input_rows, max_tokens);
     case QType::FP32:
     case QType::INT32:
         break;

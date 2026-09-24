@@ -16,15 +16,8 @@ enum class QType : std::uint16_t {
     INT32               = 6,
     NVFP4               = 7,
     FP8_E4M3FN_ROW_BF16 = 8,
-    T2_G128_FP16        = 9,
-    T5_G128_FP16        = 10,
+    T5_G128_FP16        = 10, // Prism ternary codes, scaled base-3 (TernaryRowK128)
 };
-
-// Prism ternary weights (codes {0, 1, 2} = c - 1, one FP16 scale per 128 columns): T2 packs
-// four 2-bit codes per byte, T5 scaled base-3 13-byte units of 64 columns (TernaryRowK128).
-[[nodiscard]] constexpr bool ternary_qtype(QType qtype) noexcept {
-    return qtype == QType::T2_G128_FP16 || qtype == QType::T5_G128_FP16;
-}
 
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,

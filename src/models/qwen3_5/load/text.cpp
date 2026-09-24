@@ -147,8 +147,8 @@ void validate_prism_hadamard(const Bindings& b, const TextConfig& config) {
     for (const auto& weight : b.weights) {
         const auto& name  = weight.reference.name;
         const QType format = bound_format(b, weight);
-        const bool ternary = ternary_qtype(format);
-        if (format == QType::T5_G128_FP16) {
+        const bool ternary = format == QType::T5_G128_FP16;
+        if (ternary) {
             for (const auto& use : weight.uses) {
                 if (!ops::allows_a8(use.policy)) {
                     throw artifact::ArtifactError(name + "@" + use.input +

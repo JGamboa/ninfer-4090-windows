@@ -213,26 +213,32 @@ tensor `(q - 1) * scale`. The reconstruction error must be consistent with 1.76-
 
 ---
 
-## 2. NInfer weight format `t2_g128_fp16` (CONTRACT)
+## 2. NInfer weight format `t5_g128_fp16` (CONTRACT)
 
-Name follows the artifact convention (`q4_g64_fp16`, `q8_g32_fp16`, `q5_g64_fp16`): `t2` = ternary
-in 2-bit slots, group 128, fp16 scales. Owner of the definition: agent B; agent A writes it; agent
-C reads it.
+Name follows the artifact convention (`q4_g64_fp16`, `q8_g32_fp16`, `q5_g64_fp16`): `t5` = ternary,
+five trits per byte (scaled base 3), group 128, fp16 scales, layout `ternary_row_k128_v1`. It
+replaced the original 2-bit `t2_g128_fp16` (codes `(codes[n][k/4] >> 2(k%4)) & 3`) on 2026-09-24:
+exact, 1.75 instead of 2.125 bits per weight, ~+10 % MTP decode (section 9, "Base-3 t5
+prototype" and "t5 against t2 end to end").
 
-Per matrix of `N` output rows × `K` input columns (`K % 128 == 0`; rotated inputs additionally have
+Per matrix of `N` output rows × `K` input columns (`K % 128 == 0`; the kernels require
 `K % 1024 == 0`):
 
 | plane | dtype / shape | layout |
 |---|---|---|
-| `codes` | `uint8 [N][K/4]` | row-major, K-contiguous; weight `(n, k)` is `(codes[n][k/4] >> ((k%4)*2)) & 3`; value `= code - 1`; code 3 is invalid. Bit-identical to a PQ2_0 row with the scales stripped, and to bonsai-vllm's little-endian int32 words (16 codes per word). |
-| `scales` | `fp16 [N][K/128]` | row-major; scale of group `g` covers `k ∈ [128g, 128g+128)`. |
+| `codes` | `uint8 [N][13 K/64]` | row-major, K-contiguous; a row is K/64 units of 13 bytes, unit u = columns 64u..64u+63. Code `c` (value `c - 1`) of column 64u + 20g + 4m + j is trit t_m of unit byte 4g + j (g = 0..2, j = 0..3, m = 0..4); byte 12 holds columns 64u + 60 + m as t_m (m = 0..3) with t_4 = 0. A byte is q = ceil(256 v / 243) with v = Σ_m t_m 3^(4-m) (t_0 most significant); decode r = q, then per m: r = 3r, t_m = r >> 8, r = r & 255. Only the 243 values q(v) are valid. |
+| `scales` | `fp16 [N][K/128]` | row-major after the code plane (256-aligned); scale of group `g` covers `k ∈ [128g, 128g+128)` (two units). |
 | `weight_scale_divisor` | as the existing formats use it | 1.0 (scales are absolute). |
+
+The layout serves the A8 kernels: one 32-bit group of unit bytes 4g..4g+3, split into even and odd
+bytes in 16-bit lanes, yields per m one word of four codes for the natural-order columns
+20g + 4m .. 20g + 4m + 3 (a dp4a operand, or an m16n8k32 A register). A unit is half a scale
+group and two 32-column slices of the int8 activation. t5 requires `AllowA8`; there is no A16
+route.
 
 Row-level fusions and permutations (fused qkv, fused gate+up, q/gate interleave, GDN value-head
 order) are done exactly as the converter does them for bf16/q8 today: permute whole rows of
-`codes` and `scales` together. Nothing in `t2_g128_fp16` is tile-reordered in v1. If agent C's GEMV
-wants a tile-major layout, that becomes a second format (`t2r_…`) added later with a reorder pass
-in the converter; do not block M1 on it.
+`codes` and `scales` together.
 
 Hadamard side data, stored once in the artifact as direct `bf16 [width]` text parameters, in
 the primal index order of the activation NInfer feeds the projection (logical parameter names
@@ -245,7 +251,7 @@ are what the loader binds; the converter writes exactly these):
 | `text/hadamard/signs_17408` | 17408 | input of mlp down_proj |
 
 Text-config metadata (`components.text.config.prism_hadamard`, next to the existing config
-keys; `rotated_inputs` lists the per-layer parameter suffixes stored as `t2_g128_fp16`):
+keys; `rotated_inputs` lists the per-layer parameter suffixes stored as `t5_g128_fp16`):
 
 ```json
 "prism_hadamard": {
@@ -261,18 +267,19 @@ keys; `rotated_inputs` lists the per-layer parameter suffixes stored as `t2_g128
 ```
 
 `embedding_inverse` was `false` in v1 (the converter un-rotated the embedding offline, section
-2.2); `bonsai2_27b` now stores the rotated `t2` table and sets it `true` (section 9). Startup (agent B) must refuse an artifact whose `rotated_inputs` list does not match
-the set of `t2_g128_fp16` tensors the model binds, and must refuse `t2` tensors without this block.
+2.2); `bonsai2_27b` now stores the rotated `t5` table and sets it `true` (section 9). Startup
+must refuse an artifact whose `rotated_inputs` list does not match the set of `t5_g128_fp16`
+tensors the model binds, `t5` tensors without this block, and any `t5` use without `AllowA8`.
 
-### 2.1 Which tensors are `t2_g128_fp16`
+### 2.1 Which tensors are `t5_g128_fp16`
 
 NInfer names its logical parameters per projection and lets the recipe decide how they are packed
 into artifact objects ("parents"); the engine then requires fused projections to be adjacent rows
 of ONE parent (`src/core/weight_view.cpp:157-173`, `contiguous_weight_region`). The 27B recipe
-today uses a paired form for the input projections (q4 parent + q5 parent); `t2` uses the
+today uses a paired form for the input projections (q4 parent + q5 parent); `t5` uses the
 single-parent form that NVFP4/FP8 use, so every fused projection is one object:
 
-| NInfer parameters (`text/layers/{i}/…`) | one `t2` parent, rows in this order | (N, K) | GGUF source rows |
+| NInfer parameters (`text/layers/{i}/…`) | one `t5` parent, rows in this order | (N, K) | GGUF source rows |
 |---|---|---|---|
 | `gdn/query`, `gdn/key`, `gdn/value`, `gdn/z` | query 2048, key 2048, value 6144, z 6144 | 16384 × 5120 | `attn_qkv` rows 0..10240 then `attn_gate` |
 | `gdn/output` | — | 5120 × 6144 | `ssm_out` |
@@ -280,10 +287,10 @@ single-parent form that NVFP4/FP8 use, so every fused projection is one object:
 | `attention/output` | — | 5120 × 6144 | `attn_output` |
 | `mlp/gate`, `mlp/up` | gate 17408, up 17408 | 34816 × 5120 | `ffn_gate`, `ffn_up` |
 | `mlp/down` | — | 5120 × 17408 | `ffn_down` |
-| `text/output_head` | — | 248320 × 5120 | `output` (v1: dequantized, folded, `q8_g32_fp16`; M5: `t2`) |
-| `text/token_embedding` | — | 248320 × 5120 | `token_embd` (v1: dequantized, un-rotated, `q8_g32_fp16`; now `t2` with `embedding_inverse`) |
+| `text/output_head` | — | 248320 × 5120 | `output` (v1: dequantized, folded, `q8_g32_fp16`; now `t5`) |
+| `text/token_embedding` | — | 248320 × 5120 | `token_embd` (v1: dequantized, un-rotated, `q8_g32_fp16`; now `t5` with `embedding_inverse`) |
 
-Row-level fusion for `t2` is a plain row concatenation of `codes` and `scales`, so the converter
+Row-level fusion for `t5` is a plain row concatenation of `codes` and `scales`, so the converter
 reuses the existing parameter registration (`qwen3_5.py` `attention`/`gdn`/`dense` builders) and
 the recipe's `group()` to force the single parent (`tools/convert/recipe.py:241-243`).
 
@@ -310,6 +317,8 @@ Copied from `E:\LLM\qwen3_8_27b.ninfer`: the whole `mtp` component and `dflash2`
 Weight budget v1: 48 layers × (16384+5120·6144/5120… ) — concretely per layer 2-bit planes
 (16384·5120 + 5120·6144 + 34816·5120 + 5120·17408)/4 ≈ 91.1 MB + scales/32 ≈ 2.8 MB → 64 layers ≈
 6.0 GB, plus q8 lm_head 1.3 GB, embedding 1.3-2.5 GB, MTP/DFlash2 as today. Fits with room for KV.
+Current (t5, section 9): the text weights with the t5 head and embedding load as 5.52 GiB, 6.5
+GiB with the Q8 MTP layer and Q4 proposal head.
 
 ---
 
@@ -931,7 +940,7 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   frame rate roughly doubles the stalls per frame, so the cost follows the compositing work
   more than the frame count.
 
-- (C) Base-3 "t5" prototype (`bench/ops/t5_proto_bench.cu`, 2026-09-24, RTX 4090, display
+- (C) Base-3 "t5" prototype (`bench/ops/t5_proto_bench.cu` in `97dd83b`, removed with t2; 2026-09-24, RTX 4090, display
   60 Hz). Five trits per byte, 64 columns in 13 bytes (12 bytes of five trits + one of four):
   1.625 bits per weight, 1.75 with the FP16 group scales, against t2's 2.125 (ideal time
   ratio 0.824). A unit is half a scale group and two 32-column slices, so the stored slice sums
@@ -1021,6 +1030,31 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   units (~4x the per-thread decode of the shared-memory variant, whose decode is not its
   bottleneck).
 
+- (A+C) t5 against t2 end to end, 2026-09-24, RTX 4090, display 60 Hz, one run per prompt.
+  `bonsai2_27b_vl` (t2, 7.74 GB) against the same recipe with `TERNARY_FORMAT = t5_g128_fp16`
+  (6.56 GB), text + Vision + MTP, MTP draft 2, `--lm-head-draft`, greedy, 512 new tokens:
+
+  | Prompt | t2 tok/s | t2 accept | t5 tok/s | t5 accept | change |
+  |---|---|---|---|---|---|
+  | lighthouse story | 127.2 | 39.8 % | 142.1 | 42.4 % | +11.7 % |
+  | Python merge | 162.3 | 65.4 % | 178.5 | 65.8 % | +10.0 % |
+  | transformer explanation | 152.9 | 58.3 % | 172.3 | 61.4 % | +12.7 % |
+  | Chilean history (Spanish) | 130.3 | 42.1 % | 141.4 | 41.9 % | +8.5 % |
+  | energy tips | 153.0 | 58.4 % | 168.4 | 58.4 % | +10.1 % |
+  | train problem | 165.7 | 67.9 % | 176.2 | 64.6 % | +6.3 % |
+  | mean | 148.6 | 55.3 % | 163.2 | 55.8 % | +9.8 % |
+
+  Per accepted token the round is 9.3 % faster on every prompt (~14.2 -> ~13.0 ms); acceptance
+  differences are greedy divergence (same weights, different floating-point summation order).
+  Quick perplexity is identical, 8.0873 / 9.2868 / 8.1833 / 1.8948, overall 5.855606 for both.
+  `ninfer_bench`: pp512 2800 -> 2428 tok/s (-13 %, the accepted prefill regression, 1.78x the
+  fork), tg128 without speculation 89.3 -> 100.7 tok/s (+12.7 %, 1.31x the fork). Text weights
+  6.70 -> 5.52 GiB. Vision reads both example images correctly (encoder ~22 ms). t2 is then
+  removed from the C++ engine (QType, format registry, geometry, A16 and A8 t2 kernels,
+  `ninfer_linear_t2_test`); `src/ops/linear/t5` holds the ternary route and `ninfer_t5_bench`
+  its benchmark. The prototype bench was removed with t2 (its baseline); its code is in
+  `97dd83b`.
+
 
 - (A+B+C) Ternary embedding. `bonsai2_27b` stores `text/token_embedding` as the GGUF's
   rotated `t2` words (0.33 GB instead of the 1.3 GB primal Q8 table) and sets
@@ -1072,59 +1106,30 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 
 ### 9.1 Current state and next steps (living; update in place)
 
-State: t2 conversion (`bonsai2_27b`, t2 head, `AllowA8`), A16 and A8 t2 routes, weight-owned
-rotation fused into the A8 quantization, two-warp A8 GEMV CTAs, Vision tower from Prism's
-mmproj, ternary token embedding, full MSVC build and test suite passing. Reference artifact:
-`E:\LLM\bonsai2_27b_vl.ninfer` (text with the t2 embedding, Vision, MTP; 7.74 GB). Older:
-`bonsai2_27b_vl_q8emb.ninfer` (Q8 embedding) and `bonsai2_27b_a8.ninfer` (Q8 embedding,
-DFlash2, no Vision). On the RTX 4090
-(section 9): MTP decode 116 tok/s on the lighthouse prompt, 165 on Python and 158 on the train
-problem (draft 2, `--lm-head-draft`, ~15.1 ms per round); pp512 2648 tok/s and tg128 85 tok/s
-against the fork's 1363 and 77.1; quick perplexity overall 5.8545.
+State: base-3 `t5_g128_fp16` conversion (`bonsai2_27b`: projections, head and token embedding,
+`AllowA8`), the A8 t5 route (rotation fused into the natural-order quantization, arithmetic
+dp4a GEMV, shared-memory-decode prefill GEMM, embedding gather), Vision tower from Prism's
+mmproj, full MSVC build and test suite passing. t2 is gone from the C++ engine; the Python
+codec still accepts it until the other session's cleanup commit (slot2 packing,
+`T2_G128_FP16`, its tests and the loading test's `to_t5` override). Reference artifact:
+`E:\LLM\bonsai2_27b_vl.ninfer` (t5, text + Vision + MTP, 6.56 GB). The older t2 artifacts
+(`bonsai2_27b_vl_t2`, `bonsai2_27b_vl_q8emb`, `bonsai2_27b_a8`) no longer load. On the RTX
+4090 at 60 Hz (section 9, "t5 against t2 end to end"): MTP decode 142-179 tok/s over six
+prompts (mean 163, draft 2, `--lm-head-draft`, ~13.0 ms per round); tg128 101 tok/s and pp512
+2428 tok/s against the fork's 77.1 and 1363; quick perplexity overall 5.8556.
 
 Next steps, in order:
 
 1. MTP layer (Q8, 1.3 ms per round) and Q4 proposal head (1.0 ms), both at ~935 GB/s-1 TB/s:
    measure six-prompt acceptance with a Q5 and a Q4 MTP layer before changing the recipe.
-2. Replace t2 with the arithmetic base-3 format `t5_g128_fp16` (approved 2026-09-24; section 9,
-   "Base-3 t5 prototype": GEMV round ratio 0.81 at T = 1 and 3, 0.86 at T = 4, every shape
-   faster than t2 through T = 4). Expected ~+12-13 % decode and ~1.2 GB less weight memory
-   (~6.2 GiB with MTP). Exact, so perplexity must equal t2's up to accumulation rounding.
-   t2 is removed (every Bonsai artifact is reconverted); no parallel format.
-
-   Layout (the prototype's `t5a` packing in `bench/ops/t5_proto_bench.cu`):
-   - Codes c = w + 1 in {0, 1, 2} for weight w in {-1, 0, +1} (t2's convention), in the
-     rotated basis with `Weight::input_signs` as today.
-   - A row is K / 64 units of 13 bytes, units in column order; row stride 13 K / 64 bytes
-     (a multiple of 208 since K % 1024 == 0). Fused projections keep their rows in one parent.
-   - Unit u covers columns 64u .. 64u + 63. Byte i < 12, with g = i / 4 and j = i % 4, holds
-     the five trits t_m = c[64u + 20g + 4m + j], m = 0..4. Byte 12 holds t_m = c[64u + 60 + m]
-     for m = 0..3 and t_4 = 0.
-   - Byte value q = ceil(256 v / 243) = (256 v + 242) / 243 with v = sum_m t_m 3^(4 - m)
-     (t_0 most significant). Decode: r = q; for m = 0..4: r = 3 r, t_m = r >> 8, r = r & 255.
-   - Scales: FP16 [N][K / 128], one per 128 columns (two units), in a region after the codes
-     as in t2's geometry.
-   - Activation for the A8 kernels: int8 in natural column order, one FP32 scale per 128
-     columns and the per-32-column slice sums (unit u subtracts slices 2u and 2u + 1).
-   - t5 requires `AllowA8`; there is no A16 route.
-
-   Split: the other session registers the format (Python and C++ geometry, QType/QuantLayout),
-   writes the converter from PTQ1_0 with the exact GGUF trits (PQ2_0 repacked), the recipe and
-   their tests. This session writes the production kernels with FP64 oracles and benches:
-   A8 GEMV for T = 1..4 (prototype 64/2), the prefill GEMM decoding t5 while filling shared
-   memory (qualified at T = 512 against pp512 2648 tok/s), the T = 5..8 route (Tile-8 GEMV
-   or the GEMM, whichever is less slow; Tile-8 GEMV is 1.2-1.7x t2 today) and the embedding
-   gather.
-
-   Progress: format registration, converter and loader validation are done (section 9, "t5
-   format registration and converter"); the kernels remain. Flip `TERNARY_FORMAT` in
-   `tools/convert/official_recipes.py` and remove t2 when they land.
-3. Measure decode with the monitor cable on the iGPU (motherboard output), lighthouse and
-   Python prompts, beside the 120 Hz and 60 Hz figures in section 9, "Display preemption".
-   Expected: the ~2.2-2.8 ms of compositor stalls per round disappear. Until then the display
-   runs at 60 Hz.
-4. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit once the
-   T = 4 round is cheaper (t5 makes it 0.86 of t2), or with an adaptive window.
+2. Measure decode with the monitor cable on the iGPU (motherboard output), the six prompts,
+   beside the 60 Hz figures of section 9. Expected: the ~2.2 ms of compositor stalls per round
+   disappear. Until then the display runs at 60 Hz.
+3. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit with the
+   cheaper t5 T = 4 round (0.86 of t2), or with an adaptive window.
+4. Prefill: recover the accepted t5 regression (pp512 -13 %) with a 64 x 128-token GEMM tile
+   (half the weight reads and decode per token), and an eight-token tensor-core route for
+   T = 5..8 (1.2-1.7x t2 today) if short prefills matter.
 5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
    quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
    Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).

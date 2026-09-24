@@ -7,7 +7,7 @@
 namespace ninfer::ops {
 
 /**
- * Prism input rotation of a ternary (T2_G128_FP16) projection:
+ * Prism input rotation of a ternary (T5_G128_FP16) projection:
  *
  *   y[t][k] = (1/32) * sum_j H[k mod 1024][j] * signs[b + j] * x[t][b + j],  b = 1024 * (k / 1024),
  *

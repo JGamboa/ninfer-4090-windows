@@ -186,7 +186,7 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
 
 # The stored ternary format of every Bonsai projection, head and embedding. The base-3
 # `t5_g128_fp16` replaces it once its production kernels land (design doc 9.1, step 2).
-TERNARY_FORMAT = "t2_g128_fp16"
+TERNARY_FORMAT = "t5_g128_fp16"
 
 _BONSAI_TERNARY = (
     "/attention/query",

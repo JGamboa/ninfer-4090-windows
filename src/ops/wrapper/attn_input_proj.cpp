@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 
-#include "ops/linear/t2/t2_project.h"
+#include "ops/linear/t5/t5_project.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
@@ -126,7 +126,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
-    if (ternary_qtype(weight.qtype)) {
+    if (weight.qtype == QType::T5_G128_FP16) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
         constexpr std::int32_t kKvRows = 1024;
@@ -139,11 +139,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
         if (weight.n != kRows || weight.k != kHidden) {
-            throw std::invalid_argument("t2 attn_input_proj: unsupported weight shape");
+            throw std::invalid_argument("t5 attn_input_proj: unsupported weight shape");
         }
-        // Parent rows are query, key, gate, value (the caller rotated x).
+        // Parent rows are query, key, gate, value (t5_project rotates x).
         Tensor* outputs[] = {&q, &k, &gate, &v};
-        detail::t2_project(x, weight, outputs, /*accumulate=*/false, policy, workspace, stream);
+        detail::t5_project(x, weight, outputs, /*accumulate=*/false, policy, workspace, stream);
         return;
     }
 
@@ -220,12 +220,11 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         (void)detail::q8_attn_input_resolve_plan(
             {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
         return 0;
-    case QType::T2_G128_FP16:
     case QType::T5_G128_FP16:
         if (parent_rows != 14336 || input_rows != 5120) {
-            throw std::invalid_argument("attn_input_proj workspace: unsupported t2 profile");
+            throw std::invalid_argument("attn_input_proj workspace: unsupported t5 profile");
         }
-        return detail::t2_workspace_capacity_bytes(policy, input_rows, max_tokens);
+        return detail::t5_workspace_capacity_bytes(policy, input_rows, max_tokens);
     case QType::Q4_G64_FP16:
     case QType::Q5_G64_FP16:
     case QType::Q6_G64_FP16:
