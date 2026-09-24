@@ -1,6 +1,11 @@
+#include "serve/monitor_page.h"
 #include "serve/serve_metrics.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <string>
@@ -107,6 +112,56 @@ int main() {
     const auto residue = metrics.last_completed();
     failures += check(residue.prompt_tokens == 10 && residue.cached_tokens == 10,
                       "last completed cache clamped to prompt");
+
+    // Monitor snapshot: the static context, live KV/scheduler gauges and totals, one row per
+    // slot, and the completed requests newest first.
+    ServeMetrics::MonitorContext context{"bonsai-27b", 262144, 3, 262144, 4096, 2};
+    live.device_main_kv_occupied_pages = 1400;
+    live.running_requests              = 1;
+    live.waiting_requests              = 2;
+    std::vector<ninfer::SlotState> slots(3);
+    slots[0].processing    = true;
+    slots[0].prompt_tokens = 86266;
+    slots[0].cached_tokens = 85133;
+    slots[1].retained      = true;
+    const auto monitor = nlohmann::json::parse(metrics.render_monitor(context, live, slots));
+    failures += check(monitor.at("model") == "bonsai-27b" && monitor.at("draft_window") == 2,
+                      "monitor context");
+    failures += check(monitor.at("kv").at("pages") == 4096 &&
+                          monitor.at("kv").at("occupied_pages") == 1400,
+                      "monitor kv occupancy");
+    failures += check(monitor.at("scheduler").at("running") == 1 &&
+                          monitor.at("scheduler").at("waiting") == 2,
+                      "monitor scheduler gauges");
+    failures += check(monitor.at("totals").at("requests") == 3 &&
+                          monitor.at("totals").at("decode_tokens") == 300 &&
+                          monitor.at("totals").at("cached_prompt_tokens") == 950,
+                      "monitor totals");
+    const auto& slot_rows = monitor.at("slots");
+    failures += check(slot_rows.size() == 3 && slot_rows[0].at("processing") == true &&
+                          slot_rows[0].at("prompt_tokens") == 86266 &&
+                          slot_rows[1].at("retained") == true,
+                      "monitor slot rows");
+    const auto& recent = monitor.at("recent");
+    failures += check(recent.size() == 3 && recent[0].at("sequence") == 3 &&
+                          recent[0].at("cached_tokens") == 10 && recent[2].at("sequence") == 1 &&
+                          recent[1].at("drafted") == 150 && recent[1].at("accepted") == 75,
+                      "monitor recent requests newest first");
+
+    // The recent list keeps the latest kRecentRequests completions.
+    for (int i = 0; i < 40; ++i) metrics.record(outcome(100 + i, 0, 10, 0.1, 0.2, 0, 0));
+    const auto kept = metrics.recent_requests();
+    failures += check(kept.size() == ServeMetrics::kRecentRequests && kept.front().sequence == 43 &&
+                          kept.front().prompt_tokens == 139 &&
+                          kept.back().sequence == 43 - ServeMetrics::kRecentRequests + 1,
+                      "recent requests bounded");
+
+    // The page compiled into the server is the source page, byte for byte.
+    std::ifstream page_file(std::string(NINFER_SOURCE_DIR) + "/src/serve/monitor_page.html",
+                            std::ios::binary);
+    const std::string page_source{std::istreambuf_iterator<char>(page_file), {}};
+    failures += check(!page_source.empty() && ninfer::serve::monitor_page() == page_source,
+                      "embedded monitor page matches its source");
 
     std::printf("%s serve metrics\n", failures == 0 ? "OK" : "FAIL");
     return failures == 0 ? 0 : 1;

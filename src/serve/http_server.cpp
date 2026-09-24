@@ -4,6 +4,7 @@
 
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
+#include "serve/monitor_page.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
 #include "serve/slot_files.h"
@@ -461,6 +462,22 @@ void HttpServer::register_routes() {
                                                             : ninfer::RuntimeStats{}),
                         "text/plain; version=0.0.4");
     });
+    // Live monitor: a self-contained page polling the JSON snapshot below once per second.
+    server_.Get("/monitor", [](const httplib::Request&, httplib::Response& res) {
+        const std::string_view page = monitor_page();
+        res.set_content(page.data(), page.size(), "text/html; charset=utf-8");
+    });
+    server_.Get("/monitor/stats", [this](const httplib::Request&, httplib::Response& res) {
+        if (service_ == nullptr) {
+            res.status = 503;
+            res.set_content(nlohmann::json{{"status", "loading"}}.dump(), "application/json");
+            return;
+        }
+        std::vector<ninfer::SlotState> slots = service_->slot_states();
+        slots.resize(service_->slot_count());
+        res.set_content(metrics_.render_monitor(monitor_context_, service_->runtime_stats(), slots),
+                        "application/json");
+    });
     // llama.cpp-shaped slot detail, read from the Engine's continuation catalog: one slot per
     // private catalog cell. A cell claimed by a running request reports that request's prompt
     // and reused-prefix sizes; a retained cell reports the resident session's depth (as both
@@ -694,6 +711,15 @@ void HttpServer::attach(GenerationService& service) {
     }
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_name);
+    const ninfer::MemorySummary memory = service.memory_summary();
+    monitor_context_ = {public_model_id_,
+                        options_.max_context,
+                        service.slot_count(),
+                        memory.kv_capacity,
+                        memory.kv_capacity_page_groups,
+                        options_.speculative.backend != ninfer::SpeculativeBackend::None
+                            ? options_.speculative.draft_tokens
+                            : 0u};
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,

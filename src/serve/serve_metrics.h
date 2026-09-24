@@ -11,10 +11,15 @@
 // so they advance during a request like llama.cpp's do, not only at its
 // completion. The ninfer:-prefixed series report what llama.cpp cannot:
 // speculative draft/acceptance totals and prefix-cache reuse.
+//
+// The same counters, the Engine's KV and scheduler gauges, the slot table and the most recent
+// completed requests also form the JSON snapshot behind GET /monitor/stats, which the page at
+// GET /monitor polls; rates are differenced by the page.
 
 #include "serve/generation_service.h"
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -52,6 +57,38 @@ public:
     };
     [[nodiscard]] LastCompleted last_completed() const;
 
+    // Summary of one completed request, newest first in recent_requests().
+    struct RecentRequest {
+        std::uint64_t sequence  = 0; // 1-based completion order
+        int prompt_tokens       = 0;
+        int cached_tokens       = 0;
+        int completion_tokens   = 0;
+        int reasoning_tokens    = 0;
+        double ttft_seconds     = 0.0;
+        double decode_seconds   = 0.0;
+        double total_seconds    = 0.0;
+        std::uint64_t drafted   = 0;
+        std::uint64_t accepted  = 0;
+        ninfer::FinishReason finish_reason = ninfer::FinishReason::None;
+    };
+    static constexpr std::size_t kRecentRequests = 32;
+    [[nodiscard]] std::vector<RecentRequest> recent_requests() const;
+
+    // Static facts of the running server shown by the monitor.
+    struct MonitorContext {
+        std::string model;
+        std::uint32_t max_context        = 0;
+        std::uint32_t max_concurrency    = 0;
+        std::uint32_t kv_capacity_tokens = 0;
+        std::uint32_t kv_pages           = 0;
+        std::uint32_t draft_window       = 0; // 0 without speculative decoding
+    };
+
+    // The GET /monitor/stats JSON body.
+    [[nodiscard]] std::string render_monitor(const MonitorContext& context,
+                                             const ninfer::RuntimeStats& live,
+                                             const std::vector<ninfer::SlotState>& slots) const;
+
     // One complete Prometheus text body, without HTTP framing. In-flight
     // requests are split into processing/deferred against `max_concurrency`,
     // matching the FIFO scheduler's work-conserving behavior.
@@ -68,6 +105,7 @@ private:
     std::uint64_t speculative_draft_tokens_total_    = 0;
     std::uint64_t speculative_accepted_tokens_total_ = 0;
     LastCompleted last_completed_;
+    std::deque<RecentRequest> recent_; // newest first, at most kRecentRequests
     std::map<std::uint64_t, int> active_;
 };
 

@@ -65,6 +65,9 @@ selected for this process.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `GET /metrics` | llama.cpp-compatible Prometheus text counters plus NInfer draft and prefix-cache totals |
+| `GET /monitor` | live monitor page for a browser: throughput, KV occupancy, slots, recent requests |
+| `GET /monitor/stats` | the monitor's JSON snapshot: context, KV and scheduler gauges, cumulative totals, slots, last 32 requests |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 
@@ -111,6 +114,15 @@ next restore recovers the session at its latest frontier instead of the last exp
 save. Sessions never saved or restored have no binding and are not spilled; an explicit
 `erase` is a deletion request and never auto-saves. The console reports each spill as
 `slot auto-save file=... n_saved=...`.
+
+`GET /monitor` serves one self-contained page (`src/serve/monitor_page.html`, compiled into the
+server) that polls `GET /monitor/stats` once per second from the same origin, so it needs no
+`--cors`. The snapshot carries cumulative counters (prefill and decode tokens and unit seconds,
+reused prompt tokens, drafted and accepted tokens); the page differences consecutive snapshots
+into decode and prefill tok/s, the current MTP acceptance and a two-minute throughput chart. KV
+occupancy is the Engine's occupied Main KV pages against the resolved page capacity. The recent
+list keeps the last 32 completed requests with their prompt, reused, output and thinking tokens,
+time to first token, decode seconds, draft counts and finish reason.
 
 `GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue

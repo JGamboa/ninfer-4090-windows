@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NInfer Monitor</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e3e6eb; --text: #1b1f24; --muted: #667080;
+  --accent: #2f6fdd; --accent2: #d9822b; --good: #2e9d5b; --warn: #c9851a; --bad: #cc3d3d;
+  --track: #edf0f4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --panel: #191d23; --line: #2a3039; --text: #e6e9ee; --muted: #8b95a5;
+    --accent: #5b9bff; --accent2: #f0a050; --good: #4cc27d; --warn: #e3a63a; --bad: #f06a6a;
+    --track: #232932;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 40px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 18px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; font-weight: 650; }
+h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
+     text-transform: uppercase; letter-spacing: .04em; }
+.meta { color: var(--muted); font-size: 13px; }
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: var(--good); } .dot.bad { background: var(--bad); }
+.grid { display: grid; gap: 12px; }
+.tiles { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); margin-bottom: 12px; }
+.two { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); margin-bottom: 12px; }
+@media (max-width: 820px) { .two { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.tile .label { color: var(--muted); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .value small { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 4px; }
+.tile .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.idle { color: var(--muted); }
+canvas { width: 100%; height: 220px; display: block; }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+.bar { height: 10px; background: var(--track); border-radius: 5px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); border-radius: 5px; transition: width .4s; }
+.bar.warn > span { background: var(--warn); } .bar.bad > span { background: var(--bad); }
+.kv-row { display: flex; justify-content: space-between; font-size: 13px; margin: 10px 0 6px;
+          font-variant-numeric: tabular-nums; }
+.kv-row span:first-child { color: var(--muted); }
+.sched { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 14px; }
+.sched div { background: var(--track); border-radius: 8px; padding: 8px 10px; }
+.sched b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+.sched span { color: var(--muted); font-size: 12px; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+th:first-child, td:first-child, td.left, th.left { text-align: left; }
+tbody tr:last-child td { border-bottom: none; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--track); color: var(--muted); }
+.pill.run { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
+.pill.keep { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+.mini { width: 110px; display: inline-block; vertical-align: middle; margin-left: 8px; }
+.empty { color: var(--muted); padding: 10px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="model">NInfer</h1>
+    <span class="meta" id="facts"></span>
+    <span class="status"><span class="dot" id="dot"></span><span id="state">connecting</span></span>
+  </header>
+
+  <section class="grid tiles">
+    <div class="panel tile"><div class="label">Decode</div><div class="value" id="t-decode">&ndash;</div><div class="sub" id="t-decode-sub">&nbsp;</div></div>
+    <div class="panel tile"><div class="label">Prefill</div><div class="value" id="t-prefill">&ndash;</div><div class="sub" id="t-prefill-sub">&nbsp;</div></div>
+    <div class="panel tile"><div class="label">MTP acceptance</div><div class="value" id="t-accept">&ndash;</div><div class="sub" id="t-accept-sub">&nbsp;</div></div>
+    <div class="panel tile"><div class="label">Prompt from cache</div><div class="value" id="t-cache">&ndash;</div><div class="sub" id="t-cache-sub">&nbsp;</div></div>
+    <div class="panel tile"><div class="label">Requests</div><div class="value" id="t-req">&ndash;</div><div class="sub" id="t-req-sub">&nbsp;</div></div>
+  </section>
+
+  <section class="grid two">
+    <div class="panel">
+      <h2>Throughput, last 2 minutes</h2>
+      <canvas id="chart"></canvas>
+      <div class="legend"><span><i style="background:var(--accent)"></i>decode tok/s</span><span><i style="background:var(--accent2)"></i>prefill tok/s (right axis)</span></div>
+    </div>
+    <div class="panel">
+      <h2>KV cache</h2>
+      <div class="kv-row"><span>GPU pool</span><span id="kv-text">&ndash;</span></div>
+      <div class="bar" id="kv-bar"><span style="width:0"></span></div>
+      <div class="kv-row"><span>Host (RAM) KV</span><span id="host-text">&ndash;</span></div>
+      <div class="sched">
+        <div><b id="s-run">0</b><span>running</span></div>
+        <div><b id="s-prefill">0</b><span>prefilling</span></div>
+        <div><b id="s-decode">0</b><span>decoding</span></div>
+        <div><b id="s-wait">0</b><span>waiting</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" style="margin-bottom:12px">
+    <h2>Slots</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Slot</th><th class="left">State</th><th>Context tokens</th><th>From cache</th><th>Checkpoints</th><th class="left">Context use</th></tr></thead>
+      <tbody id="slots"></tbody>
+    </table></div>
+  </section>
+
+  <section class="panel">
+    <h2>Recent requests</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>#</th><th>Prompt</th><th>From cache</th><th>Output</th><th>Thinking</th><th>First token</th><th>Decode</th><th>MTP accept</th><th>Total</th><th class="left">Finish</th></tr></thead>
+      <tbody id="recent"></tbody>
+    </table></div>
+  </section>
+</main>
+<script>
+"use strict";
+const HISTORY = 120;
+const history = [];
+let previous = null;
+const $ = (id) => document.getElementById(id);
+const num = (v) => Math.round(v).toLocaleString("en-US");
+const fixed = (v, d) => v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const bytes = (b) => b >= 1 << 30 ? fixed(b / (1 << 30), 2) + " GiB" : fixed(b / (1 << 20), 0) + " MiB";
+const pct = (a, b) => b > 0 ? fixed(100 * a / b, 1) + " %" : "\u2013";
+
+function rate(tokens, seconds) { return seconds > 0 ? tokens / seconds : 0; }
+
+function setTile(id, text, sub, idle) {
+  const el = $(id);
+  el.innerHTML = text;
+  el.classList.toggle("idle", !!idle);
+  if (sub !== undefined) $(id + "-sub").innerHTML = sub || "&nbsp;";
+}
+
+function update(s) {
+  $("model").textContent = s.model || "NInfer";
+  $("facts").textContent = num(s.max_context) + " context \u00b7 " + s.max_concurrency + " slots" +
+    (s.draft_window ? " \u00b7 MTP " + s.draft_window + " drafts" : "");
+  const t = s.totals;
+  let decode = 0, prefill = 0, accept = null;
+  if (previous) {
+    const p = previous.totals;
+    decode = rate(t.decode_tokens - p.decode_tokens, t.decode_seconds - p.decode_seconds);
+    prefill = rate(t.prefill_tokens - p.prefill_tokens, t.prefill_seconds - p.prefill_seconds);
+    if (t.drafted > p.drafted) accept = (t.accepted - p.accepted) / (t.drafted - p.drafted);
+  }
+  // The first snapshot has no interval to difference; the chart starts at the second.
+  if (previous) {
+    history.push({ decode, prefill });
+    if (history.length > HISTORY) history.shift();
+  }
+  previous = s;
+
+  const avgDecode = rate(t.decode_tokens, t.decode_seconds);
+  const avgPrefill = rate(t.prefill_tokens, t.prefill_seconds);
+  setTile("t-decode", decode > 0 ? fixed(decode, 1) + "<small>tok/s</small>" : "idle",
+          "session avg " + (avgDecode > 0 ? fixed(avgDecode, 1) + " tok/s" : "\u2013"), decode <= 0);
+  setTile("t-prefill", prefill > 0 ? num(prefill) + "<small>tok/s</small>" : "idle",
+          "session avg " + (avgPrefill > 0 ? num(avgPrefill) + " tok/s" : "\u2013"), prefill <= 0);
+  if (s.draft_window) {
+    const overall = t.drafted > 0 ? t.accepted / t.drafted : null;
+    setTile("t-accept", accept !== null ? fixed(100 * accept, 1) + "<small>%</small>" :
+            (overall !== null ? fixed(100 * overall, 1) + "<small>%</small>" : "\u2013"),
+            overall !== null ? "session " + fixed(100 * overall, 1) + " % of " + num(t.drafted) + " drafts" : "",
+            accept === null);
+  } else {
+    setTile("t-accept", "off", "no speculative decoding", true);
+  }
+  const promptTotal = t.cached_prompt_tokens + t.prefill_tokens;
+  setTile("t-cache", promptTotal > 0 ? fixed(100 * t.cached_prompt_tokens / promptTotal, 1) + "<small>%</small>" : "\u2013",
+          num(t.cached_prompt_tokens) + " reused \u00b7 " + num(t.prefill_tokens) + " computed");
+  setTile("t-req", num(t.requests), s.scheduler.in_flight + " in flight \u00b7 " +
+          num(t.decode_tokens) + " tokens generated");
+
+  const kv = s.kv;
+  const used = kv.pages > 0 ? kv.occupied_pages / kv.pages : 0;
+  const usedTokens = kv.pages > 0 ? Math.round(kv.occupied_pages * kv.capacity_tokens / kv.pages) : 0;
+  $("kv-text").textContent = num(usedTokens) + " / " + num(kv.capacity_tokens) + " tokens (" + pct(kv.occupied_pages, kv.pages) + ")";
+  const bar = $("kv-bar");
+  bar.firstElementChild.style.width = Math.min(100, 100 * used) + "%";
+  bar.classList.toggle("warn", used >= 0.75 && used < 0.92);
+  bar.classList.toggle("bad", used >= 0.92);
+  $("host-text").textContent = bytes(kv.host_occupied_bytes) + " held";
+  $("s-run").textContent = s.scheduler.running;
+  $("s-prefill").textContent = s.scheduler.prefilling;
+  $("s-decode").textContent = s.scheduler.decode_ready;
+  $("s-wait").textContent = s.scheduler.waiting;
+
+  $("slots").innerHTML = s.slots.map((slot) => {
+    const state = slot.processing ? '<span class="pill run">processing</span>' :
+                  slot.retained ? '<span class="pill keep">retained</span>' : '<span class="pill">idle</span>';
+    const use = s.max_context > 0 ? Math.min(100, 100 * slot.prompt_tokens / s.max_context) : 0;
+    return "<tr><td>" + slot.id + '</td><td class="left">' + state + "</td><td>" + num(slot.prompt_tokens) +
+           "</td><td>" + num(slot.cached_tokens) + "</td><td>" + slot.checkpoints +
+           '</td><td class="left">' + fixed(use, 1) + ' %<span class="bar mini"><span style="width:' + use + '%"></span></span></td></tr>';
+  }).join("");
+
+  $("recent").innerHTML = s.recent.length === 0 ? '<tr><td colspan="10" class="empty left">No completed requests yet.</td></tr>' :
+    s.recent.map((r) => {
+      const speed = r.decode_seconds > 0 && r.completion_tokens > 1 ? fixed((r.completion_tokens - 1) / r.decode_seconds, 1) + " tok/s" : "\u2013";
+      const acc = r.drafted > 0 ? pct(r.accepted, r.drafted) : "\u2013";
+      return "<tr><td>" + r.sequence + "</td><td>" + num(r.prompt_tokens) + "</td><td>" + num(r.cached_tokens) +
+             "</td><td>" + num(r.completion_tokens) + "</td><td>" + num(r.reasoning_tokens) + "</td><td>" +
+             fixed(r.ttft_seconds, 2) + " s</td><td>" + speed + "</td><td>" + acc + "</td><td>" +
+             fixed(r.total_seconds, 1) + ' s</td><td class="left">' + r.finish_reason + "</td></tr>";
+    }).join("");
+  draw();
+}
+
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+function draw() {
+  const canvas = $("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const css = getComputedStyle(document.documentElement);
+  const color = (name) => css.getPropertyValue(name).trim();
+  const left = 44, right = 54, top = 8, bottom = 20;
+  const pw = w - left - right, ph = h - top - bottom;
+  const dMax = niceMax(Math.max(...history.map((p) => p.decode), 10));
+  const pMax = niceMax(Math.max(...history.map((p) => p.prefill), 100));
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; ++i) {
+    const y = top + ph - (ph * i) / 4;
+    ctx.strokeStyle = color("--line");
+    ctx.beginPath(); ctx.moveTo(left, y + 0.5); ctx.lineTo(left + pw, y + 0.5); ctx.stroke();
+    ctx.fillStyle = color("--muted");
+    ctx.textAlign = "right"; ctx.fillText(num((dMax * i) / 4), left - 6, y + 4);
+    ctx.textAlign = "left"; ctx.fillText(num((pMax * i) / 4), left + pw + 6, y + 4);
+  }
+  ctx.textAlign = "center";
+  ctx.fillText("-2 min", left, h - 4); ctx.fillText("now", left + pw, h - 4);
+  const series = (key, max, stroke) => {
+    ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.beginPath();
+    const offset = HISTORY - history.length;
+    history.forEach((p, i) => {
+      const x = left + (pw * (offset + i)) / (HISTORY - 1);
+      const y = top + ph - (ph * Math.min(p[key], max)) / max;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  };
+  series("prefill", pMax, color("--accent2"));
+  series("decode", dMax, color("--accent"));
+}
+
+async function poll() {
+  try {
+    const response = await fetch("/monitor/stats", { cache: "no-store" });
+    if (!response.ok) throw new Error(response.status === 503 ? "loading" : "HTTP " + response.status);
+    update(await response.json());
+    $("dot").className = "dot ok"; $("state").textContent = "live";
+  } catch (error) {
+    $("dot").className = "dot bad"; $("state").textContent = String(error.message || error);
+  }
+  setTimeout(poll, 1000);
+}
+window.addEventListener("resize", draw);
+poll();
+</script>
+</body>
+</html>

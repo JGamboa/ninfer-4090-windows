@@ -1,5 +1,9 @@
 #include "serve/serve_metrics.h"
 
+#include "serve/operational_log.h"
+
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cstdio>
 
@@ -53,6 +57,84 @@ void ServeMetrics::record(const GenerationOutcome& outcome) {
     // Clamped like computed_prefill above: a cache figure reported larger
     // than the prompt must not advertise more resident tokens than exist.
     last_completed_.cached_tokens = static_cast<int>(std::min(cached, prompt));
+
+    RecentRequest recent;
+    recent.sequence          = requests_total_;
+    recent.prompt_tokens     = last_completed_.prompt_tokens;
+    recent.cached_tokens     = last_completed_.cached_tokens;
+    recent.completion_tokens = outcome.completion_tokens;
+    recent.reasoning_tokens  = outcome.reasoning_tokens;
+    recent.ttft_seconds      = m.ttft_seconds;
+    recent.decode_seconds    = m.decode_seconds;
+    recent.total_seconds     = m.total_seconds;
+    recent.drafted           = m.speculative_draft_tokens;
+    recent.accepted          = m.speculative_accepted_tokens;
+    recent.finish_reason     = outcome.finish_reason;
+    recent_.push_front(recent);
+    if (recent_.size() > kRecentRequests) { recent_.pop_back(); }
+}
+
+std::vector<ServeMetrics::RecentRequest> ServeMetrics::recent_requests() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return {recent_.begin(), recent_.end()};
+}
+
+std::string ServeMetrics::render_monitor(const MonitorContext& context,
+                                         const ninfer::RuntimeStats& live,
+                                         const std::vector<ninfer::SlotState>& slots) const {
+    nlohmann::json slot_rows = nlohmann::json::array();
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        const ninfer::SlotState& slot = slots[i];
+        slot_rows.push_back({{"id", i},
+                             {"processing", slot.processing},
+                             {"retained", slot.retained},
+                             {"prompt_tokens", slot.prompt_tokens},
+                             {"cached_tokens", slot.cached_tokens},
+                             {"checkpoints", slot.checkpoints.size()}});
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    nlohmann::json recent = nlohmann::json::array();
+    for (const RecentRequest& r : recent_) {
+        recent.push_back({{"sequence", r.sequence},
+                          {"prompt_tokens", r.prompt_tokens},
+                          {"cached_tokens", r.cached_tokens},
+                          {"completion_tokens", r.completion_tokens},
+                          {"reasoning_tokens", r.reasoning_tokens},
+                          {"ttft_seconds", r.ttft_seconds},
+                          {"decode_seconds", r.decode_seconds},
+                          {"total_seconds", r.total_seconds},
+                          {"drafted", r.drafted},
+                          {"accepted", r.accepted},
+                          {"finish_reason", finish_reason_name(r.finish_reason)}});
+    }
+    const nlohmann::json body{
+        {"model", context.model},
+        {"max_context", context.max_context},
+        {"max_concurrency", context.max_concurrency},
+        {"draft_window", context.draft_window},
+        {"kv",
+         {{"capacity_tokens", context.kv_capacity_tokens},
+          {"pages", context.kv_pages},
+          {"occupied_pages", live.device_main_kv_occupied_pages},
+          {"host_occupied_bytes", live.host_kv_occupied_bytes}}},
+        {"scheduler",
+         {{"in_flight", active_.size()},
+          {"running", live.running_requests},
+          {"prefilling", live.prefilling_requests},
+          {"decode_ready", live.decode_ready_requests},
+          {"waiting", live.waiting_requests}}},
+        {"totals",
+         {{"requests", requests_total_},
+          {"prefill_tokens", live.computed_prefill_tokens},
+          {"prefill_seconds", live.prefill_seconds_total},
+          {"decode_tokens", live.committed_decode_tokens},
+          {"decode_seconds", live.decode_seconds_total},
+          {"cached_prompt_tokens", prefix_cache_hit_tokens_total_},
+          {"drafted", speculative_draft_tokens_total_},
+          {"accepted", speculative_accepted_tokens_total_}}},
+        {"slots", std::move(slot_rows)},
+        {"recent", std::move(recent)}};
+    return body.dump();
 }
 
 ServeMetrics::LastCompleted ServeMetrics::last_completed() const {

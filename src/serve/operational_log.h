@@ -25,6 +25,9 @@ struct OperationalRecord {
     std::string message;
 };
 
+// Human-readable finish reason, shared by the console log and the monitor.
+[[nodiscard]] const char* finish_reason_name(ninfer::FinishReason reason) noexcept;
+
 [[nodiscard]] OperationalRecord render_request_start(const RequestLogContext& context);
 [[nodiscard]] OperationalRecord render_request_rejected(const RequestRejectionLogContext& context);
 [[nodiscard]] OperationalRecord render_request_done(const RequestLogContext& context,

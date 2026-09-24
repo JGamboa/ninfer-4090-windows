@@ -126,6 +126,10 @@ build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl.ninfer --host 127.0.0.1 --port
   --max-context 32768 --spec mtp --draft-tokens 2 --lm-head-draft --vision
 ```
 
+While the server runs, open `http://localhost:8080/monitor` in a browser for a live view of
+decode and prefill speed, MTP acceptance, prefix-cache reuse, KV occupancy, slots and recent
+requests.
+
 The model thinks by default. Prism recommends `temperature 1.0, top_p 0.95, top_k 20,
 min_p 0.05` in thinking mode. `--draft-tokens 3` is faster on code and math (up to +18 %) and
 slower on prose (about −10 %); 2 is the better default. `ninfer.exe --help` and

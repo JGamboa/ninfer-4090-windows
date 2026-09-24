@@ -35,7 +35,7 @@ ninfer_add_test(ninfer_openai_responses_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_responses.cpp"
   LIBRARIES ninfer_serve)
 
-ninfer_add_test(ninfer_serve_metrics_test
+ninfer_add_test(ninfer_serve_metrics_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_metrics.cpp"
   LIBRARIES ninfer_serve)
 

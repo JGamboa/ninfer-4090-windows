@@ -68,24 +68,6 @@ OperationalSeverity failure_severity(RequestFailureClass classification) noexcep
     return OperationalSeverity::Error;
 }
 
-const char* finish_reason_name(ninfer::FinishReason reason) noexcept {
-    switch (reason) {
-    case ninfer::FinishReason::None:
-        return "none";
-    case ninfer::FinishReason::OutputLimit:
-        return "output limit";
-    case ninfer::FinishReason::ContextCapacity:
-        return "context capacity";
-    case ninfer::FinishReason::StopToken:
-        return "stop token";
-    case ninfer::FinishReason::StopString:
-        return "stop string";
-    case ninfer::FinishReason::Cancelled:
-        return "cancelled";
-    }
-    return "unknown";
-}
-
 const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
@@ -177,6 +159,24 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
 }
 
 } // namespace
+
+const char* finish_reason_name(ninfer::FinishReason reason) noexcept {
+    switch (reason) {
+    case ninfer::FinishReason::None:
+        return "none";
+    case ninfer::FinishReason::OutputLimit:
+        return "output limit";
+    case ninfer::FinishReason::ContextCapacity:
+        return "context capacity";
+    case ninfer::FinishReason::StopToken:
+        return "stop token";
+    case ninfer::FinishReason::StopString:
+        return "stop string";
+    case ninfer::FinishReason::Cancelled:
+        return "cancelled";
+    }
+    return "unknown";
+}
 
 OperationalRecord render_request_start(const RequestLogContext& context) {
     std::ostringstream out;
