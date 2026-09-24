@@ -142,6 +142,16 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 16;
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::TernaryRowK128) {
+        // Four 2-bit codes per byte (code c means c - 1), then FP16 scales per 128 columns.
+        if (format != QType::T2_G128_FP16 || k % 128) {
+            throw std::invalid_argument("TernaryRowK128 requires T2_G128_FP16 and K%128=0");
+        }
+        out.group_size          = 128;
+        out.code_bytes_per_row  = k / 4;
+        out.scale_bytes_per_row = k / 128 * 2;
+        out.code_bytes          = mul(n, out.code_bytes_per_row);
+        out.scale_offset        = aligned(out.code_bytes, 256);
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
@@ -275,7 +285,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.group                = g.group_size ? dimension(g.group_size) : 0;
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
-    if (g.layout == QuantLayout::RowSplit) {
+    if (g.layout == QuantLayout::RowSplit || g.layout == QuantLayout::TernaryRowK128) {
         out.scale_dtype = DType::FP16;
         out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
         out.scale_ne[1] = out.n;

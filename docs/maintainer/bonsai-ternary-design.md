@@ -699,7 +699,13 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   C++ `weight_geometry` must reproduce. Sign vectors are the direct bf16 parameters
   `text/hadamard/signs_{5120,6144,17408}`; the config block carries a `signs` map to them
   (section 2).
-- (B) format enum name / storage layout struct: _pending_ (C++ side; the strings above are fixed)
+- (B) C++ enums, 2026-09-24: `QType::T2_G128_FP16 = 9`, `QuantLayout::TernaryRowK128 = 4`
+  (`src/core/weight.h`), spellings in `src/artifact/formats.cpp`. `weight_geometry` gives
+  `group_size = 128`, `code_bytes_per_row = K/4`, `scale_bytes_per_row = K/64`, scale plane at
+  `align_up(N*K/4, 256)`, no high plane, no divisor; `native_weight` accepts whole-row views of
+  a fused parent (like RowSplit) with `scale_dtype = FP16`, `scale_ne = {K/128, n}`,
+  `scale_nb = {2, K/64}`. `tests/artifact/test_reader.cpp` pins the byte counts of the six 27B
+  shapes to the Python geometry.
 - (B) GDN out_proj activation order: _pending_
 - (B+C) final launcher signatures: _pending_
 - (A) `ssm_a` convention: `ssm_a = -exp(a_log)` (`a_log = log(-ssm_a)`), the standard

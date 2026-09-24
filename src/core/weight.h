@@ -16,6 +16,7 @@ enum class QType : std::uint16_t {
     INT32               = 6,
     NVFP4               = 7,
     FP8_E4M3FN_ROW_BF16 = 8,
+    T2_G128_FP16        = 9,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -23,6 +24,7 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
+    TernaryRowK128      = 4,
 };
 
 struct Weight {
