@@ -14,6 +14,7 @@ namespace {
 
 constexpr int kThreads     = 256;
 constexpr int kWarps       = kThreads / 32;
+constexpr int kRowsPerWarp = 2;
 constexpr int kMaxTile     = 8; // tokens per launch column; larger T uses grid.y
 constexpr int kMaxOutputs  = 4;
 
@@ -27,7 +28,7 @@ struct Outputs {
 // keep several global loads in flight. The 32 decoded weights (code - 1) are reused for every
 // token; x comes from global memory through L1 (the whole activation is shared by all warps).
 // FP32 accumulation, one FP16 group scale per 32-code slice (a slice never crosses a group).
-template <int Tile, int kRowsPerWarp>
+template <int Tile>
 __global__ void __launch_bounds__(kThreads)
     t2_project_kernel(const __nv_bfloat16* __restrict__ x, const uint2* __restrict__ codes,
                       const __half* __restrict__ scales, std::int64_t scale_row_halves, int n,
@@ -38,16 +39,12 @@ __global__ void __launch_bounds__(kThreads)
     const int live   = min(Tile, tokens - token0);
     const int row0   = (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
     if (row0 >= n) return;
-    const int slices_per_row = k / 32;
-    // Rows past n alias the last row; their results are never stored.
-    const uint2* row_codes[kRowsPerWarp];
-    const __half* row_scales[kRowsPerWarp];
-#pragma unroll
-    for (int r = 0; r < kRowsPerWarp; ++r) {
-        const int row = min(row0 + r, n - 1);
-        row_codes[r]  = codes + std::int64_t(row) * slices_per_row;
-        row_scales[r] = scales + std::int64_t(row) * scale_row_halves;
-    }
+    const bool pair           = row0 + 1 < n;
+    const int slices_per_row  = k / 32;
+    const uint2* row_codes[2] = {codes + std::int64_t(row0) * slices_per_row,
+                                 codes + std::int64_t(pair ? row0 + 1 : row0) * slices_per_row};
+    const __half* row_scales[2] = {scales + std::int64_t(row0) * scale_row_halves,
+                                   scales + std::int64_t(pair ? row0 + 1 : row0) * scale_row_halves};
     const __nv_bfloat16* xt = x + std::int64_t(token0) * k;
 
     float acc[kRowsPerWarp][Tile];
@@ -154,30 +151,18 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
-template <int Tile, int Rows>
+template <int Tile>
 void launch(const Tensor& x, const Weight& w, const Outputs& outputs, bool accumulate,
             cudaStream_t stream) {
     const int tokens         = x.ne[1];
-    constexpr int kRowsBlock = kWarps * Rows;
+    constexpr int kRowsBlock = kWarps * kRowsPerWarp;
     const dim3 grid(static_cast<unsigned>((w.n + kRowsBlock - 1) / kRowsBlock),
                     static_cast<unsigned>((tokens + Tile - 1) / Tile));
-    t2_project_kernel<Tile, Rows><<<grid, kThreads, 0, stream>>>(
+    t2_project_kernel<Tile><<<grid, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const uint2*>(w.qdata),
         static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.n, w.k, tokens, outputs,
         accumulate);
     CUDA_CHECK(cudaGetLastError());
-}
-
-template <int Rows>
-void launch_rows(const Tensor& x, const Weight& w, const Outputs& outputs, bool accumulate,
-                 cudaStream_t stream) {
-    switch (x.ne[1]) {
-    case 1: launch<1, Rows>(x, w, outputs, accumulate, stream); break;
-    case 2: launch<2, Rows>(x, w, outputs, accumulate, stream); break;
-    case 3: launch<3, Rows>(x, w, outputs, accumulate, stream); break;
-    case 4: launch<4, Rows>(x, w, outputs, accumulate, stream); break;
-    default: launch<kMaxTile, Rows>(x, w, outputs, accumulate, stream); break;
-    }
 }
 
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15) == 0; }
@@ -195,7 +180,7 @@ void validate_t2_weight(const Weight& w, const char* op) {
 }
 
 void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outputs,
-                bool accumulate, cudaStream_t stream, int rows_per_warp) {
+                bool accumulate, cudaStream_t stream) {
     validate_t2_weight(w, "t2_project");
     const int tokens = x.ne[1];
     if (x.dtype != DType::BF16 || x.ne[0] != w.k || tokens <= 0 || x.ne[2] != 1 ||
@@ -224,13 +209,12 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     if (end != w.n) {
         throw std::invalid_argument("t2_project: output rows must cover the weight rows");
     }
-    const int rows = rows_per_warp ? rows_per_warp : (tokens == 1 ? 2 : 4);
-    if (rows == 2) {
-        launch_rows<2>(x, w, packed, accumulate, stream);
-    } else if (rows == 4) {
-        launch_rows<4>(x, w, packed, accumulate, stream);
-    } else {
-        throw std::invalid_argument("t2_project: rows per warp must be 2 or 4");
+    switch (tokens) {
+    case 1: launch<1>(x, w, packed, accumulate, stream); break;
+    case 2: launch<2>(x, w, packed, accumulate, stream); break;
+    case 3: launch<3>(x, w, packed, accumulate, stream); break;
+    case 4: launch<4>(x, w, packed, accumulate, stream); break;
+    default: launch<kMaxTile>(x, w, packed, accumulate, stream); break;
     }
 }
 

@@ -79,8 +79,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(scratch));
     }
-    std::printf("%-12s %6s %6s %4s %5s %10s %10s\n", "role", "N", "K", "T", "rows", "us/call",
-                "GB/s");
+    std::printf("%-12s %6s %6s %4s %10s %10s\n", "role", "N", "K", "T", "us/call", "GB/s");
     for (const auto& shape : shapes) {
         const std::array<std::uint64_t, 2> dims{std::uint64_t(shape.n), std::uint64_t(shape.k)};
         const auto geometry =
@@ -109,13 +108,11 @@ int main(int argc, char** argv) {
             for (int c = 0; c < copies; ++c) {
                 ops::detail::t2_project(x, weights[c], outputs, false, nullptr);
             }
-            for (const int rows : {2, 4}) {
-                const double us = median_us(start, stop, [&](int i) {
-                    ops::detail::t2_project(x, weights[i % copies], outputs, false, nullptr, rows);
-                });
-                std::printf("%-12s %6d %6d %4d %5d %10.1f %10.1f\n", shape.role, shape.n, shape.k,
-                            t, rows, us, double(geometry.bytes) / (us * 1e3));
-            }
+            const double us = median_us(start, stop, [&](int i) {
+                ops::detail::t2_project(x, weights[i % copies], outputs, false, nullptr);
+            });
+            std::printf("%-12s %6d %6d %4d %10.1f %10.1f\n", shape.role, shape.n, shape.k, t, us,
+                        double(geometry.bytes) / (us * 1e3));
             CUDA_CHECK(cudaFree(x_data));
             CUDA_CHECK(cudaFree(y_data));
         }
