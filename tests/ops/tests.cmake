@@ -31,6 +31,10 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
+ninfer_add_op_test(ninfer_hadamard_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hadamard.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)

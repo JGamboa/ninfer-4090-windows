@@ -706,8 +706,36 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   a fused parent (like RowSplit) with `scale_dtype = FP16`, `scale_ne = {K/128, n}`,
   `scale_nb = {2, K/64}`. `tests/artifact/test_reader.cpp` pins the byte counts of the six 27B
   shapes to the Python geometry.
-- (B) GDN out_proj activation order: _pending_
-- (B+C) final launcher signatures: _pending_
+- (B) GDN out_proj activation order, 2026-09-24: grouped (HF `repeat_interleave`), so the
+  `gdn/output` Hadamard needs no permutation (`perm == nullptr`). The GDN kernels map value
+  head `h_v` to key head `h_v / group_size` (`src/ops/linear_attention/gated_delta_net/
+  common.cuh:112`, used by the recurrent and chunked paths) and write output head `h_v` at
+  `[h_v][128]`; `gated_rmsnorm` is per head and keeps that order. M0 independently matched the
+  un-rotated `ssm_out` columns to `gdn/output` without a column permutation.
+- (B+C) v1 execution, 2026-09-24 (compiled for sm_89; not yet run on a GPU):
+  - `ops::hadamard_1024(x, signs, y, stream)` (`include/ninfer/ops/hadamard.h`) over
+    `detail::hadamard_1024_launch(x, signs, perm, y, stream)` (`src/ops/hadamard/`), one
+    shared-memory butterfly block per (1024 columns, token), y may alias x.
+  - One projection kernel, `detail::t2_project(x, w, outputs, accumulate, stream)`
+    (`src/ops/linear/t2/`): a warp per two parent rows, 1024-column x chunks staged in shared
+    memory, token tiles of 8 (T <= 8) or 16, FP32 accumulation with the FP16 group scale applied
+    per 16-code word, parent rows written in order to up to four outputs, optional in-place
+    residual add. No workspace. The families route to it: `linear`; `linear_add`
+    (accumulate); `attn_input_proj` (outputs query, key, gate, value); `gdn_input_proj` (qkv,
+    z), its conv snapshot (projection into the composed BF16 channel workspace, then
+    `gdn_projected_conv_snapshot_launch`) and record (projection into the record, then
+    `gdn_projected_conv_record_launch`); `linear_swiglu` (gate/up into workspace, then
+    `silu_mul`; gate and up round to BF16 first).
+  - Model: `AttentionParameters`, `GdnParameters` and `DenseParameters` carry an optional sign
+    tensor per projection, present exactly when the weight is `t2`; `attn_mix`, `gdn_mix` and
+    `ffn` rotate that projection's input in place right before the Op (each rotated activation
+    has a single consumer; GDN `g`/`beta` are computed from the primal `h` first).
+  - Loading validates `prism_hadamard` against the bound formats in both directions and binds
+    the sign vectors by width; there is no execution refusal.
+  - Tests to run on the 4090: `ninfer_hadamard_test`, `ninfer_linear_t2_a16_test` (FP64
+    oracles, graph replay), `ninfer_qwen3_5_prism_loading_interop_test` (runs here too, CPU).
+  - Known v1 costs (M4): T > 16 re-reads the weights once per 16 tokens (slow prefill), a
+    standalone Hadamard launch per rotated projection, unfused SwiGLU.
 - (A) `ssm_a` convention: `ssm_a = -exp(a_log)` (`a_log = log(-ssm_a)`), the standard
   Mamba2/GDN parameterization. Resolved together with a 48-head index permutation
   (`perm[i] = 3*(i % 16) + (i // 16)`, GDN's 16 key heads x 3 value-head repeats) that is

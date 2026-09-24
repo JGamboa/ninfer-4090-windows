@@ -22,9 +22,14 @@ using LinearParameters = ops::SingleProjectionWeight;
     return static_cast<std::int32_t>(value);
 }
 
+// A Prism sign vector is present exactly when the projection's weight is T2_G128_FP16; the
+// caller rotates that projection's (single-consumer) input in place before the Op.
+using InputRotation = std::optional<Tensor>;
+
 struct DenseParameters {
     LinearParameters gate_up;
     LinearParameters down;
+    InputRotation gate_up_rotation, down_rotation;
 };
 
 using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
@@ -33,6 +38,7 @@ struct AttentionParameters {
     ops::ProjectionWeights projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
+    InputRotation projection_rotation, output_rotation;
 };
 
 struct GdnParameters {
@@ -40,6 +46,7 @@ struct GdnParameters {
     ops::ProjectionWeights control;
     Tensor a_log, dt_bias, convolution, norm;
     LinearParameters output;
+    InputRotation projection_rotation, output_rotation;
 };
 
 struct BlockParameters {

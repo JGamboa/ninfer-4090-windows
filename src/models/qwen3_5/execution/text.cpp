@@ -12,6 +12,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/hadamard.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -848,6 +849,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
     Tensor h              = projection.hidden;
     ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+    if (p.projection_rotation) { ops::hadamard_1024(h, *p.projection_rotation, h, s); }
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -921,8 +923,9 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    Tensor gated = a.view({dimension(config_.attention->query_width()), T});
+    if (p.output_rotation) { ops::hadamard_1024(gated, *p.output_rotation, gated, s); }
+    ops::linear_add(gated, p.output.weight, x, p.output.policy, work_, s);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -936,6 +939,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor beta        = control.beta;
     gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
                      ctx_.execution_view());
+    // g and beta already consumed the primal h; only the q/k/v/z projection reads it rotated.
+    if (p.projection_rotation) { ops::hadamard_1024(h, *p.projection_rotation, h, s); }
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1056,8 +1061,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
 
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    Tensor normalized = on.view({dimension(config_.gdn->value_width()), T});
+    // Grouped value-head order is the order Prism folded into gdn/output: no gather needed.
+    if (p.output_rotation) { ops::hadamard_1024(normalized, *p.output_rotation, normalized, s); }
+    ops::linear_add(normalized, p.output.weight, x, p.output.policy, work_, s);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {

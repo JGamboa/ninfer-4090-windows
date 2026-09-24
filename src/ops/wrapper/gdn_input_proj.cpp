@@ -10,6 +10,7 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
+#include "ops/linear/t2/t2_project.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -310,6 +311,22 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         return;
     }
 
+    if (weight.qtype == QType::T2_G128_FP16) {
+        constexpr std::int32_t kHidden  = 5120;
+        constexpr std::int32_t kQkvRows = 10240;
+        constexpr std::int32_t kZRows   = 6144;
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(qkv, kQkvRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_single_parent_nonoverlap(x, qkv, z);
+        if (weight.n != kQkvRows + kZRows || weight.k != kHidden) {
+            throw std::invalid_argument("t2 gdn_input_proj: unsupported weight shape");
+        }
+        Tensor* outputs[] = {&qkv, &z}; // the caller rotated x
+        detail::t2_project(x, weight, outputs, /*accumulate=*/false, stream);
+        return;
+    }
+
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         constexpr std::int32_t kHidden  = 5120;
         constexpr std::int32_t kQkvRows = 10240;
@@ -457,6 +474,41 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         detail::nvfp4_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                             initial_state_slots, snapshot_base_slots, query, key,
                                             value, z, policy, workspace, stream);
+        return;
+    }
+
+    if (weight.qtype == QType::T2_G128_FP16) {
+        constexpr std::int32_t kHidden    = 5120;
+        constexpr std::int32_t kQueryRows = 2048;
+        constexpr std::int32_t kKeyRows   = 2048;
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        const ConvGeometry geometry       = require_snapshot_input(x, kHidden);
+        detail::validate_t2_weight(weight, "t2 gdn_input_proj_conv_snapshot");
+        if (weight.n != kChannels + kZRows || weight.k != kHidden) {
+            throw std::invalid_argument("t2 gdn_input_proj_conv_snapshot: unsupported weight shape");
+        }
+        require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                  snapshot_base_slots, kChannels, geometry);
+        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "query");
+        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "key");
+        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "value");
+        require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "z");
+        require_snapshot_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                                    snapshot_base_slots, query, key, value, z, workspace);
+        // v1: project the rotated x into BF16 channels, then the shared causal-conv snapshot.
+        compose_batched_snapshot(
+            x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
+            query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry, workspace, stream,
+            [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
+                Tensor* outputs[] = {&projected, &z_flat};
+                detail::t2_project(x_flat, weight, outputs, /*accumulate=*/false, stream);
+            });
         return;
     }
 
@@ -615,6 +667,44 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         return;
     }
 
+    if (weight.qtype == QType::T2_G128_FP16) {
+        constexpr std::int32_t kHidden    = 5120;
+        constexpr std::int32_t kQueryRows = 2048;
+        constexpr std::int32_t kKeyRows   = 2048;
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        const ConvGeometry geometry       = require_record_input(x, kHidden);
+        detail::validate_t2_weight(weight, "t2 gdn_input_proj_conv_record");
+        if (weight.n != kChannels + kZRows || weight.k != kHidden) {
+            throw std::invalid_argument("t2 gdn_input_proj_conv_record: unsupported weight shape");
+        }
+        require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                kChannels, geometry);
+        require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "conv record");
+        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "query");
+        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "key");
+        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "value");
+        require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
+                            "z");
+        require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                                  conv_record, query, key, value, z, workspace);
+        const std::int32_t columns = geometry.width * geometry.batch;
+        Tensor x_flat(x.data, DType::BF16, {kHidden, columns});
+        Tensor record_flat(conv_record.data, DType::BF16, {kChannels, columns});
+        Tensor z_flat(z.data, DType::BF16, {kZRows, columns});
+        Tensor* outputs[] = {&record_flat, &z_flat}; // the caller rotated x
+        detail::t2_project(x_flat, weight, outputs, /*accumulate=*/false, stream);
+        detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states,
+                                                 valid_columns, initial_state_slots, query, key,
+                                                 value, stream);
+        return;
+    }
+
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         constexpr std::int32_t kHidden     = 5120;
         constexpr std::int32_t kQueryRows  = 2048;
@@ -735,6 +825,9 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (parent_qtype == QType::T2_G128_FP16 && parent_rows == 16384 && input_rows == 5120) {
+        return 0;
+    }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
         (void)detail::q8_gdn_input_resolve_plan(
             {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
@@ -802,6 +895,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
+    if (parent_qtype == QType::T2_G128_FP16 && parent_rows == 16384 && input_rows == 5120) {
+        return composed_snapshot_capacity(10240, batch_size * max_width, 0);
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {
@@ -851,6 +947,9 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
+    if (parent_qtype == QType::T2_G128_FP16 && parent_rows == 16384 && input_rows == 5120) {
+        return 0;
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {

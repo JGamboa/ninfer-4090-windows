@@ -52,13 +52,32 @@ public:
         });
     }
 
+    // The sign vector of a rotated (t2) projection input, keyed by its input width.
+    InputRotation rotation(const Weight& weight) const {
+        if (weight.qtype != QType::T2_G128_FP16) { return std::nullopt; }
+        const auto& signs = model_.weights().text.hadamard_signs;
+        const auto found  = signs.find(static_cast<std::uint64_t>(weight.k));
+        if (found == signs.end()) {
+            throw std::invalid_argument("t2 projection has no Hadamard sign vector of its width");
+        }
+        return tensor(found->second);
+    }
+
+    InputRotation rotation(const ops::ProjectionWeights& projection) const {
+        const auto* single = std::get_if<LinearParameters>(&projection);
+        return single ? rotation(single->weight) : std::nullopt;
+    }
+
     DenseParameters dense(const DenseWeights& w) const {
-        return {with_context(model_.weight(w.gate).name,
-                             [&] {
-                                 return ops::prepare_linear_swiglu_weight(model_.input(w.gate),
-                                                                          model_.input(w.up));
-                             }),
-                linear(w.down)};
+        DenseParameters out{with_context(model_.weight(w.gate).name,
+                                         [&] {
+                                             return ops::prepare_linear_swiglu_weight(
+                                                 model_.input(w.gate), model_.input(w.up));
+                                         }),
+                            linear(w.down)};
+        out.gate_up_rotation = rotation(out.gate_up.weight);
+        out.down_rotation    = rotation(out.down.weight);
+        return out;
     }
 
     FfnParameters ffn(const BlockWeights& w) const {
@@ -93,8 +112,10 @@ public:
                 ops::prepare_attn_input_proj_weights(model_.input(a->query), model_.input(a->key),
                                                      model_.input(a->gate), model_.input(a->value)),
                 tensor(a->query_norm), tensor(a->key_norm), linear(a->output)};
-            out.projection_prefetch =
-                prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
+            auto& attention               = std::get<AttentionParameters>(out.mixer);
+            attention.projection_rotation = rotation(attention.projection);
+            attention.output_rotation     = rotation(attention.output.weight);
+            out.projection_prefetch       = prefetch(attention.projection, a->query);
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
             out.mixer     = GdnParameters{
@@ -107,8 +128,10 @@ public:
                 tensor(g.convolution),
                 tensor(g.norm),
                 linear(g.output)};
-            out.projection_prefetch =
-                prefetch(std::get<GdnParameters>(out.mixer).projection, g.query);
+            auto& gdn               = std::get<GdnParameters>(out.mixer);
+            gdn.projection_rotation = rotation(gdn.projection);
+            gdn.output_rotation     = rotation(gdn.output.weight);
+            out.projection_prefetch = prefetch(gdn.projection, g.query);
         }
         return out;
     }

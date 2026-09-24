@@ -11,6 +11,7 @@
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/q8/q8_linear_add_plan.h"
+#include "ops/linear/t2/t2_project.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -137,6 +138,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
     }
+    if (qtype == QType::T2_G128_FP16) {
+        if (output_rows <= 0 || input_rows <= 0 || input_rows % 1024) {
+            throw std::invalid_argument("linear_add workspace: t2 requires K % 1024 == 0");
+        }
+        return 0;
+    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -240,6 +247,14 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    if (w.qtype == QType::T2_G128_FP16) {
+        // The caller rotated x; the residual is added in FP32 before one BF16 rounding.
+        (void)ws;
+        Tensor* outputs[] = {&residual_out};
+        detail::t2_project(x, w, outputs, /*accumulate=*/true, stream);
         return;
     }
 

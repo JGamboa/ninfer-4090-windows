@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 
+#include "ops/linear/t2/t2_project.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
@@ -125,6 +126,27 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
+    if (weight.qtype == QType::T2_G128_FP16) {
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = 14336;
+        const std::int32_t cols        = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("t2 attn_input_proj: unsupported weight shape");
+        }
+        // Parent rows are query, key, gate, value (the caller rotated x).
+        Tensor* outputs[] = {&q, &k, &gate, &v};
+        detail::t2_project(x, weight, outputs, /*accumulate=*/false, stream);
+        return;
+    }
+
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -197,6 +219,11 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             {input_rows, 4096, 512, parent_rows, input_rows, min_tokens});
         (void)detail::q8_attn_input_resolve_plan(
             {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
+        return 0;
+    case QType::T2_G128_FP16:
+        if (parent_rows != 14336 || input_rows != 5120) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported t2 profile");
+        }
         return 0;
     case QType::Q4_G64_FP16:
     case QType::Q5_G64_FP16:
