@@ -633,6 +633,9 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
   conversion and dequantization code defined the formats this branch reads.
 - [fraserprice/bonsai-vllm](https://github.com/fraserprice/bonsai-vllm) - a CUDA reference for
   the Hadamard kernel and a ternary tensor-core GEMM.
+- The Bonsai port (converter, ternary kernels, runtime integration, vision, tests and
+  measurements) was developed with [Claude Code](https://claude.com/claude-code), with every
+  kernel checked against FP64 oracles and every performance claim measured on the RTX 4090.
 - [Neroued/ninfer](https://github.com/Neroued/ninfer) - the engine, developed for the RTX 5090
   (`sm_120a`).
 - [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) - the SM86 compatibility layer,
