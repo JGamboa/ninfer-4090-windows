@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
         DeviceBuffer input       = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
-            QType::Q4G64_F16S, kGateUpRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
+            QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
 
         for (const std::int32_t t : tokens) {
             std::printf("== T=%d ==\n", t);

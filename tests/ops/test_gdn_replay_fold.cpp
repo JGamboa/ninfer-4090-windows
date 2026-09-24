@@ -270,7 +270,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     Tensor local_state_tensor(local_state.p, DType::FP32,
                               {kStateDim, kStateDim, profile.value_heads});
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
     WorkspaceArena reference_workspace(256);
 
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
