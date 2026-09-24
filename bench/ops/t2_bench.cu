@@ -1,7 +1,8 @@
 // Cold-weight timing (median of repeated runs after a clock warm-up) of the Prism ternary projection and the Hadamard rotation at the Bonsai
 // 2 27B shapes. Weight copies rotate so their total exceeds L2; the reported bandwidth is the
 // ternary weight bytes (codes + scales) read per call divided by the call time. Each shape is
-// timed with BF16 activations (A16) and with int8 activations (A8, quantization included).
+// timed with BF16 activations (A16), int8 activations (A8, quantization included) and A8 with
+// the Prism rotation fused into the quantization (A8+rot, replacing a standalone Hadamard).
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/weight_view.h"
@@ -81,8 +82,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(scratch));
     }
-    std::printf("%-12s %6s %6s %4s %10s %10s %10s %10s\n", "role", "N", "K", "T", "A16 us",
-                "A16 GB/s", "A8 us", "A8 GB/s");
+    std::printf("%-12s %6s %6s %4s %10s %10s %10s %10s %12s\n", "role", "N", "K", "T", "A16 us",
+                "A16 GB/s", "A8 us", "A8 GB/s", "A8+rot us");
     for (const auto& shape : shapes) {
         const std::array<std::uint64_t, 2> dims{std::uint64_t(shape.n), std::uint64_t(shape.k)};
         const auto geometry =
@@ -100,6 +101,9 @@ int main(int argc, char** argv) {
             weights[c] = native_weight(
                 WeightView{{dims[0], dims[1]}, {{&parents[c], 0, dims[0] * dims[1]}}});
         }
+        void* signs = nullptr;
+        CUDA_CHECK(cudaMalloc(&signs, std::size_t(shape.k) * 2));
+        CUDA_CHECK(cudaMemset(signs, 0x3f, std::size_t(shape.k) * 2)); // ~+0.75, timing only
         for (const int t : tokens) {
             void *x_data = nullptr, *y_data = nullptr;
             CUDA_CHECK(cudaMalloc(&x_data, std::size_t(shape.k) * t * 2));
@@ -110,9 +114,12 @@ int main(int argc, char** argv) {
             Tensor* outputs[] = {&y};
             DeviceArena workspace(ops::detail::t2_workspace_capacity_bytes(
                 ops::LinearPolicy::AllowA8, shape.k, t));
-            double us[2];
-            for (int mode = 0; mode < 2; ++mode) {
+            // Modes: A16 and A8 on an unrotated weight, then A8 with the Prism rotation fused
+            // into the activation quantization (Weight::input_signs).
+            double us[3];
+            for (int mode = 0; mode < 3; ++mode) {
                 const auto policy = mode ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only;
+                for (auto& weight : weights) weight.input_signs = mode == 2 ? signs : nullptr;
                 for (int c = 0; c < copies; ++c) {
                     ops::detail::t2_project(x, weights[c], outputs, false, policy, &workspace,
                                             nullptr);
@@ -122,12 +129,13 @@ int main(int argc, char** argv) {
                                             &workspace, nullptr);
                 });
             }
-            std::printf("%-12s %6d %6d %4d %10.1f %10.1f %10.1f %10.1f\n", shape.role, shape.n,
-                        shape.k, t, us[0], double(geometry.bytes) / (us[0] * 1e3), us[1],
-                        double(geometry.bytes) / (us[1] * 1e3));
+            std::printf("%-12s %6d %6d %4d %10.1f %10.1f %10.1f %10.1f %12.1f\n", shape.role,
+                        shape.n, shape.k, t, us[0], double(geometry.bytes) / (us[0] * 1e3), us[1],
+                        double(geometry.bytes) / (us[1] * 1e3), us[2]);
             CUDA_CHECK(cudaFree(x_data));
             CUDA_CHECK(cudaFree(y_data));
         }
+        CUDA_CHECK(cudaFree(signs));
         for (void* buffer : buffers) CUDA_CHECK(cudaFree(buffer));
     }
 

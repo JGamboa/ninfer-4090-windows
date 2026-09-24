@@ -1,6 +1,7 @@
 #include "ops/linear/t2/t2_project.h"
 
 #include "core/device.h"
+#include "ops/hadamard/hadamard.h"
 #include "ops/linear/t2/t2_a8.cuh"
 #include "ops/linear/t2/t2_gemm.cuh"
 #include "ops/linear/t2/t2_mma.cuh"
@@ -176,17 +177,27 @@ struct QuantizedX {
     Tensor q, scale, group_sum, slice_sum;
 };
 
-QuantizedX quantize(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream) {
+// Quantizes x, or its Prism rotation when the weight carries input signs (one fused kernel).
+QuantizedX quantize(const Tensor& x, const void* signs, WorkspaceArena& workspace,
+                    cudaStream_t stream) {
     const int k = x.ne[0], tokens = x.ne[1];
     QuantizedX result{workspace.alloc(DType::I8, {k, tokens}),
                       workspace.alloc(DType::FP32, {k / 128, tokens}),
                       workspace.alloc(DType::I32, {k / 128, tokens}),
                       workspace.alloc(DType::I32, {k / 32, tokens})};
-    const dim3 grid(static_cast<unsigned>(k / 512), static_cast<unsigned>(tokens));
-    t2_a8::quantize_kernel<<<grid, 128, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), k, static_cast<std::uint32_t*>(result.q.data),
-        static_cast<float*>(result.scale.data), static_cast<int*>(result.group_sum.data),
-        static_cast<int*>(result.slice_sum.data));
+    auto* q     = static_cast<std::uint32_t*>(result.q.data);
+    auto* scale = static_cast<float*>(result.scale.data);
+    auto* gsum  = static_cast<int*>(result.group_sum.data);
+    auto* ssum  = static_cast<int*>(result.slice_sum.data);
+    const auto* input = static_cast<const __nv_bfloat16*>(x.data);
+    if (signs != nullptr) {
+        const dim3 grid(static_cast<unsigned>(k / 1024), static_cast<unsigned>(tokens));
+        t2_a8::rotate_quantize_kernel<<<grid, t2_a8::kRotateThreads, 0, stream>>>(
+            input, static_cast<const __nv_bfloat16*>(signs), k, q, scale, gsum, ssum);
+    } else {
+        const dim3 grid(static_cast<unsigned>(k / 512), static_cast<unsigned>(tokens));
+        t2_a8::quantize_kernel<<<grid, 128, 0, stream>>>(input, k, q, scale, gsum, ssum);
+    }
     CUDA_CHECK(cudaGetLastError());
     return result;
 }
@@ -208,7 +219,7 @@ void launch_a8_gemv(const QuantizedX& q, const Weight& w, int tokens,
 void project_a8(const Tensor& x, const Weight& w, const Outputs& packed, bool accumulate,
                 WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope             = workspace.scope();
-    const QuantizedX q     = quantize(x, workspace, stream);
+    const QuantizedX q     = quantize(x, w.input_signs, workspace, stream);
     const int tokens       = x.ne[1];
     t2_a8::Outputs outputs{};
     for (int i = 0; i < kMaxOutputs; ++i) {
@@ -243,7 +254,8 @@ void validate_t2_weight(const Weight& w, const char* op) {
         w.scale_dtype != DType::FP16 || w.group_size != 128 || w.n <= 0 || w.k % 1024 ||
         w.qdata == nullptr || w.qhigh != nullptr || w.scales == nullptr ||
         (reinterpret_cast<std::uintptr_t>(w.qdata) & 15) ||
-        (reinterpret_cast<std::uintptr_t>(w.scales) & 15) || w.scale_nb[1] != w.k / 64) {
+        (reinterpret_cast<std::uintptr_t>(w.scales) & 15) || w.scale_nb[1] != w.k / 64 ||
+        (reinterpret_cast<std::uintptr_t>(w.input_signs) & 1)) {
         throw std::invalid_argument(std::string(op) +
                                     ": weight must be T2_G128_FP16 ternary rows with K%1024=0");
     }
@@ -254,9 +266,11 @@ std::size_t t2_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_
     if (input_rows <= 0 || input_rows % 1024 || max_tokens <= 0) {
         throw std::invalid_argument("t2 workspace: requires K % 1024 == 0 and positive T");
     }
-    if (!allows_a8(policy)) return 0;
     const std::size_t k = static_cast<std::size_t>(input_rows);
     const std::size_t t = static_cast<std::size_t>(max_tokens);
+    // A8: the int8 activation, its group scales and sums. A16: a rotated BF16 input copy (used
+    // only by a weight with input signs).
+    if (!allows_a8(policy)) return round_up_256(k * t * 2);
     return round_up_256(k * t) + 2 * round_up_256(k / 128 * t * 4) + round_up_256(k / 32 * t * 4);
 }
 
@@ -293,6 +307,20 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     }
     if (allows_a8(policy) && workspace != nullptr) {
         project_a8(x, w, packed, accumulate, *workspace, stream);
+        return;
+    }
+    if (w.input_signs != nullptr) {
+        // A16 with a rotated weight: rotate a BF16 copy of x, then the unrotated A16 routes.
+        if (workspace == nullptr) {
+            throw std::invalid_argument("t2_project: a rotated weight requires a workspace");
+        }
+        auto scope   = workspace->scope();
+        Tensor rotated = workspace->alloc(DType::BF16, {x.ne[0], tokens});
+        const Tensor signs(const_cast<void*>(w.input_signs), DType::BF16, {x.ne[0]});
+        hadamard_1024_launch(x, signs, nullptr, rotated, stream);
+        Weight unrotated     = w;
+        unrotated.input_signs = nullptr;
+        t2_project(rotated, unrotated, outputs, accumulate, policy, nullptr, stream);
         return;
     }
     if (tokens >= 17 && w.n % t2_gemm::kRows == 0) {

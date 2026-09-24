@@ -148,8 +148,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     }
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    project_head(hidden, state.execution.parameters.text.output_head,
-                 state.execution.parameters.text.output_head_rotation, logits,
+    project(hidden, state.execution.parameters.text.output_head, logits,
                  state.execution.work, state.execution.device.stream);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,

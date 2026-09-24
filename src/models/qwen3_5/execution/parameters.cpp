@@ -52,20 +52,20 @@ public:
         });
     }
 
-    // The sign vector of a rotated (t2) projection input, keyed by its input width.
-    InputRotation rotation(const Weight& weight) const {
-        if (weight.qtype != QType::T2_G128_FP16) { return std::nullopt; }
+    // A t2 projection is stored in the Prism-rotated basis: attach the sign vector of its input
+    // width so the projection rotates its (primal) input itself.
+    void rotate(Weight& weight) const {
+        if (weight.qtype != QType::T2_G128_FP16) { return; }
         const auto& signs = model_.weights().text.hadamard_signs;
         const auto found  = signs.find(static_cast<std::uint64_t>(weight.k));
         if (found == signs.end()) {
             throw std::invalid_argument("t2 projection has no Hadamard sign vector of its width");
         }
-        return tensor(found->second);
+        weight.input_signs = tensor(found->second).data;
     }
 
-    InputRotation rotation(const ops::ProjectionWeights& projection) const {
-        const auto* single = std::get_if<LinearParameters>(&projection);
-        return single ? rotation(single->weight) : std::nullopt;
+    void rotate(ops::ProjectionWeights& projection) const {
+        if (auto* single = std::get_if<LinearParameters>(&projection)) { rotate(single->weight); }
     }
 
     DenseParameters dense(const DenseWeights& w) const {
@@ -75,8 +75,8 @@ public:
                                                  model_.input(w.gate), model_.input(w.up));
                                          }),
                             linear(w.down)};
-        out.gate_up_rotation = rotation(out.gate_up.weight);
-        out.down_rotation    = rotation(out.down.weight);
+        rotate(out.gate_up.weight);
+        rotate(out.down.weight);
         return out;
     }
 
@@ -113,8 +113,8 @@ public:
                                                      model_.input(a->gate), model_.input(a->value)),
                 tensor(a->query_norm), tensor(a->key_norm), linear(a->output)};
             auto& attention               = std::get<AttentionParameters>(out.mixer);
-            attention.projection_rotation = rotation(attention.projection);
-            attention.output_rotation     = rotation(attention.output.weight);
+            rotate(attention.projection);
+            rotate(attention.output.weight);
             out.projection_prefetch       = prefetch(attention.projection, a->query);
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
@@ -129,8 +129,8 @@ public:
                 tensor(g.norm),
                 linear(g.output)};
             auto& gdn               = std::get<GdnParameters>(out.mixer);
-            gdn.projection_rotation = rotation(gdn.projection);
-            gdn.output_rotation     = rotation(gdn.output.weight);
+            rotate(gdn.projection);
+            rotate(gdn.output.weight);
             out.projection_prefetch = prefetch(gdn.projection, g.query);
         }
         return out;
@@ -166,8 +166,8 @@ public:
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
         out.ffn         = ffn(w.layer);
-        out.output_head          = linear(w.output_head_use);
-        out.output_head_rotation = rotation(out.output_head.weight);
+        out.output_head = linear(w.output_head_use);
+        rotate(out.output_head.weight);
         return out;
     }
 
@@ -240,8 +240,8 @@ public:
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
         out.final_norm         = tensor(w.final_norm);
-        out.output_head          = linear(w.output_head_use);
-        out.output_head_rotation = rotation(out.output_head.weight);
+        out.output_head = linear(w.output_head_use);
+        rotate(out.output_head.weight);
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
             out.layers.push_back(with_context(
@@ -287,7 +287,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
-    text.output_head_rotation = prepare.rotation(text.output_head.weight);
+    prepare.rotate(text.output_head.weight);
     text.final_norm      = prepare.tensor(w.text.final_norm);
     text.layers.reserve(w.text.layers.size());
     for (std::size_t i = 0; i < w.text.layers.size(); ++i) {

@@ -726,10 +726,7 @@ ColdFusion fine-tune, not the Qwen3.8 base).
     `gdn_projected_conv_snapshot_launch`) and record (projection into the record, then
     `gdn_projected_conv_record_launch`); `linear_swiglu` (gate/up into workspace, then
     `silu_mul`; gate and up round to BF16 first).
-  - Model: `AttentionParameters`, `GdnParameters` and `DenseParameters` carry an optional sign
-    tensor per projection, present exactly when the weight is `t2`; `attn_mix`, `gdn_mix` and
-    `ffn` rotate that projection's input in place right before the Op (each rotated activation
-    has a single consumer; GDN `g`/`beta` are computed from the primal `h` first).
+  - Model: superseded by the weight-owned rotation below (the model no longer rotates).
   - Loading validates `prism_hadamard` against the bound formats in both directions and binds
     the sign vectors by width; there is no execution refusal.
   - Tests to run on the 4090: `ninfer_hadamard_test`, `ninfer_linear_t2_test` (FP64
@@ -808,9 +805,9 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   attention, GDN and the MTP layer.
 
 - (A+B) M5 head, 2026-09-24: `bonsai2_27b` stores `text/output_head` as the rotated GGUF `t2`
-  words (0.33 GB instead of 1.3 GB Q8) and lists `output_head` in `rotated_inputs`. The runtime
-  applies it through `execution::project_head`, which rotates a workspace copy of the head
-  input (the final hidden is also read in the primal basis by MTP and DFlash). Proposal heads
+  words (0.33 GB instead of 1.3 GB Q8) and lists `output_head` in `rotated_inputs`. Like every
+  t2 projection it carries its sign vector and reads the primal final hidden (which MTP and
+  DFlash also read). Proposal heads
   stay Q4 gathered from the primal values. Not supported: DFlash2 with the full (t2) head,
   whose `linear_topk` admits Q8/FP8 only; use the optimized proposal head. The embedding
   stays primal Q8 (a ternary gather with the inverse rotation remains open).
@@ -840,6 +837,15 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   the reconverted `AllowA8` artifact: MTP decode (draft 2, `--lm-head-draft`) 92.6 -> 99.5
   tok/s (18.4 ms per round, 41.4 % acceptance); quick perplexity 8.0827 / 9.2857 / 8.1834 /
   1.8944, overall 5.8543 (A16 5.8535, +0.01 %), scored at 1060 tok/s.
+
+- (B+C) Weight-owned rotation (option C, fused Hadamard). `Weight::input_signs` (BF16 [k])
+  marks a t2 weight stored in the rotated basis; `Parameters` attaches the sign vector of the
+  input width to every t2 projection and head, and the model passes primal activations (no
+  `hadamard_1024` calls, no rotated head copy). `t2_project` applies the rotation itself: under
+  A8 one `rotate_quantize_kernel` per (1024 columns, token) rotates in FP32 shared memory and
+  quantizes directly (no BF16 rotated activation, one launch instead of two); under A16 it
+  rotates a BF16 workspace copy. The t2 workspace capacity covers that copy under A16Only.
+  Oracle: `ninfer_linear_t2_test` rotates x with an explicit FP64 Sylvester matrix.
 
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also

@@ -2,7 +2,6 @@
 
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
-#include "ninfer/ops/hadamard.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/residual_add.h"
@@ -82,13 +81,10 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     }
     Tensor activation = workspace.alloc(DType::BF16, {gu.n / 2, columns});
     Tensor input      = hidden;
-    // The normalized hidden and the SwiGLU product each feed only their projection.
-    if (p.gate_up_rotation) { ops::hadamard_1024(input, *p.gate_up_rotation, input, stream); }
     {
         auto call = workspace.scope();
         ops::linear_swiglu(input, gu, activation, p.gate_up.policy, workspace, stream);
     }
-    if (p.down_rotation) { ops::hadamard_1024(activation, *p.down_rotation, activation, stream); }
     ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
 }
 

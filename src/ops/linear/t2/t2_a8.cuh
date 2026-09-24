@@ -4,6 +4,8 @@
 // one FP32 scale per 128-column group (the weight scale group), and the ternary codes multiply
 // it in integer arithmetic.
 //
+// With a rotated weight (Weight::input_signs) the Prism rotation is fused into the quantization.
+//
 // Quantized activation layout. Inside every 16-column block the 4x4 byte matrix is transposed:
 // int8 position 16 s + 4 j + m holds column 16 s + 4 m + j. Then `(code_word >> 2 j) & 0x03030303`
 // of the 32-bit code word of those 16 columns (column c at bits 2 c) yields the codes {0,1,2}
@@ -39,27 +41,17 @@ __device__ __forceinline__ void store_output(const Outputs& outputs, int row, in
     *out = __float2bfloat16_rn(accumulate ? value + __bfloat162float(*out) : value);
 }
 
-// One warp per (token, 128-column group); lane l = 4 s + m owns activation word l.
+// One warp quantizes one (token, 128-column group). Lane l = 4 s + m holds the group columns
+// 16 s + 4 i + m (i = 0..3) in `value` and writes activation word l.
 // q = rint(x * 127 / amax), scale = amax / 127 (zero for an all-zero group).
-__global__ void __launch_bounds__(128)
-    quantize_kernel(const __nv_bfloat16* __restrict__ x, int k, std::uint32_t* __restrict__ qx,
-                    float* __restrict__ group_scale, int* __restrict__ group_sum,
-                    int* __restrict__ slice_sum) {
-    const int warp  = static_cast<int>(threadIdx.x) >> 5;
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int group = static_cast<int>(blockIdx.x) * 4 + warp;
-    const int token = static_cast<int>(blockIdx.y);
-    const int s     = lane >> 2;
-    const int m     = lane & 3;
-    const __nv_bfloat16* source = x + std::int64_t(token) * k + group * 128;
-
-    float value[4];
+__device__ __forceinline__ void quantize_group(const float (&value)[4], int lane, int token,
+                                               int group, int k, std::uint32_t* __restrict__ qx,
+                                               float* __restrict__ group_scale,
+                                               int* __restrict__ group_sum,
+                                               int* __restrict__ slice_sum) {
     float amax = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        value[i] = __bfloat162float(source[16 * s + 4 * i + m]);
-        amax     = fmaxf(amax, fabsf(value[i]));
-    }
+    for (int i = 0; i < 4; ++i) amax = fmaxf(amax, fabsf(value[i]));
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
@@ -85,6 +77,70 @@ __global__ void __launch_bounds__(128)
         group_scale[std::int64_t(token) * groups + group] = amax / 127.0f;
         group_sum[std::int64_t(token) * groups + group]   = sum;
     }
+}
+
+// Unrotated input: four warps, one group each.
+__global__ void __launch_bounds__(128)
+    quantize_kernel(const __nv_bfloat16* __restrict__ x, int k, std::uint32_t* __restrict__ qx,
+                    float* __restrict__ group_scale, int* __restrict__ group_sum,
+                    int* __restrict__ slice_sum) {
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int group = static_cast<int>(blockIdx.x) * 4 + warp;
+    const int token = static_cast<int>(blockIdx.y);
+    const __nv_bfloat16* source = x + std::int64_t(token) * k + group * 128;
+    float value[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        value[i] = __bfloat162float(source[16 * (lane >> 2) + 4 * i + (lane & 3)]);
+    }
+    quantize_group(value, lane, token, group, k, qx, group_scale, group_sum, slice_sum);
+}
+
+// Rotated input: one CTA per (1024-column block, token) applies the Prism rotation
+// (1/32) H (signs * x) in FP32 shared memory (the butterfly of ops/hadamard) and quantizes the
+// rotated block directly, eight warps with one 128-column group each. The rotated activation
+// is never rounded to BF16 or written back.
+constexpr int kRotateThreads = 256;
+
+__global__ void __launch_bounds__(kRotateThreads)
+    rotate_quantize_kernel(const __nv_bfloat16* __restrict__ x,
+                           const __nv_bfloat16* __restrict__ signs, int k,
+                           std::uint32_t* __restrict__ qx, float* __restrict__ group_scale,
+                           int* __restrict__ group_sum, int* __restrict__ slice_sum) {
+    constexpr int kBlock = 1024;
+    __shared__ float values[kBlock];
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int token   = static_cast<int>(blockIdx.y);
+    const int column0 = static_cast<int>(blockIdx.x) * kBlock;
+    const __nv_bfloat16* source = x + std::int64_t(token) * k + column0;
+#pragma unroll
+    for (int i = 0; i < kBlock / kRotateThreads; ++i) {
+        const int index = tid + i * kRotateThreads;
+        values[index]   = __bfloat162float(source[index]) * __bfloat162float(signs[column0 + index]);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int stride = 1; stride < kBlock; stride <<= 1) {
+#pragma unroll
+        for (int pair = tid; pair < kBlock / 2; pair += kRotateThreads) {
+            const int low        = (pair / stride) * 2 * stride + pair % stride;
+            const float a        = values[low];
+            const float b        = values[low + stride];
+            values[low]          = a + b;
+            values[low + stride] = a - b;
+        }
+        __syncthreads();
+    }
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    float value[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        value[i] = values[warp * 128 + 16 * (lane >> 2) + 4 * i + (lane & 3)] * 0x1p-5f;
+    }
+    quantize_group(value, lane, token, column0 / 128 + warp, k, qx, group_scale, group_sum,
+                   slice_sum);
 }
 
 // ---------------------------------------------------------------------------------------------

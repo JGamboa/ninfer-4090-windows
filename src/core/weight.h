@@ -49,6 +49,10 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+    // T2_G128_FP16 only: BF16 +-1 [k] Prism sign vector of a weight stored in the rotated basis.
+    // The logical weight is W' H S: the projection multiplies W' by the 1024-block normalized
+    // Walsh-Hadamard rotation (1/32) H (signs * x) of its input (ninfer/ops/hadamard.h).
+    const void* input_signs = nullptr;
 };
 
 } // namespace ninfer

@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 
 #include <array>
+#include <bit>
 #include <cstring>
 #include <cstdint>
 #include <iostream>
@@ -72,10 +73,23 @@ struct Ternary {
         parent = {geometry, static_cast<const std::byte*>(device.p)};
     }
 
+    // Prism rotation: the weight multiplies (1/32) H (signs * x) per 1024-column block.
+    std::vector<float> signs;
+    DeviceBuffer device_signs;
+
+    void rotate(std::uint32_t seed) {
+        std::mt19937 rng(seed);
+        signs.resize(std::size_t(k));
+        for (auto& sign : signs) sign = rng() & 1 ? 1.0f : -1.0f;
+        device_signs = to_device_bf16(signs);
+    }
+
     Weight rows(std::int32_t first, std::int32_t count) const {
-        return native_weight(WeightView{{std::uint64_t(count), std::uint64_t(k)},
-                                        {{&parent, std::uint64_t(first) * k,
-                                          std::uint64_t(first + count) * k}}});
+        Weight view = native_weight(WeightView{{std::uint64_t(count), std::uint64_t(k)},
+                                               {{&parent, std::uint64_t(first) * k,
+                                                 std::uint64_t(first + count) * k}}});
+        view.input_signs = signs.empty() ? nullptr : device_signs.p;
+        return view;
     }
 
     double weight(std::int32_t row, std::int32_t column) const {
@@ -91,14 +105,36 @@ std::vector<float> activation(std::int32_t k, std::int32_t t, std::uint32_t seed
     return x;
 }
 
-// out[t][r] = sum_c W[first + r][c] x[t][c], FP64.
+// The weight's input: x, or its Prism rotation (1/32) H (signs * x) with the Sylvester
+// Walsh-Hadamard matrix H[r][c] = (-1)^popcount(r & c) of every 1024-column block, FP64.
+std::vector<double> weight_input(const Ternary& w, const std::vector<float>& x, std::int32_t t) {
+    std::vector<double> input(x.begin(), x.end());
+    if (w.signs.empty()) return input;
+    for (std::int32_t token = 0; token < t; ++token) {
+        for (std::int32_t block = 0; block < w.k; block += 1024) {
+            const std::size_t base = std::size_t(token) * w.k + block;
+            for (int r = 0; r < 1024; ++r) {
+                double sum = 0;
+                for (int c = 0; c < 1024; ++c) {
+                    const double term = double(x[base + c]) * w.signs[block + c];
+                    sum += std::popcount(unsigned(r & c)) & 1 ? -term : term;
+                }
+                input[base + r] = sum / 32.0;
+            }
+        }
+    }
+    return input;
+}
+
+// out[t][r] = sum_c W[first + r][c] input[t][c], FP64.
 std::vector<double> oracle(const Ternary& w, std::int32_t first, std::int32_t rows,
                            const std::vector<float>& x, std::int32_t t) {
+    const std::vector<double> input = weight_input(w, x, t);
     std::vector<double> out(std::size_t(rows) * t);
     for (std::int32_t token = 0; token < t; ++token) {
         for (std::int32_t r = 0; r < rows; ++r) {
             double sum = 0;
-            for (std::int32_t c = 0; c < w.k; ++c) sum += w.weight(first + r, c) * x[std::size_t(token) * w.k + c];
+            for (std::int32_t c = 0; c < w.k; ++c) sum += w.weight(first + r, c) * input[std::size_t(token) * w.k + c];
             out[std::size_t(token) * rows + r] = sum;
         }
     }
@@ -252,6 +288,25 @@ int main() {
             const Ternary w(n, k, 2000u + n + k);
             for (std::int32_t t : {1, 3, 8, 32}) failures += linear_case(w, 0, n, t, false, a8);
         }
+    }
+    {
+        // Rotated weights (Weight::input_signs): the projection rotates its primal input, fused
+        // into the int8 quantization under A8 and through a rotated BF16 copy under A16.
+        constexpr auto a8  = ops::LinearPolicy::AllowA8;
+        constexpr auto a16 = ops::LinearPolicy::A16Only;
+        Ternary rotated(448, 2048, 21u);
+        rotated.rotate(22u);
+        for (std::int32_t t : {1, 3, 8, 9, 65}) {
+            failures += linear_case(rotated, 0, 448, t, t == 3, a8);
+            failures += linear_case(rotated, 0, 448, t, t == 9, a16);
+        }
+        failures += linear_case(rotated, 64, 320, 5, false, a8);
+        failures += linear_add_case(rotated, 3, a8);
+        failures += linear_add_case(rotated, 20, a16);
+        Ternary attention(14336, 5120, 23u);
+        attention.rotate(24u);
+        failures += attention_case(attention, 3, a8);
+        failures += attention_case(attention, 2, a16);
     }
     std::cout << (failures ? "FAIL" : "OK") << " t2 A16/A8\n";
     return failures ? 1 : 0;

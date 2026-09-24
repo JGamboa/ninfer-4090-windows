@@ -13,7 +13,6 @@
 #include "ninfer/ops/argmax.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/hadamard.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -249,7 +248,6 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
     embed_      = &parameters_.text.token_embedding;
     final_norm_ = &parameters_.text.final_norm;
     lm_head_    = &parameters_.text.output_head;
-    lm_head_rotation_ = &parameters_.text.output_head_rotation;
     mtp_        = parameters_.mtp ? &*parameters_.mtp : nullptr;
     if (mtp_enabled() && mtp_ == nullptr) {
         throw std::invalid_argument("MTP state requires selected MTP parameters");
@@ -582,7 +580,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         }
     } else {
         Tensor output_logits = matrix_window(logits, T);
-        project_head(hidden, mtp_->output_head, mtp_->output_head_rotation, output_logits, work_,
+        project(hidden, mtp_->output_head, output_logits, work_,
                      ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
@@ -703,7 +701,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project_head(hidden, *lm_head_, *lm_head_rotation_, logits, work_, stream);
+        project(hidden, *lm_head_, logits, work_, stream);
     }
     work_.reset();
 }
@@ -763,7 +761,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project_head(flat_hidden, *lm_head_, *lm_head_rotation_, flat_logits, work_, stream);
+        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }
@@ -847,7 +845,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
     Tensor h              = projection.hidden;
     ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
-    if (p.projection_rotation) { ops::hadamard_1024(h, *p.projection_rotation, h, s); }
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -922,7 +919,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     ops::sigmoid_mul(gate, a, s);
 
     Tensor gated = a.view({dimension(config_.attention->query_width()), T});
-    if (p.output_rotation) { ops::hadamard_1024(gated, *p.output_rotation, gated, s); }
     ops::linear_add(gated, p.output.weight, x, p.output.policy, work_, s);
 }
 
@@ -937,8 +933,6 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor beta        = control.beta;
     gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
                      ctx_.execution_view());
-    // g and beta already consumed the primal h; only the q/k/v/z projection reads it rotated.
-    if (p.projection_rotation) { ops::hadamard_1024(h, *p.projection_rotation, h, s); }
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -1061,7 +1055,6 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
 
     Tensor normalized = on.view({dimension(config_.gdn->value_width()), T});
     // Grouped value-head order is the order Prism folded into gdn/output: no gather needed.
-    if (p.output_rotation) { ops::hadamard_1024(normalized, *p.output_rotation, normalized, s); }
     ops::linear_add(normalized, p.output.weight, x, p.output.policy, work_, s);
 }
 
@@ -1272,7 +1265,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                project_head(last_xf, *lm_head_, *lm_head_rotation_, logits, work_, s);
+                project(last_xf, *lm_head_, logits, work_, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
