@@ -211,8 +211,9 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     if (end != w.n) {
         throw std::invalid_argument("t2_project: output rows must cover the weight rows");
     }
-    if (tokens >= 2 && w.n % t2_mma::kRows == 0) {
-        // Tensor cores keep the cost per weight byte flat in T (MTP verification, prefill).
+    if (tokens >= 5 && w.n % t2_mma::kRows == 0) {
+        // Measured on the RTX 4090: the GEMV wins up to T = 4 (MTP verification), the tensor
+        // cores from T = 5 (their cost stays flat through T = 8; prefill tiles of 8 tokens).
         t2_mma::Outputs mma_outputs{};
         for (int i = 0; i < kMaxOutputs; ++i) {
             mma_outputs.data[i] = packed.data[i];

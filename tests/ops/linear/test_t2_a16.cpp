@@ -189,21 +189,22 @@ int main() {
         failures += linear_case(small, 44, 200, 5, false);
     }
     {
-        // Rows a multiple of 16 take the tensor-core route for T >= 2: several token tiles, a
+        // Rows a multiple of 16 take the tensor-core route for T >= 5: several token tiles, a
         // partial last tile and a row view that starts inside the parent.
         const Ternary tiled(320, 3072, 6u);
-        for (std::int32_t t : {2, 5, 8, 9, 17, 40}) failures += linear_case(tiled, 0, 320, t, t == 17);
+        for (std::int32_t t : {4, 5, 8, 9, 17, 40}) failures += linear_case(tiled, 0, 320, t, t == 17);
         failures += linear_case(tiled, 32, 256, 7, false);
     }
     // Bonsai decode shapes (N, K) at decode and MTP-verify widths.
     for (const auto [n, k] : std::array<std::pair<int, int>, 3>{{{5120, 6144}, {5120, 17408}, {16384, 5120}}}) {
         const Ternary w(n, k, 1000u + n + k);
-        for (std::int32_t t : {1, 4}) failures += linear_case(w, 0, n, t, t == 4);
+        for (std::int32_t t : {1, 4, 8}) failures += linear_case(w, 0, n, t, t == 4);
         if (n == 5120) failures += linear_add_case(w, 3);
     }
     {
         const Ternary attention(14336, 5120, 77u);
         failures += attention_case(attention, 2);
+        failures += attention_case(attention, 6); // tensor-core route, four outputs
     }
     std::cout << (failures ? "FAIL" : "OK") << " t2 A16\n";
     return failures ? 1 : 0;
