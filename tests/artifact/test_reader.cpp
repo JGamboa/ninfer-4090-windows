@@ -197,13 +197,26 @@ void invalid_directories() {
         file.seekp(16);
         file.put(0);
     }
-    Reader wrong_part(fixture.entry);
-    rejects([&] { (void)wrong_part.read_object(wrong_part.find("q5")); },
-            "foreign continuation accepted");
+    {
+        // Windows readers share files for reading only; close before rewriting the fixture.
+        Reader wrong_part(fixture.entry);
+        rejects([&] { (void)wrong_part.read_object(wrong_part.find("q5")); },
+                "foreign continuation accepted");
+    }
     fixture.write();
     Reader shortened(fixture.entry);
+#ifdef _WIN32
+    // An open Reader denies writers, so the file cannot shrink underneath it.
+    rejects<std::filesystem::filesystem_error>(
+        [&] {
+            std::filesystem::resize_file(fixture.entry,
+                                         std::filesystem::file_size(fixture.entry) - 1);
+        },
+        "an open artifact was truncated by another writer");
+#else
     std::filesystem::resize_file(fixture.entry, std::filesystem::file_size(fixture.entry) - 1);
     rejects([&] { (void)shortened.read_range(499, 1); }, "premature EOF accepted");
+#endif
 }
 
 } // namespace
