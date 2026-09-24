@@ -110,7 +110,7 @@ ROW_SCALE_V1 = Layout(
 TERNARY_ROW_K128_V1 = Layout(
     "ternary_row_k128_v1",
     256,
-    frozenset(("t2_g128_fp16",)),
+    frozenset(("t2_g128_fp16", "t5_g128_fp16")),
 )
 
 LAYOUTS = MappingProxyType(
@@ -269,7 +269,7 @@ def row_scale_geometry(
 def ternary_geometry(
     format: str | TernaryFormat, shape: Sequence[int]
 ) -> TernaryGeometry:
-    """Row-major 2-bit code plane, then a 256-aligned row-major FP16 scale plane."""
+    """Row-major code plane (the format's packing), then a 256-aligned FP16 scale plane."""
     spec = _format(format)
     if not isinstance(spec, TernaryFormat):
         raise ValueError("ternary_row_k128_v1 requires a ternary format")
@@ -279,7 +279,7 @@ def ternary_geometry(
             f"ternary_row_k128_v1 requires K divisible by {K_ALIGNMENT}, got {k}"
         )
     groups_per_row = k // spec.group_size
-    code_row_bytes = k // 4
+    code_row_bytes = spec.code_row_bytes(k)
     scale_row_bytes = groups_per_row * 2
     code_plane_bytes = n * code_row_bytes
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)

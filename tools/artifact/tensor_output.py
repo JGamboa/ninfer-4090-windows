@@ -114,7 +114,7 @@ class TensorOutput:
         elif isinstance(self.format, TernaryFormat):
             g = ternary_geometry(self.format, obj.shape)
             local = ternary_geometry(self.format, (rows, k))
-            block = memoryview(encode_ternary(codes, scales, (rows, k)))
+            block = memoryview(encode_ternary(codes, scales, (rows, k), self.format))
             self.write_bytes(
                 row_begin * g.code_row_bytes, block[: local.code_plane_bytes]
             )

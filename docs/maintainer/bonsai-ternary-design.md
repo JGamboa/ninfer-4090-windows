@@ -1006,6 +1006,21 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   is unchanged; tok/s differences between the two builds followed the display activity (the
   same Q8 build measured 121 and 131 tok/s on the lighthouse prompt minutes apart).
 
+- (A+B) t5 format registration and converter (9.1 step 2, format half). Python:
+  `TernaryFormat.packing` (`slot2` for t2, `base3` for `t5_g128_fp16`) drives
+  `code_row_bytes` (K / 4 or 13 K / 64) under the shared `ternary_row_k128_v1` layout; the codec
+  (`codecs/ternary.py`) packs, unpacks and validates both (a base-3 byte must be one of the 243
+  canonical `q(v)`, byte 12's fifth trit zero) and takes the format explicitly everywhere.
+  `ternary_rows(..., format)` and `PrismCheckpoint.encoded_rows(..., format)` repack the exact
+  GGUF trits (PTQ1_0 and PQ2_0) into either format. C++: `QType::T5_G128_FP16`, `ternary_qtype`,
+  `weight_geometry` (TernaryRowK128 code rows by format), format spelling, single-parent input
+  projections and sign attachment accept both; the loader requires `AllowA8` for every use of
+  a t5 weight. The recipe's `TERNARY_FORMAT` stays `t2_g128_fp16` until the t5 production
+  kernels exist (the kernel session flips it and removes t2). Tests: literal byte-by-byte t5
+  transcription, all 243 byte values, canonical-byte and padding rejection, t5 repack of both
+  GGUF packings, an end-to-end t5 conversion keeping the GGUF trits, C++ geometry equal to the
+  Python writer, and C++ planning of a t5 artifact plus refusal of an `A16Only` t5 use.
+
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also
   drives a 3840x2160 120 Hz desktop), PCIe 4.0 x16, Core i9-13900K, CUDA 13.4.
@@ -1061,6 +1076,10 @@ Next steps, in order:
    memory (qualified at T = 512 against pp512 2648 tok/s), the T = 5..8 route (Tile-8 GEMV
    or the GEMM, whichever is less slow; Tile-8 GEMV is 1.2-1.7x t2 today) and the embedding
    gather.
+
+   Progress: format registration, converter and loader validation are done (section 9, "t5
+   format registration and converter"); the kernels remain. Flip `TERNARY_FORMAT` in
+   `tools/convert/official_recipes.py` and remove t2 when they land.
 3. Measure decode with the monitor cable on the iGPU (motherboard output), lighthouse and
    Python prompts, beside the 120 Hz and 60 Hz figures in section 9, "Display preemption".
    Expected: the ~2.2-2.8 ms of compositor stalls per round disappear. Until then the display

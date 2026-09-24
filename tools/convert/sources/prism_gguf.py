@@ -7,7 +7,8 @@ test_prism_gguf.py` checks the vectorized decoders here against a literal scalar
 transliteration of the same C loops.
 
 Both codecs first produce the stored codes {0, 1, 2} and FP16 block scales;
-:func:`ternary_rows` repacks them exactly into `t2_g128_fp16` words (design doc section 2)
+:func:`ternary_rows` repacks them exactly into ternary words (`t2_g128_fp16` or
+`t5_g128_fp16`, design doc sections 2 and 9.1)
 and :func:`dequantize_rows` reproduces the reference C dequantization `(code - 1) * d`.
 """
 
@@ -67,7 +68,7 @@ def pq2_0_block_codes(raw: bytes | bytearray | memoryview) -> tuple[np.ndarray, 
 
     `raw` must hold a whole number of 34-byte `block_pq2_0` records (`ggml_half d` then
     `qs[32]`). Code 3 is returned as stored (the reference dequantizes it to `2 * d`);
-    :func:`ternary_rows` rejects it when packing `t2_g128_fp16` words.
+    :func:`ternary_rows` rejects it when packing ternary words.
     """
     if len(raw) % _PQ2_0_BLOCK_BYTES:
         raise ValueError("PQ2_0 raw byte length is not a multiple of the 34-byte block")
@@ -126,10 +127,11 @@ _CODE_DECODERS = {
 
 
 def ternary_rows(
-    store: GgufStore, name: str, row_begin: int, row_end: int
+    store: GgufStore, name: str, row_begin: int, row_end: int, format: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact `t2_g128_fp16` words for a row range: packed uint8 codes `[rows, K/4]` and
-    float16 scales `[rows, K/128]`. Nothing is expanded to floats."""
+    """Exact ternary words of a row range in `format` (`t2_g128_fp16` or `t5_g128_fp16`):
+    packed uint8 code bytes `[rows, code_row_bytes]` and float16 scales `[rows, K/128]`.
+    The GGUF's trits are repacked exactly; nothing is expanded to floats."""
     info = store.tensor(name)
     try:
         decode = _CODE_DECODERS[info.ggml_type]
@@ -142,7 +144,7 @@ def ternary_rows(
         raise ValueError(f"{name}: K={k} is not a multiple of the ternary block size {BLOCK_ELEMENTS}")
     rows = row_end - row_begin
     codes, scales = decode(store.read_rows_raw(name, row_begin, row_end))
-    packed = pack_ternary_codes(torch.from_numpy(codes.reshape(rows, k)))
+    packed = pack_ternary_codes(torch.from_numpy(codes.reshape(rows, k)), format)
     return packed, torch.from_numpy(scales.reshape(rows, k // BLOCK_ELEMENTS))
 
 

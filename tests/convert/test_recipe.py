@@ -274,7 +274,7 @@ def test_private_component_storage_cannot_be_packed_with_target_weights():
 def _ternary_source(name, rows, seed):
     generator = torch.Generator().manual_seed(seed)
     logical = torch.randint(0, 3, (rows, 256), dtype=torch.uint8, generator=generator)
-    codes = pack_ternary_codes(logical)
+    codes = pack_ternary_codes(logical, "t2_g128_fp16")
     scales = torch.rand((rows, 2), generator=generator).to(torch.float16)
 
     def no_values(begin, end):
@@ -312,6 +312,7 @@ def test_ternary_import_fuses_packing_group_rows_exactly(tmp_path):
         torch.cat([codes for _, codes, _ in parts.values()]),
         torch.cat([scales for _, _, scales in parts.values()]),
         (15, 256),
+        "t2_g128_fp16",
     )
     with Artifact(path) as artifact:
         assert artifact.read_object(spec.id) == expected

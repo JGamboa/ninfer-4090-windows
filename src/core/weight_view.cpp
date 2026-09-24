@@ -143,12 +143,13 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
     } else if (layout == QuantLayout::TernaryRowK128) {
-        // Four 2-bit codes per byte (code c means c - 1), then FP16 scales per 128 columns.
-        if (format != QType::T2_G128_FP16 || k % 128) {
-            throw std::invalid_argument("TernaryRowK128 requires T2_G128_FP16 and K%128=0");
+        // Ternary code rows (code c means c - 1): four 2-bit codes per byte (T2) or 13-byte
+        // base-3 units of 64 columns (T5); then FP16 scales per 128 columns.
+        if (!ternary_qtype(format) || k % 128) {
+            throw std::invalid_argument("TernaryRowK128 requires a ternary format and K%128=0");
         }
         out.group_size          = 128;
-        out.code_bytes_per_row  = k / 4;
+        out.code_bytes_per_row  = format == QType::T2_G128_FP16 ? k / 4 : k / 64 * 13;
         out.scale_bytes_per_row = k / 128 * 2;
         out.code_bytes          = mul(n, out.code_bytes_per_row);
         out.scale_offset        = aligned(out.code_bytes, 256);

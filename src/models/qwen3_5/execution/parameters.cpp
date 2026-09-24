@@ -55,7 +55,7 @@ public:
     // A t2 projection is stored in the Prism-rotated basis: attach the sign vector of its input
     // width so the projection rotates its (primal) input itself.
     void rotate(Weight& weight) const {
-        if (weight.qtype != QType::T2_G128_FP16) { return; }
+        if (!ternary_qtype(weight.qtype)) { return; }
         const auto& signs = model_.weights().text.hadamard_signs;
         const auto found  = signs.find(static_cast<std::uint64_t>(weight.k));
         if (found == signs.end()) {

@@ -14,6 +14,7 @@ import torch
 
 from tools.artifact.codecs.ternary import decode_ternary_words, unpack_ternary_codes
 from tools.artifact.reader import Artifact
+from tools.convert.official_recipes import TERNARY_FORMAT
 from tools.convert.sources.ninfer_artifact import NInferArtifactStore
 
 from .bonsai_fixtures import (
@@ -46,11 +47,11 @@ def test_gdn_input_projection_is_one_t2_parent_in_grouped_head_order(converted):
     fixture, _, _, out = converted
     with Artifact(out) as artifact:
         obj = _parent(artifact, "text/layers/0/gdn/query")
-        assert (obj.format, obj.layout) == ("t2_g128_fp16", "ternary_row_k128_v1")
+        assert (obj.format, obj.layout) == (TERNARY_FORMAT, "ternary_row_k128_v1")
         assert obj.shape == (2 * KG + 2 * VG, H)
         for role in ("key", "value", "z"):
             assert _parent(artifact, f"text/layers/0/gdn/{role}").id == obj.id
-        codes, scales = decode_ternary_words(artifact.read_object(obj.id), obj.shape)
+        codes, scales = decode_ternary_words(artifact.read_object(obj.id), obj.shape, obj.format)
     qkv, qkv_scales = fixture.ternary["blk.0.attn_qkv.weight"]
     gate, gate_scales = fixture.ternary["blk.0.attn_gate.weight"]
     heads = [_grouped_to_tiled(j) for j in range(NV)]
@@ -64,7 +65,7 @@ def test_gdn_input_projection_is_one_t2_parent_in_grouped_head_order(converted):
             _rows(gate_scales, heads, DV),
         )
     )
-    np.testing.assert_array_equal(unpack_ternary_codes(codes).numpy(), expected)
+    np.testing.assert_array_equal(unpack_ternary_codes(codes, obj.format).numpy(), expected)
     np.testing.assert_array_equal(scales.numpy(), expected_scales)
 
 
@@ -72,25 +73,25 @@ def test_attention_and_mlp_parents_keep_the_bf16_path_row_assembly(converted):
     fixture, _, _, out = converted
     with Artifact(out) as artifact:
         attention = _parent(artifact, "text/layers/3/attention/query")
-        codes, _ = decode_ternary_words(artifact.read_object(attention.id), attention.shape)
+        codes, _ = decode_ternary_words(artifact.read_object(attention.id), attention.shape, attention.format)
         mlp = _parent(artifact, "text/layers/1/mlp/gate")
-        mlp_codes, _ = decode_ternary_words(artifact.read_object(mlp.id), mlp.shape)
+        mlp_codes, _ = decode_ternary_words(artifact.read_object(mlp.id), mlp.shape, mlp.format)
         down = _parent(artifact, "text/layers/1/gdn/output")
-        down_codes, _ = decode_ternary_words(artifact.read_object(down.id), down.shape)
+        down_codes, _ = decode_ternary_words(artifact.read_object(down.id), down.shape, down.format)
     q = fixture.ternary["blk.3.attn_q.weight"][0]
     query = np.concatenate([q[2 * h * HEAD_DIM : (2 * h + 1) * HEAD_DIM] for h in range(HEADS)])
     gate = np.concatenate([q[(2 * h + 1) * HEAD_DIM : (2 * h + 2) * HEAD_DIM] for h in range(HEADS)])
     expected = np.concatenate(
         (query, fixture.ternary["blk.3.attn_k.weight"][0], gate, fixture.ternary["blk.3.attn_v.weight"][0])
     )
-    np.testing.assert_array_equal(unpack_ternary_codes(codes).numpy(), expected)
+    np.testing.assert_array_equal(unpack_ternary_codes(codes, attention.format).numpy(), expected)
     np.testing.assert_array_equal(
-        unpack_ternary_codes(mlp_codes).numpy(),
+        unpack_ternary_codes(mlp_codes, mlp.format).numpy(),
         np.concatenate((fixture.ternary["blk.1.ffn_gate.weight"][0], fixture.ternary["blk.1.ffn_up.weight"][0])),
     )
     # out_proj's input axis is already grouped: no column permutation.
     np.testing.assert_array_equal(
-        unpack_ternary_codes(down_codes).numpy(), fixture.ternary["blk.1.ssm_out.weight"][0]
+        unpack_ternary_codes(down_codes, down.format).numpy(), fixture.ternary["blk.1.ssm_out.weight"][0]
     )
 
 
@@ -99,10 +100,10 @@ def test_output_head_and_embedding_keep_the_rotated_t2_words(converted):
     with Artifact(out) as artifact:
         for name, gguf in (("text/output_head", "output.weight"), ("text/token_embedding", "token_embd.weight")):
             obj = _parent(artifact, name)
-            assert obj.format == "t2_g128_fp16", name
-            codes, scales = decode_ternary_words(artifact.read_object(obj.id), obj.shape)
+            assert obj.format == TERNARY_FORMAT, name
+            codes, scales = decode_ternary_words(artifact.read_object(obj.id), obj.shape, obj.format)
             stored_codes, stored_scales = fixture.ternary[gguf]
-            np.testing.assert_array_equal(unpack_ternary_codes(codes).numpy(), stored_codes)
+            np.testing.assert_array_equal(unpack_ternary_codes(codes, obj.format).numpy(), stored_codes)
             np.testing.assert_array_equal(scales.numpy(), stored_scales)
 
 
@@ -172,3 +173,23 @@ def test_mtp_is_copied_word_for_word(converted):
                 assert torch.equal(a.codes, b.codes) and torch.equal(a.scales, b.scales), name
             else:
                 assert torch.equal(source.dequantize(name), result.dequantize(name)), name
+
+
+def test_t5_conversion_keeps_the_exact_gguf_trits(tmp_path, monkeypatch):
+    # The recipe's stored ternary format switched to base-3 t5 (design doc 9.1, step 2).
+    import tools.convert.official_recipes as recipes
+
+    monkeypatch.setattr(recipes, "TERNARY_FORMAT", "t5_g128_fp16")
+    fixture, _, _, out, _ = convert_bonsai(tmp_path)
+    with Artifact(out) as artifact:
+        for name, gguf in (
+            ("text/output_head", "output.weight"),
+            ("text/token_embedding", "token_embd.weight"),
+            ("text/layers/1/gdn/output", "blk.1.ssm_out.weight"),
+        ):
+            obj = _parent(artifact, name)
+            assert (obj.format, obj.layout) == ("t5_g128_fp16", "ternary_row_k128_v1"), name
+            codes, scales = decode_ternary_words(artifact.read_object(obj.id), obj.shape, obj.format)
+            stored_codes, stored_scales = fixture.ternary[gguf]
+            np.testing.assert_array_equal(unpack_ternary_codes(codes, obj.format).numpy(), stored_codes)
+            np.testing.assert_array_equal(scales.numpy(), stored_scales)

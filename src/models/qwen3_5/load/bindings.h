@@ -59,8 +59,9 @@ private:
                                       const std::string& component);
 void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& config,
                   const TextConfig& target);
-// Every T2_G128_FP16 binding must be a per-layer projection listed in prism_hadamard, every
-// listed projection must be T2, and its input width must have a sign vector.
+// Every ternary (T2/T5) binding must be a weight listed in prism_hadamard (rotated_inputs, or
+// the embedding under embedding_inverse), every listed weight must be ternary with a sign
+// vector of its input width, and every use of a T5 weight must admit A8 (T5 has no A16 route).
 void validate_prism_hadamard(const Bindings& bindings, const TextConfig& config);
 [[nodiscard]] ProposalWeights bind_proposal(Bindings& bindings, const artifact::Proposal& proposal,
                                             const TextConfig& target, const LoadOptions& options,

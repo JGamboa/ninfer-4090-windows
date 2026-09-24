@@ -29,15 +29,32 @@ def down_not_ternary(model, recipe, sources):
     recipe.assign("text/layers/*/mlp/down", format="q8_g32_fp16", method="grouped_absmax")
 
 
+def to_t5(model, recipe, sources):
+    """Store every Prism ternary weight in the base-3 t5 format instead of t2."""
+    for name, parameter in model.parameters.items():
+        if name.startswith("text/") and recipe.selections[name][0].format == "t2_g128_fp16":
+            recipe.assign(
+                name,
+                format="t5_g128_fp16",
+                source=model.source(name, sources["gguf"], "t5_g128_fp16"),
+            )
+
+
+def t5_a16_use(model, recipe, sources):
+    to_t5(model, recipe, sources)
+    recipe.assign("text/layers/*/mlp/down", activation_policy="A16Only")
+
+
 def embedding_not_ternary(model, recipe, sources):
     recipe.assign("text/token_embedding", format="q8_g32_fp16", method="grouped_absmax")
 
 
 CASES = (
     ("without_prism_block", "is not a prism_hadamard rotated weight"),
-    ("without_down_rotation", "mlp/down: t2_g128_fp16 weight is not a prism_hadamard"),
-    ("down_not_ternary", "lists this weight but it is not t2_g128_fp16"),
+    ("without_down_rotation", "mlp/down: ternary weight is not a prism_hadamard"),
+    ("down_not_ternary", "lists this weight but it is not ternary"),
     ("embedding_not_ternary", "token_embedding: prism_hadamard lists this weight"),
+    ("t5_a16_use", "t5_g128_fp16 requires an AllowA8 use"),
 )
 
 
@@ -47,6 +64,10 @@ def main() -> int:
         root = Path(temporary)
         (root / "valid").mkdir()
         *_, out, _ = convert_bonsai(root / "valid")
+        if subprocess.run([executable, str(out)]).returncode:
+            return 1
+        (root / "valid_t5").mkdir()
+        *_, out, _ = convert_bonsai(root / "valid_t5", "--override", f"{__file__}:to_t5")
         if subprocess.run([executable, str(out)]).returncode:
             return 1
         for name, message in CASES:

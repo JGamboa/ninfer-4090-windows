@@ -8,7 +8,8 @@ views per ternary matrix:
   (`unrotate_rows`), for the embedding the primal table. A recipe that re-quantizes a
   ternary tensor (the v1 Q8 output head and embedding) therefore folds the rotation
   automatically.
-- encoded rows: the exact rotated ternary words as `t2_g128_fp16`, for `import_encoded`.
+- encoded rows: the exact rotated ternary words in a requested ternary format
+  (`t2_g128_fp16` or `t5_g128_fp16`), for `import_encoded`.
   Their column axis stays in the rotated basis; the runtime applies the Hadamard to a
   projection's activation, or to a gathered embedding row (`prism_hadamard` text config).
   Projections (`prism.hadamard.weight_names`) and the embedding
@@ -37,6 +38,7 @@ from typing import Callable
 import numpy as np
 import torch
 
+from tools.artifact.formats import TERNARY_FORMATS
 from tools.convert.quantization.hadamard import unrotate_rows
 from .gguf_reader import GgufStore
 from .logical import EncodedRows, LogicalSource
@@ -50,7 +52,6 @@ from .prism_gguf import (
 )
 from .safetensors import TensorInfo
 
-TERNARY_FORMAT = "t2_g128_fp16"
 _TERNARY_TYPES = (PTQ1_0_TYPE, PQ2_0_TYPE)
 _F32, _BF16 = 0, 30
 
@@ -263,8 +264,8 @@ class PrismCheckpoint:
         except KeyError:
             raise ValueError(f"{self.path}: no Hadamard sign vector of width {width}") from None
 
-    def encoded_rows(self, name: str, begin: int, end: int) -> EncodedRows:
-        """Exact rotated `t2_g128_fp16` words for HF rows [begin, end)."""
+    def encoded_rows(self, name: str, begin: int, end: int, format: str) -> EncodedRows:
+        """Exact rotated ternary words in `format` for HF rows [begin, end)."""
         entry = self._entry(name)
         if not self.ternary(name):
             raise ValueError(f"{name}: {entry.gguf} is not a ternary tensor")
@@ -277,11 +278,11 @@ class PrismCheckpoint:
             raise ValueError(f"{name}: invalid encoded rows [{begin},{end})")
         codes, scales = [], []
         for low, high in self._runs(entry, begin, end):
-            c, s = ternary_rows(self._store, entry.gguf, low, high)
+            c, s = ternary_rows(self._store, entry.gguf, low, high, format)
             codes.append(c)
             scales.append(s)
         self.bytes_read += (end - begin) * self._store.row_bytes(entry.gguf)
-        return EncodedRows(TERNARY_FORMAT, torch.cat(codes), torch.cat(scales))
+        return EncodedRows(format, torch.cat(codes), torch.cat(scales))
 
     def vector_values(self, name: str) -> torch.Tensor:
         entry = self._entry(name)
@@ -318,14 +319,15 @@ class PrismCheckpoint:
         entry = self._entry(name)
         if tuple(shape) != entry.shape:
             raise ValueError(f"{name}: expected shape {entry.shape}, got {tuple(shape)}")
-        ternary = self.ternary(name)
-        if format not in (None, TERNARY_FORMAT) or (format and not ternary):
+        if format is not None and (format not in TERNARY_FORMATS or not self.ternary(name)):
             raise ValueError(f"{name}: {entry.gguf} does not provide {format} rows")
         return LogicalSource(
             entry.shape,
             f"{self.path}:{entry.gguf} as {name}",
             lambda begin, end: self.read_flat(name, begin, end),
-            (lambda begin, end: self.encoded_rows(name, begin, end)) if ternary else None,
+            (lambda begin, end: self.encoded_rows(name, begin, end, format))
+            if format is not None
+            else None,
         )
 
     def close(self) -> None:
@@ -338,4 +340,4 @@ class PrismCheckpoint:
         self.close()
 
 
-__all__ = ["PrismCheckpoint", "TERNARY_FORMAT", "grouped_head_sources"]
+__all__ = ["PrismCheckpoint", "grouped_head_sources"]

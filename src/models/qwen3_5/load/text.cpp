@@ -1,6 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include "artifact/formats.h"
+#include "ninfer/ops/linear.h"
 
 #include <limits>
 #include <set>
@@ -145,7 +146,16 @@ void validate_prism_hadamard(const Bindings& b, const TextConfig& config) {
     const auto* prism = config.prism_hadamard ? &*config.prism_hadamard : nullptr;
     for (const auto& weight : b.weights) {
         const auto& name  = weight.reference.name;
-        const bool ternary = bound_format(b, weight) == QType::T2_G128_FP16;
+        const QType format = bound_format(b, weight);
+        const bool ternary = ternary_qtype(format);
+        if (format == QType::T5_G128_FP16) {
+            for (const auto& use : weight.uses) {
+                if (!ops::allows_a8(use.policy)) {
+                    throw artifact::ArtifactError(name + "@" + use.input +
+                                                  ": t5_g128_fp16 requires an AllowA8 use");
+                }
+            }
+        }
         std::string_view role;
         if (name.starts_with("text/layers/")) {
             const auto slash = name.find('/', std::string_view("text/layers/").size());
@@ -158,8 +168,8 @@ void validate_prism_hadamard(const Bindings& b, const TextConfig& config) {
                                            : !role.empty() && prism->rotated_inputs.contains(role));
         if (ternary != rotated) {
             throw artifact::ArtifactError(
-                name + (ternary ? ": t2_g128_fp16 weight is not a prism_hadamard rotated weight"
-                                : ": prism_hadamard lists this weight but it is not t2_g128_fp16"));
+                name + (ternary ? ": ternary weight is not a prism_hadamard rotated weight"
+                                : ": prism_hadamard lists this weight but it is not ternary"));
         }
         if (rotated) {
             const auto width = weight.reference.shape.at(1);

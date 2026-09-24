@@ -17,7 +17,14 @@ enum class QType : std::uint16_t {
     NVFP4               = 7,
     FP8_E4M3FN_ROW_BF16 = 8,
     T2_G128_FP16        = 9,
+    T5_G128_FP16        = 10,
 };
+
+// Prism ternary weights (codes {0, 1, 2} = c - 1, one FP16 scale per 128 columns): T2 packs
+// four 2-bit codes per byte, T5 scaled base-3 13-byte units of 64 columns (TernaryRowK128).
+[[nodiscard]] constexpr bool ternary_qtype(QType qtype) noexcept {
+    return qtype == QType::T2_G128_FP16 || qtype == QType::T5_G128_FP16;
+}
 
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,
@@ -49,7 +56,7 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
-    // T2_G128_FP16 only: BF16 +-1 [k] Prism sign vector of a weight stored in the rotated basis.
+    // Ternary (T2/T5) only: BF16 +-1 [k] Prism sign vector of a weight stored in the rotated basis.
     // The logical weight is W' H S: a projection multiplies W' by the 1024-block normalized
     // Walsh-Hadamard rotation (1/32) H (signs * x) of its input (ninfer/ops/hadamard.h); an
     // embedding table's logical row is signs * (1/32) H z' of its stored row z'.
