@@ -12,43 +12,40 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kChunk         = 1024;        // x columns staged per pass
-constexpr int kWordsPerChunk = kChunk / 16; // 16 two-bit codes per 32-bit word
-constexpr int kThreads       = 256;
-constexpr int kRowsPerWarp   = 2;
-constexpr int kRowsPerBlock  = kThreads / 32 * kRowsPerWarp;
-constexpr int kMaxOutputs    = 4;
+constexpr int kThreads     = 256;
+constexpr int kWarps       = kThreads / 32;
+constexpr int kRowsPerWarp = 2;
+constexpr int kMaxTile     = 8; // tokens per launch column; larger T uses grid.y
+constexpr int kMaxOutputs  = 4;
 
 struct Outputs {
     __nv_bfloat16* data[kMaxOutputs];
     int end[kMaxOutputs]; // exclusive parent row bound of each output
 };
 
-__device__ __forceinline__ void unpack8(const uint4& v, float (&out)[8]) {
-    const auto* h = reinterpret_cast<const __nv_bfloat162*>(&v);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float2 f = __bfloat1622float2(h[i]);
-        out[2 * i]     = f.x;
-        out[2 * i + 1] = f.y;
-    }
-}
-
-// Each warp owns kRowsPerWarp parent rows and one tile of Tile tokens; lanes split the 64 code
-// words of every staged 1024-column chunk. Code c contributes (c - 1) * x; the per-word partial
-// sum is scaled once by its group's FP16 scale.
+// Each warp owns two parent rows. A lane reads 32 codes (8 bytes) of each row per step, so a
+// warp step covers 1024 columns; the codes of both rows are loaded before any arithmetic to
+// keep several global loads in flight. The 32 decoded weights (code - 1) are reused for every
+// token; x comes from global memory through L1 (the whole activation is shared by all warps).
+// FP32 accumulation, one FP16 group scale per 32-code slice (a slice never crosses a group).
 template <int Tile>
 __global__ void __launch_bounds__(kThreads)
-    t2_project_kernel(const __nv_bfloat16* __restrict__ x, const std::uint32_t* __restrict__ codes,
+    t2_project_kernel(const __nv_bfloat16* __restrict__ x, const uint2* __restrict__ codes,
                       const __half* __restrict__ scales, std::int64_t scale_row_halves, int n,
                       int k, int tokens, Outputs outputs, bool accumulate) {
-    __shared__ __align__(16) __nv_bfloat16 staged[Tile][kChunk];
     const int warp   = static_cast<int>(threadIdx.x) / 32;
     const int lane   = static_cast<int>(threadIdx.x) % 32;
     const int token0 = static_cast<int>(blockIdx.y) * Tile;
     const int live   = min(Tile, tokens - token0);
-    const int row0   = static_cast<int>(blockIdx.x) * kRowsPerBlock + warp * kRowsPerWarp;
-    const std::int64_t words_per_row = k / 16;
+    const int row0   = (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
+    if (row0 >= n) return;
+    const bool pair           = row0 + 1 < n;
+    const int slices_per_row  = k / 32;
+    const uint2* row_codes[2] = {codes + std::int64_t(row0) * slices_per_row,
+                                 codes + std::int64_t(pair ? row0 + 1 : row0) * slices_per_row};
+    const __half* row_scales[2] = {scales + std::int64_t(row0) * scale_row_halves,
+                                   scales + std::int64_t(pair ? row0 + 1 : row0) * scale_row_halves};
+    const __nv_bfloat16* xt = x + std::int64_t(token0) * k;
 
     float acc[kRowsPerWarp][Tile];
 #pragma unroll
@@ -57,47 +54,51 @@ __global__ void __launch_bounds__(kThreads)
         for (int t = 0; t < Tile; ++t) acc[r][t] = 0.0f;
     }
 
-    for (int chunk = 0; chunk < k / kChunk; ++chunk) {
-        constexpr int kVectors = kChunk / 8;
-        for (int i = static_cast<int>(threadIdx.x); i < live * kVectors; i += kThreads) {
-            const int t = i / kVectors, v = i % kVectors;
-            reinterpret_cast<uint4*>(staged[t])[v] = reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(token0 + t) * k + chunk * kChunk)[v];
-        }
-        __syncthreads();
+    for (int slice = lane; slice < slices_per_row; slice += 32) {
+        uint2 bits[kRowsPerWarp];
+        float scale[kRowsPerWarp];
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
-            const int row = row0 + r;
-            if (row < n) {
-                for (int word = lane; word < kWordsPerChunk; word += 32) {
-                    const std::int64_t index = chunk * kWordsPerChunk + word;
-                    const std::uint32_t bits = codes[row * words_per_row + index];
-                    const float scale = __half2float(scales[row * scale_row_halves + index / 8]);
-                    float weight[16];
+            bits[r]  = __ldg(row_codes[r] + slice);
+            scale[r] = __half2float(__ldg(row_scales[r] + slice / 4));
+        }
+        // Decode the 32 weights of each row once; every token reuses them.
+        float weight[kRowsPerWarp][32];
 #pragma unroll
-                    for (int j = 0; j < 16; ++j) {
-                        weight[j] = static_cast<float>(static_cast<int>((bits >> (2 * j)) & 3u) - 1);
-                    }
+        for (int r = 0; r < kRowsPerWarp; ++r) {
 #pragma unroll
-                    for (int t = 0; t < Tile; ++t) {
-                        if (t < live) {
-                            const auto* xv = reinterpret_cast<const uint4*>(&staged[t][word * 16]);
-                            float lo[8], hi[8];
-                            unpack8(xv[0], lo);
-                            unpack8(xv[1], hi);
-                            float partial = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                const std::uint32_t word = j < 16 ? bits[r].x : bits[r].y;
+                weight[r][j] = static_cast<float>(static_cast<int>((word >> ((j % 16) * 2)) & 3u) - 1);
+            }
+        }
+        const int column = slice * 32;
 #pragma unroll
-                            for (int j = 0; j < 8; ++j) {
-                                partial = fmaf(weight[j], lo[j], partial);
-                                partial = fmaf(weight[8 + j], hi[j], partial);
-                            }
-                            acc[r][t] = fmaf(scale, partial, acc[r][t]);
+        for (int t = 0; t < Tile; ++t) {
+            if (t < live) {
+                const uint4* xv = reinterpret_cast<const uint4*>(xt + std::int64_t(t) * k + column);
+                float partial[kRowsPerWarp] = {};
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const uint4 packed = __ldg(xv + q);
+                    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+                    for (int h = 0; h < 4; ++h) {
+                        // Two BF16 values per word; the low half is the lower column.
+                        const float x0 = __uint_as_float(words[h] << 16);
+                        const float x1 = __uint_as_float(words[h] & 0xffff0000u);
+                        const int j    = q * 8 + h * 2;
+#pragma unroll
+                        for (int r = 0; r < kRowsPerWarp; ++r) {
+                            partial[r] = fmaf(weight[r][j], x0, partial[r]);
+                            partial[r] = fmaf(weight[r][j + 1], x1, partial[r]);
                         }
                     }
                 }
+#pragma unroll
+                for (int r = 0; r < kRowsPerWarp; ++r) acc[r][t] = fmaf(scale[r], partial[r], acc[r][t]);
             }
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -122,7 +123,7 @@ __global__ void __launch_bounds__(kThreads)
         const int rows  = outputs.end[s] - begin;
 #pragma unroll
         for (int t = 0; t < Tile; ++t) {
-            if (t < live && lane == t % 32) {
+            if (t < live && lane == t) {
                 auto* out = outputs.data[s] + static_cast<std::int64_t>(token0 + t) * rows +
                             (row - begin);
                 const float value = accumulate ? acc[r][t] + __bfloat162float(*out) : acc[r][t];
@@ -135,11 +136,12 @@ __global__ void __launch_bounds__(kThreads)
 template <int Tile>
 void launch(const Tensor& x, const Weight& w, const Outputs& outputs, bool accumulate,
             cudaStream_t stream) {
-    const int tokens = x.ne[1];
-    const dim3 grid(static_cast<unsigned>((w.n + kRowsPerBlock - 1) / kRowsPerBlock),
+    const int tokens         = x.ne[1];
+    constexpr int kRowsBlock = kWarps * kRowsPerWarp;
+    const dim3 grid(static_cast<unsigned>((w.n + kRowsBlock - 1) / kRowsBlock),
                     static_cast<unsigned>((tokens + Tile - 1) / Tile));
     t2_project_kernel<Tile><<<grid, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint32_t*>(w.qdata),
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const uint2*>(w.qdata),
         static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.n, w.k, tokens, outputs,
         accumulate);
     CUDA_CHECK(cudaGetLastError());
@@ -151,9 +153,9 @@ bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15
 
 void validate_t2_weight(const Weight& w, const char* op) {
     if (w.qtype != QType::T2_G128_FP16 || w.layout != QuantLayout::TernaryRowK128 ||
-        w.scale_dtype != DType::FP16 || w.group_size != 128 || w.n <= 0 || w.k % kChunk ||
+        w.scale_dtype != DType::FP16 || w.group_size != 128 || w.n <= 0 || w.k % 1024 ||
         w.qdata == nullptr || w.qhigh != nullptr || w.scales == nullptr ||
-        (reinterpret_cast<std::uintptr_t>(w.qdata) & 3) || w.scale_nb[1] != w.k / 64) {
+        (reinterpret_cast<std::uintptr_t>(w.qdata) & 7) || w.scale_nb[1] != w.k / 64) {
         throw std::invalid_argument(std::string(op) +
                                     ": weight must be T2_G128_FP16 ternary rows with K%1024=0");
     }
@@ -189,10 +191,12 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     if (end != w.n) {
         throw std::invalid_argument("t2_project: output rows must cover the weight rows");
     }
-    if (tokens <= 8) {
-        launch<8>(x, w, packed, accumulate, stream);
-    } else {
-        launch<16>(x, w, packed, accumulate, stream);
+    switch (tokens) {
+    case 1: launch<1>(x, w, packed, accumulate, stream); break;
+    case 2: launch<2>(x, w, packed, accumulate, stream); break;
+    case 3: launch<3>(x, w, packed, accumulate, stream); break;
+    case 4: launch<4>(x, w, packed, accumulate, stream); break;
+    default: launch<kMaxTile>(x, w, packed, accumulate, stream); break;
     }
 }
 
