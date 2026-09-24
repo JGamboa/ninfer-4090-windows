@@ -1163,10 +1163,25 @@ Next steps, in order:
    attention qkvg (224 x 8) 4.1 % at 0.58 ms. Gate+up does 91 G int8 MACs in 1.60 ms (~114
    TOPS, ~17 % of the tensor peak) while reading ~312 MB of t5 weights from DRAM (39 MB per
    64-token tile, ~200 GB/s): neither memory nor compute bound, and the prototype's no-decode
-   variant was as slow, so the trit decode is not its limit; the evidence points at latency
-   and issue (two-stage pipeline, four warps per CTA, a barrier per stage). `ncu --set full`
-   on one gate+up launch is pending: GPU performance counters need administrator access on
-   this Windows machine (`ERR_NVGPUCTRPERM`).
+   variant was as slow, so the trit decode is not its limit.
+
+   `ncu --set full` on one gate+up launch (`profiles/ncu/t5_gemm_gateup.ncu-repz`, grid
+   544 x 8, SM 2.59 GHz; GPU performance counters must be enabled for all users in the NVIDIA
+   Control Panel): 1.13 ms; DRAM 9 % of peak, L2 69.5 % (the activation tiles re-read by every
+   row CTA, 98 % L2 hit rate), compute 30 %, tensor pipe 23.8 %, issue slots 23.5 % busy,
+   0.95 IPC. Latency bound: no warp eligible in 76 % of the cycles, 13.1 cycles per issued
+   instruction, of which MIO throttle 3.4 (shared-memory instruction queue: four 32-bit A-word
+   loads per fragment pair, the B `ldmatrix`, the decoded-word stores, ~5 M bank conflicts),
+   long scoreboard 2.8 (global code-byte loads and local memory), barrier 1.1, wait 1.1.
+   Occupancy 25 % (3 CTAs per SM, limited by 166 registers per thread and 25.6 KB of shared
+   memory per CTA); no register spills, but 1.7 M local loads from the output epilogue's
+   dynamically indexed `Outputs` (uncoalesced, 1 thread per request). The trit decode is about
+   150 instructions per thread and stage, ~30 % of the 352 M executed warp instructions, but
+   the issue slots are three-quarters idle, so it costs registers and MIO traffic rather than
+   issue bandwidth. Levers, by the profile: A fragments through `ldmatrix` from an
+   `ldmatrix`-friendly word layout (fewer MIO instructions), fewer registers for a fourth CTA
+   per SM, a 128-token tile (half the decode and L2 activation re-reads per token), and the
+   epilogue's output index resolved without local memory.
 5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
    quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
    Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).
