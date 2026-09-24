@@ -862,6 +862,14 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   bench uses the current `QType` name, and the artifact materialization test (GNU ld `--wrap`)
   is registered only off Windows.
 
+- (A) Vision tower from Prism's mmproj (`bonsai-ternary-conversion.md`, "Vision tower"): a
+  `MmprojCheckpoint` source (`sources/mmproj.py`) maps llama.cpp's `qwen3vl_merger` mmproj to
+  the HF `model.visual.*` names (patch Conv3D reassembled from its two temporal halves),
+  `bonsai_base --mmproj` writes `vision_config` and the preprocessor resources, and
+  `bonsai2_27b` accepts `vision` with `--source mmproj=...`, quantized to the official
+  Qwen3.8 Vision formats (the only registered Vision kernels). `bonsai_vision_check`
+  compares the tower with a Qwen3.8 reference. No runtime change: the tower is Qwen3.8's.
+
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also
   drives a 3840x2160 120 Hz desktop), PCIe 4.0 x16, Core i9-13900K, CUDA 13.4.

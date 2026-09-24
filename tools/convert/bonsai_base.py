@@ -9,8 +9,14 @@ its text resources (`tokenizer.json`, `tokenizer_config.json`, `generation_confi
 `tokenizer.chat_template` is written next to the base as `gguf_chat_template.jinja` with a
 line stating whether it matches the reference template (design doc section 8, risk 5).
 
+With `--mmproj` (Prism's Qwen3-VL vision pack), `config.json` also carries the
+`vision_config` derived from the mmproj metadata, and the base directory receives the
+Vision preprocessor resources: from the reference's `vision` component when it has one,
+otherwise from `--vision-resources DIR` (e.g. the Qwen3.8-27B HF repository files).
+
     python -m tools.convert.bonsai_base --gguf E:\\LLM\\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
-        --reference E:\\LLM\\qwen3_8_27b.ninfer --out E:\\LLM\\bonsai2-27b
+        --reference E:\\LLM\\qwen3_8_27b.ninfer --out E:\\LLM\\bonsai2-27b ^
+        [--mmproj E:\\LLM\\bonsai\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf]
 """
 
 from __future__ import annotations
@@ -20,8 +26,9 @@ import json
 from pathlib import Path
 
 from .qwen3_5 import text_config
-from .resources import TEXT_RESOURCES
+from .resources import TEXT_RESOURCES, VISION_RESOURCES
 from .sources.gguf_reader import GgufStore
+from .sources.mmproj import MmprojCheckpoint
 from .sources.ninfer_artifact import NInferArtifactStore
 
 _GGUF_FIELDS = {
@@ -38,8 +45,14 @@ _GGUF_FIELDS = {
 }
 
 
-def write_base(gguf_path: Path, reference_path: Path, out: Path) -> dict:
-    """Write config.json and text resources to `out`; return a small report."""
+def write_base(
+    gguf_path: Path,
+    reference_path: Path,
+    out: Path,
+    mmproj_path: Path | None = None,
+    vision_resources: Path | None = None,
+) -> dict:
+    """Write config.json and text (and Vision) resources to `out`; return a small report."""
     with NInferArtifactStore(reference_path) as reference, GgufStore(gguf_path) as gguf:
         component = reference.directory.components["text"]
         config = dict(component["config"])
@@ -58,8 +71,32 @@ def write_base(gguf_path: Path, reference_path: Path, out: Path) -> dict:
         missing = [role for role in TEXT_RESOURCES if role not in resources]
         if missing:
             raise ValueError(f"{reference_path}: missing text resources {missing}")
+        vision_files: dict[str, bytes] = {}
+        if mmproj_path is not None:
+            with MmprojCheckpoint(mmproj_path) as mmproj:
+                vision = dict(mmproj.config["vision_config"])
+            if vision["out_hidden_size"] != config["hidden_size"]:
+                raise ValueError(
+                    f"{mmproj_path}: projection_dim {vision['out_hidden_size']} differs from "
+                    f"hidden_size {config['hidden_size']}"
+                )
+            config["vision_config"] = vision
+            reference_vision = reference.directory.components.get("vision", {})
+            stored = reference_vision.get("resources", {})
+            for role in VISION_RESOURCES:
+                if role in stored:
+                    vision_files[role] = reference.read_object(stored[role])
+                elif vision_resources is not None and (vision_resources / role).is_file():
+                    vision_files[role] = (vision_resources / role).read_bytes()
+                else:
+                    raise ValueError(
+                        f"Vision resource {role} is in neither {reference_path} nor "
+                        "--vision-resources"
+                    )
         out.mkdir(parents=True, exist_ok=False)
         (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        for role, data in vision_files.items():
+            (out / role).write_bytes(data)
         template = b""
         for role in TEXT_RESOURCES:
             data = reference.read_object(resources[role])
@@ -81,8 +118,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gguf", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--mmproj", type=Path, help="Prism Qwen3-VL vision mmproj GGUF")
+    parser.add_argument(
+        "--vision-resources",
+        type=Path,
+        help="directory with preprocessor_config.json and video_preprocessor_config.json",
+    )
     args = parser.parse_args(argv)
-    report = write_base(args.gguf, args.reference, args.out)
+    report = write_base(args.gguf, args.reference, args.out, args.mmproj, args.vision_resources)
     print(f"wrote {report['config']}")
     matches = report["chat_template_matches_gguf"]
     if matches is None:

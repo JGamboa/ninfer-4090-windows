@@ -47,6 +47,7 @@ _BLOCK_LAYOUT = {
     0: (1, 4),      # F32
     1: (1, 2),      # F16
     30: (1, 2),     # BF16
+    8: (32, 34),    # Q8_0:   ggml_half d (2) + qs[32] (vision mmproj)
     142: (128, 34),  # PQ2_0:  ggml_half d (2) + qs[32]
     143: (128, 28),  # PTQ1_0: qs[24] + qh[2] + ggml_half d (2)
 }

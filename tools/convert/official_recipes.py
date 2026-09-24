@@ -11,6 +11,7 @@ from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
 from .model import Parameter
 from .sources.logical import array_source
 from .sources.ninfer_artifact import NInferArtifactStore
+from .sources.mmproj import MmprojCheckpoint
 from .sources.prism_checkpoint import TERNARY_FORMAT, PrismCheckpoint
 
 Q4 = "q4_g64_fp16"
@@ -258,13 +259,13 @@ def _bonsai_mtp(model, recipe, reference: NInferArtifactStore) -> None:
 def bonsai2_27b(model, recipe, sources):
     """Prism Ternary Bonsai 2: t2 projections and output head, primal Q8 embedding, copied MTP.
 
-    Sources: ``gguf`` (the PTQ1_0/PQ2_0 GGUF) and, with the ``mtp`` component, ``mtp``
-    (an existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word).
+    Sources: ``gguf`` (the PTQ1_0/PQ2_0 GGUF); with the ``mtp`` component, ``mtp`` (an
+    existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word); with the
+    ``vision`` component, ``mmproj`` (Prism's Qwen3-VL mmproj GGUF, not ternary), quantized
+    to the official Vision formats (Q4/Q5/Q6/Q8, the registered Vision kernels).
     """
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
-    if "vision" in model.components:
-        raise ValueError("the Bonsai GGUF has no Vision tower")
     gguf = sources["gguf"]
     if not isinstance(gguf, PrismCheckpoint):
         raise ValueError("bonsai2_27b requires --source gguf=PATH.gguf")
@@ -326,6 +327,19 @@ def bonsai2_27b(model, recipe, sources):
     }
     if "mtp" in model.components:
         _bonsai_mtp(model, recipe, sources["mtp"])
+    if "vision" in model.components:
+        _bonsai_vision(model, recipe, sources["mmproj"])
+
+
+def _bonsai_vision(model, recipe, mmproj):
+    """Read every Vision parameter from the mmproj; formats stay those of `_optional`."""
+    if not isinstance(mmproj, MmprojCheckpoint):
+        raise ValueError("bonsai2_27b vision requires --source mmproj=PATH-mmproj.gguf")
+    for name, parameter in list(model.parameters.items()):
+        if name.startswith("vision/"):
+            source = model.source(name, mmproj)
+            model.parameters[name] = replace(parameter, source=source)
+            recipe.assign(name, source=source)
 
 
 RECIPES = {

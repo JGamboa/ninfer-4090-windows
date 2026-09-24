@@ -15,14 +15,16 @@ from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.ninfer_artifact import NInferArtifactStore
+from .sources.mmproj import MmprojCheckpoint, is_mmproj
 from .sources.prism_checkpoint import PrismCheckpoint
 from .sources.safetensors import SafetensorsSource
 
 
 def open_source(path: Path):
-    """Open a named source by its file type: GGUF, NInfer artifact or Safetensors."""
+    """Open a named source by its file type: GGUF (a Prism model or a vision mmproj), NInfer
+    artifact or Safetensors."""
     if path.suffix == ".gguf":
-        return PrismCheckpoint(path)
+        return MmprojCheckpoint(path) if is_mmproj(path) else PrismCheckpoint(path)
     if path.suffix == ".ninfer":
         return NInferArtifactStore(path)
     return SafetensorsSource(path)

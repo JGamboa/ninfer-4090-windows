@@ -190,3 +190,47 @@ through `bonsai_base` and the CLI; the test rebuilds the expected t2 parents, pr
 head/embedding, vectors and MTP words independently.
 
 Results of the real run: _pending (Windows machine)_.
+
+## Vision tower (Prism mmproj)
+
+Prism ships the Qwen3.8 Vision tower (0.46B parameters, not ternary) as a separate
+llama.cpp mmproj (`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`, 0.63 GB, or the BF16 reference
+pack). Its layout is llama.cpp's `Qwen3VLVisionModel` (PrismML-Eng/llama.cpp
+`conversion/qwen3vl.py`, projector `qwen3vl_merger`, no deepstack): renames only, plus the
+Conv3D patch embedding split into two temporal halves. `tools/convert/sources/mmproj.py`
+presents it under the HF `model.visual.*` names the Qwen3.5 builder uses and decodes F32,
+F16, BF16 and Q8_0 tensors (the Q8_0 pack keeps `ffn_down`, 4304 columns, in F16).
+
+| mmproj | HF | NInfer |
+|---|---|---|
+| `v.patch_embd.weight` / `.weight.1` (t = 0 / 1) | `patch_embed.proj.weight` [h, 3, 2, p, p] | `vision/patch_embedding` |
+| `v.patch_embd.bias`, `v.position_embd.weight` | `patch_embed.proj.bias`, `pos_embed.weight` | `vision/patch_embedding_bias`, `vision/position_embedding` |
+| `v.blk.N.ln1` / `ln2` | `blocks.N.norm1` / `norm2` | `vision/layers/N/norm1_*` / `norm2_*` |
+| `v.blk.N.attn_qkv` (fused) | `blocks.N.attn.qkv` | `.../attention/{query,key,value}` rows |
+| `v.blk.N.attn_out`, `ffn_up`, `ffn_down` | `attn.proj`, `mlp.linear_fc1`, `mlp.linear_fc2` | `.../attention/output`, `mlp/fc1`, `mlp/fc2` |
+| `v.post_ln`, `mm.0`, `mm.2` | `merger.norm`, `merger.linear_fc1`, `merger.linear_fc2` | `vision/merger/norm_*`, `fc1`, `fc2` |
+
+`vision_config` comes from the `clip.vision.*` metadata (27 blocks, width 1152, MLP 4304, 16
+heads, patch 16, temporal 2, merge 2, 2304 positions, projection 5120). The registered
+Vision kernels exist only for the official Qwen3.8 formats, so `bonsai2_27b` quantizes the
+tower exactly like the Qwen3.8 recipe (Q4 qkv/fc1, Q5 output/fc2, Q6 patch, Q8 merger).
+The preprocessor resources come from the reference's `vision` component, or from
+`--vision-resources DIR` (the Qwen3.8-27B HF `preprocessor_config.json` and
+`video_preprocessor_config.json`).
+
+```
+.venv\Scripts\python.exe -m tools.convert.bonsai_vision_check ^
+  --mmproj E:\LLM\bonsai\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf --reference E:\LLM\qwen3_8_27b.ninfer
+.venv\Scripts\python.exe -m tools.convert.bonsai_base --gguf E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --reference E:\LLM\qwen3_8_27b.ninfer --mmproj E:\LLM\bonsai\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf ^
+  --out E:\LLM\bonsai2-27b-vl
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe bonsai2_27b ^
+  --components text,vision,mtp --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --source mmproj=E:\LLM\bonsai\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf ^
+  --source mtp=E:\LLM\qwen3_8_27b.ninfer --proposal --name bonsai2-27b ^
+  --out E:\LLM\bonsai2_27b_vl.ninfer --device cuda
+```
+
+`bonsai_vision_check` prints the relative L2 difference of sampled Vision parameters
+against the reference tower (same weights: about 0.01 to 0.1 from the two quantizations;
+different weights: near 1). Synthetic coverage: `tests/convert/test_bonsai_vision.py`.
