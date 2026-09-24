@@ -1150,6 +1150,23 @@ Next steps, in order:
 4. Prefill: recover the accepted t5 regression (pp512 -13 %) with a 64 x 128-token GEMM tile
    (half the weight reads and decode per token), and an eight-token tensor-core route for
    T = 5..8 (1.2-1.7x t2 today) if short prefills matter.
+
+   Profile, 2026-09-24, display 60 Hz: `nsys profile --trace=cuda,nvtx` of `ninfer_bench
+   -p 512` on the t5 `bonsai2_27b_vl.ninfer` (`profiles/nsys/bonsai_t5_pp512`), four prefills:
+   232 ms wall and 228 ms of kernels per 512-token prefill (2208 tok/s under the profiler).
+   Share of GPU time: t5 `gemm_kernel` 90.6 % (207 ms, 256 calls), `rotate_quantize_kernel`
+   3.0 % (6.8 ms), GDN chunked recurrence and conv 3.5 % (`state_passing` 2.7 ms,
+   `prepare_wy_wu` 2.3, `output` 1.0, conv 1.0, gating 0.6, l2norm 0.2), rmsnorm, SwiGLU and
+   elementwise 2.4 % (`silu_and_mul` 4.2 ms), attention 0.4 % (1.0 ms), head GEMV of the last
+   token 0.1 %. The GEMM by shape: gate+up (grid 544 x 8) 44.8 % at 1.60 ms per call, the 5120-
+   row o_proj and down (80 x 8) 27.9 % at 0.50 ms, gdn in_proj (256 x 8) 13.8 % at 0.66 ms,
+   attention qkvg (224 x 8) 4.1 % at 0.58 ms. Gate+up does 91 G int8 MACs in 1.60 ms (~114
+   TOPS, ~17 % of the tensor peak) while reading ~312 MB of t5 weights from DRAM (39 MB per
+   64-token tile, ~200 GB/s): neither memory nor compute bound, and the prototype's no-decode
+   variant was as slow, so the trit decode is not its limit; the evidence points at latency
+   and issue (two-stage pipeline, four warps per CTA, a barrier per stage). `ncu --set full`
+   on one gate+up launch is pending: GPU performance counters need administrator access on
+   this Windows machine (`ERR_NVGPUCTRPERM`).
 5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
    quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
    Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).
