@@ -6,7 +6,7 @@ of the same architecture:
 
 - **[Prism ML Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)**
   — Qwen3.8-27B compressed to ternary weights {−1, 0, +1}. This branch adds it: **~116–173
-  tok/s decode** (prompt-dependent) from a ~9 GB model with image input. That is 1.5–2.2x the
+  tok/s decode** (prompt-dependent) from a 7.7 GB artifact with image input. That is 1.5–2.2x the
   decode speed of Prism's own llama.cpp fork on the same card, at the same perplexity.
 - **Qwen3.8-27B** (the official NInfer groupwise artifact), inherited from the upstream 4090
   port: 148.6 tok/s code decode, 262K context. See [Qwen3.8-27B on the RTX 4090](#qwen38-27b-on-the-rtx-4090).
@@ -35,7 +35,7 @@ and `--lm-head-draft`. The Prism fork is llama.cpp build b10709 (`PrismML-Eng/ll
 | Decode, no speculation (`tg128`) | 85 tok/s | 77 tok/s |
 | Prefill (`pp512`) | **2,648 tok/s** | 1,363 tok/s |
 | Perplexity, wikitext / code corpus | 8.085 / 1.895 | 8.178 / 1.899 |
-| Weights in VRAM (text + MTP head) | 8.4 GiB | 5.5 GiB |
+| Weights in VRAM (text + MTP head) | 7.45 GiB | 5.5 GiB |
 | Vision tower | 23 ms per image | via `--mmproj` |
 
 - The decode rows depend on the text: MTP drafts are accepted more often in predictable output
@@ -64,7 +64,7 @@ difference comes from three places:
    replays as one CUDA Graph.
 3. **Prefill in large tiles.** The int8 tensor-core GEMM reads the weights once per 64 tokens.
 
-The costs: about 3 GB more VRAM than the fork (2-bit codes instead of 1.6–1.75 bits, plus the MTP
+The costs: about 2 GB more VRAM than the fork (2-bit codes instead of 1.6–1.75 bits, plus the MTP
 head), and an MTP head that was trained for Qwen3.8, not for Bonsai, so acceptance varies with the
 content.
 
