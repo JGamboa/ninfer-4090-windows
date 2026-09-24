@@ -6,7 +6,10 @@
 #include <array>
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -59,6 +62,14 @@ struct GdnConfig {
     [[nodiscard]] std::uint64_t conv_channels() const;
 };
 
+// Prism Walsh-Hadamard rotation of ternary projection inputs (Bonsai artifacts). Each listed
+// per-layer projection stores rotated weights and consumes H_1024(signs * x) of its input.
+struct PrismHadamardConfig {
+    static constexpr std::uint32_t kBlockSize = 1024;
+    std::map<std::uint64_t, std::string> signs; // input width -> BF16 sign-vector parameter
+    std::set<std::string, std::less<>> rotated_inputs; // e.g. "gdn/query", "mlp/down"
+};
+
 struct DenseConfig {
     std::uint32_t intermediate_size = 0;
 };
@@ -86,6 +97,7 @@ struct TextConfig {
     std::optional<RopeConfig> rope_parameters;
     std::optional<GdnConfig> gdn;
     std::variant<DenseConfig, MoeConfig> ffn;
+    std::optional<PrismHadamardConfig> prism_hadamard;
 };
 
 struct VisionConfig {

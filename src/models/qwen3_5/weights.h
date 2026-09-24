@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <variant>
@@ -67,6 +68,8 @@ struct TextWeights {
     WeightId token_embedding, output_head, final_norm;
     WeightUseId output_head_use;
     std::vector<BlockWeights> layers;
+    // Prism sign vectors by rotated input width; empty unless the config has prism_hadamard.
+    std::map<std::uint64_t, WeightId> hadamard_signs;
 };
 
 struct MtpWeights {

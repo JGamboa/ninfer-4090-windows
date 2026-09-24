@@ -90,6 +90,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             bindings.use(out->weights.draft->output_head,
                          std::string(options.speculative_component()) + "/final_hidden");
     }
+    loading::validate_prism_hadamard(bindings, text);
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
     out->info.name       = reader.directory().metadata.value(

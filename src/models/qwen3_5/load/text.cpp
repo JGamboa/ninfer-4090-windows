@@ -1,5 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/formats.h"
+
 #include <limits>
 #include <set>
 
@@ -113,7 +115,56 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
         out.layers.push_back(
             bind_block(b, config, "text/layers/" + std::to_string(i) + "/", config.layer_types[i]));
     }
+    if (config.prism_hadamard) {
+        for (const auto& [width, name] : config.prism_hadamard->signs) {
+            out.hadamard_signs.emplace(width, b.direct(name, {width}));
+        }
+    }
     return out;
+}
+
+namespace {
+
+QType bound_format(const Bindings& b, const PendingWeight& weight) {
+    std::optional<QType> format;
+    for (const auto& part : weight.reference.binding.parts) {
+        const auto& object =
+            std::get<artifact::TensorObject>(b.binder.reader().directory().object(part.object));
+        const auto parsed = artifact::parse_format(object.format);
+        if (format && *format != parsed) {
+            throw artifact::ArtifactError(weight.reference.name + ": parts mix numeric formats");
+        }
+        format = parsed;
+    }
+    return format.value_or(QType::BF16);
+}
+
+} // namespace
+
+void validate_prism_hadamard(const Bindings& b, const TextConfig& config) {
+    const auto* prism = config.prism_hadamard ? &*config.prism_hadamard : nullptr;
+    for (const auto& weight : b.weights) {
+        const auto& name  = weight.reference.name;
+        const bool ternary = bound_format(b, weight) == QType::T2_G128_FP16;
+        std::string_view role;
+        if (name.starts_with("text/layers/")) {
+            const auto slash = name.find('/', std::string_view("text/layers/").size());
+            role             = std::string_view(name).substr(slash + 1);
+        }
+        const bool rotated = prism && !role.empty() && prism->rotated_inputs.contains(role);
+        if (ternary != rotated) {
+            throw artifact::ArtifactError(
+                name + (ternary ? ": t2_g128_fp16 weight is not a prism_hadamard rotated input"
+                                : ": prism_hadamard lists this input but it is not t2_g128_fp16"));
+        }
+        if (rotated) {
+            const auto width = weight.reference.shape.at(1);
+            if (!prism->signs.contains(width)) {
+                throw artifact::ArtifactError(name + ": no Hadamard sign vector of width " +
+                                              std::to_string(width));
+            }
+        }
+    }
 }
 
 ProposalWeights bind_proposal(Bindings& b, const artifact::Proposal& proposal,

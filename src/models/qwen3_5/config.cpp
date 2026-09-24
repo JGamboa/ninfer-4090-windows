@@ -99,6 +99,53 @@ RopeConfig rope(const Json& value, std::uint32_t head_dim) {
     return out;
 }
 
+PrismHadamardConfig prism_hadamard(const Json& value) {
+    require_members(value,
+                    {"version", "transform", "block_size", "sign_mode", "sign_widths", "signs",
+                     "rotated_inputs", "embedding_inverse"},
+                    {}, "prism_hadamard");
+    if (value.at("version") != 1 || value.at("transform") != "normalized-sylvester-walsh-hadamard" ||
+        value.at("sign_mode") != "explicit" ||
+        value.at("block_size") != PrismHadamardConfig::kBlockSize) {
+        throw ArtifactError("prism_hadamard: unsupported version, transform, sign mode or block");
+    }
+    if (value.at("embedding_inverse") != false) {
+        throw ArtifactError("prism_hadamard: a rotated token embedding is not implemented");
+    }
+    PrismHadamardConfig out;
+    const auto& widths = value.at("sign_widths");
+    const auto& signs  = value.at("signs");
+    if (!widths.is_array() || widths.empty() || !signs.is_object() ||
+        signs.size() != widths.size()) {
+        throw ArtifactError("prism_hadamard: every sign width needs one sign parameter");
+    }
+    for (const auto& item : widths) {
+        const auto width = artifact::require_u64(item, "prism_hadamard sign width", true);
+        const auto key   = std::to_string(width);
+        if (width % PrismHadamardConfig::kBlockSize || !signs.contains(key) ||
+            !signs.at(key).is_string() ||
+            !out.signs.emplace(width, signs.at(key).get<std::string>()).second) {
+            throw ArtifactError("prism_hadamard: invalid or duplicate sign width " + key);
+        }
+    }
+    static const std::set<std::string_view> kProjections = {
+        "attention/query", "attention/key",  "attention/gate", "attention/value",
+        "attention/output", "gdn/query",     "gdn/key",        "gdn/value",
+        "gdn/z",            "gdn/output",    "mlp/gate",       "mlp/up",
+        "mlp/down"};
+    const auto& rotated = value.at("rotated_inputs");
+    if (!rotated.is_array() || rotated.empty()) {
+        throw ArtifactError("prism_hadamard: rotated_inputs must list projections");
+    }
+    for (const auto& item : rotated) {
+        if (!item.is_string() || !kProjections.contains(item.get<std::string>()) ||
+            !out.rotated_inputs.insert(item.get<std::string>()).second) {
+            throw ArtifactError("prism_hadamard: unknown or repeated rotated input");
+        }
+    }
+    return out;
+}
+
 TextConfig text(const Json& value, bool mtp) {
     require_members(
         value,
@@ -107,7 +154,8 @@ TextConfig text(const Json& value, bool mtp) {
         {"num_attention_heads", "num_key_value_heads", "head_dim", "rope_parameters",
          "linear_num_key_heads", "linear_key_head_dim", "linear_num_value_heads",
          "linear_value_head_dim", "linear_conv_kernel_dim", "intermediate_size", "num_experts",
-         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"},
+         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
+         "prism_hadamard"},
         "text config");
     TextConfig out;
     out.architecture = resolve_architecture(
@@ -172,6 +220,9 @@ TextConfig text(const Json& value, bool mtp) {
             if (value.contains(key)) { throw ArtifactError("Dense config carries MoE fields"); }
         }
         out.ffn = DenseConfig{dimension(value, "intermediate_size")};
+    }
+    if (value.contains("prism_hadamard")) {
+        out.prism_hadamard = prism_hadamard(value.at("prism_hadamard"));
     }
     return out;
 }
