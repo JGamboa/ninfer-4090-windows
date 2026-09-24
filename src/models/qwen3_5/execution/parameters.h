@@ -59,6 +59,7 @@ struct BlockParameters {
 struct TextParameters {
     Weight token_embedding;
     LinearParameters output_head;
+    InputRotation output_head_rotation;
     Tensor final_norm;
     std::vector<BlockParameters> layers;
 };
@@ -78,6 +79,7 @@ struct MtpParameters {
     LinearParameters output;
     FfnParameters ffn;
     LinearParameters output_head;
+    InputRotation output_head_rotation;
 };
 
 struct NormParameters {
@@ -126,6 +128,7 @@ struct DraftParameters {
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
     LinearParameters output_head;
+    InputRotation output_head_rotation;
 };
 
 struct ProposalParameters {

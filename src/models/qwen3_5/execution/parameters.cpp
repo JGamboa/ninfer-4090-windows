@@ -166,7 +166,8 @@ public:
         out.key_norm    = tensor(a.key_norm);
         out.output      = linear(a.output);
         out.ffn         = ffn(w.layer);
-        out.output_head = linear(w.output_head_use);
+        out.output_head          = linear(w.output_head_use);
+        out.output_head_rotation = rotation(out.output_head.weight);
         return out;
     }
 
@@ -239,7 +240,8 @@ public:
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
         out.final_norm         = tensor(w.final_norm);
-        out.output_head        = linear(w.output_head_use);
+        out.output_head          = linear(w.output_head_use);
+        out.output_head_rotation = rotation(out.output_head.weight);
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
             out.layers.push_back(with_context(
@@ -285,6 +287,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
+    text.output_head_rotation = prepare.rotation(text.output_head.weight);
     text.final_norm      = prepare.tensor(w.text.final_norm);
     text.layers.reserve(w.text.layers.size());
     for (std::size_t i = 0; i < w.text.layers.size(); ++i) {

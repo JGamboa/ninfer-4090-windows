@@ -300,6 +300,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k,
                                                              p.policy, first, last));
     };
+    // execution::project_head: a rotated head input copy, then the head's own scratch.
+    const auto head_scratch = [&](WorkspaceLayoutBuilder& layout,
+                                  const execution::LinearParameters& p,
+                                  const execution::InputRotation& rotation, int first, int last) {
+        auto scope = layout.scope();
+        if (rotation) { matrix(layout, DType::BF16, p.weight.k, last); }
+        linear_scratch(layout, p, first, last);
+    };
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last) {
         scratch(layout, ops::linear_add_workspace_capacity_bytes(
@@ -360,7 +368,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last));
         }
         if (!plan.causal_scoring) {
-            linear_scratch(layout, parameters.text.output_head, first, last);
+            head_scratch(layout, parameters.text.output_head, parameters.text.output_head_rotation,
+                         first, last);
         }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
@@ -372,7 +381,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(layout, DType::BF16, dimension(parameters.proposal->rows), columns);
             linear_scratch(layout, parameters.proposal->head, columns, columns);
         } else {
-            linear_scratch(layout, parameters.mtp->output_head, columns, columns);
+            head_scratch(layout, parameters.mtp->output_head, parameters.mtp->output_head_rotation,
+                         columns, columns);
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -457,7 +467,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
-        linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        head_scratch(causal_score, parameters.text.output_head,
+                     parameters.text.output_head_rotation, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
     }
 
@@ -682,10 +693,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 } else {
                     matrix(layout, DType::BF16, dimension(config.vocab_size), drafts * batch);
                 }
-                const auto& head = plan.proposal_head == ProposalHead::Optimized
-                                       ? parameters.proposal->head
-                                       : parameters.draft->output_head;
-                linear_scratch(layout, head, drafts * batch, drafts * batch);
+                if (plan.proposal_head == ProposalHead::Optimized) {
+                    linear_scratch(layout, parameters.proposal->head, drafts * batch,
+                                   drafts * batch);
+                } else {
+                    head_scratch(layout, parameters.draft->output_head,
+                                 parameters.draft->output_head_rotation, drafts * batch,
+                                 drafts * batch);
+                }
                 return finish(layout);
             };
 

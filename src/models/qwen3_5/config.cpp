@@ -132,7 +132,7 @@ PrismHadamardConfig prism_hadamard(const Json& value) {
         "attention/query", "attention/key",  "attention/gate", "attention/value",
         "attention/output", "gdn/query",     "gdn/key",        "gdn/value",
         "gdn/z",            "gdn/output",    "mlp/gate",       "mlp/up",
-        "mlp/down"};
+        "mlp/down",         "output_head"};
     const auto& rotated = value.at("rotated_inputs");
     if (!rotated.is_array() || rotated.empty()) {
         throw ArtifactError("prism_hadamard: rotated_inputs must list projections");

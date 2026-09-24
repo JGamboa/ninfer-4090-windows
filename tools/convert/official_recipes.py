@@ -256,7 +256,7 @@ def _bonsai_mtp(model, recipe, reference: NInferArtifactStore) -> None:
 
 
 def bonsai2_27b(model, recipe, sources):
-    """Prism Ternary Bonsai 2: t2 layer projections, primal Q8 embedding/head, copied MTP.
+    """Prism Ternary Bonsai 2: t2 projections and output head, primal Q8 embedding, copied MTP.
 
     Sources: ``gguf`` (the PTQ1_0/PQ2_0 GGUF) and, with the ``mtp`` component, ``mtp``
     (an existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word).
@@ -277,8 +277,17 @@ def bonsai2_27b(model, recipe, sources):
         source = model.source(name, gguf)
         # The output head and --proposal read the primal-basis GGUF values.
         model.parameters[name] = replace(parameter, source=source)
-        if name in ("text/token_embedding", "text/output_head"):
+        if name == "text/token_embedding":
             recipe.assign(name, format=Q8, method=grouped_absmax, source=source)
+        elif name == "text/output_head":
+            # The rotated ternary head; the runtime rotates a copy of its input.
+            recipe.assign(
+                name,
+                format=TERNARY_FORMAT,
+                method=import_encoded,
+                source=model.source(name, gguf, TERNARY_FORMAT),
+            )
+            rotated.add("output_head")
         elif name.startswith("text/layers/") and name.endswith(_BONSAI_TERNARY):
             recipe.assign(
                 name,

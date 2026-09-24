@@ -243,6 +243,7 @@ private:
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
     const LinearParameters* lm_head_            = nullptr;
+    const InputRotation* lm_head_rotation_      = nullptr;
     const LinearParameters* proposal_head_      = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;

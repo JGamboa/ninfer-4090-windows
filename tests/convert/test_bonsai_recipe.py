@@ -95,11 +95,17 @@ def test_attention_and_mlp_parents_keep_the_bf16_path_row_assembly(converted):
     )
 
 
-def test_output_head_and_embedding_are_primal_q8(converted):
+def test_output_head_is_rotated_t2_and_embedding_is_primal_q8(converted):
     fixture, signs, _, out = converted
     h = hadamard(1024)
     with Artifact(out) as artifact:
-        for name, gguf in (("text/output_head", "output.weight"), ("text/token_embedding", "token_embd.weight")):
+        head = _parent(artifact, "text/output_head")
+        assert head.format == "t2_g128_fp16"
+        codes, scales = decode_ternary_words(artifact.read_object(head.id), head.shape)
+        stored_codes, stored_scales = fixture.ternary["output.weight"]
+        np.testing.assert_array_equal(unpack_ternary_codes(codes).numpy(), stored_codes)
+        np.testing.assert_array_equal(scales.numpy(), stored_scales)
+        for name, gguf in (("text/token_embedding", "token_embd.weight"),):
             obj = _parent(artifact, name)
             assert obj.format == "q8_g32_fp16"
             got = dequantize_row_split(
@@ -145,7 +151,7 @@ def test_gdn_vectors_norms_and_hadamard_metadata(converted):
     assert set(config["rotated_inputs"]) == {
         "attention/query", "attention/key", "attention/gate", "attention/value",
         "attention/output", "gdn/query", "gdn/key", "gdn/value", "gdn/z", "gdn/output",
-        "mlp/gate", "mlp/up", "mlp/down",
+        "mlp/gate", "mlp/up", "mlp/down", "output_head",
     }
 
 

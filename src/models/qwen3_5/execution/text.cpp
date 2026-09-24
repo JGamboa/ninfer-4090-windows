@@ -11,6 +11,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/argmax.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/hadamard.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -52,11 +53,6 @@
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
-
-void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
-             WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::linear(x, parameters.weight, out, parameters.policy, workspace, stream);
-}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -253,6 +249,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
     embed_      = &parameters_.text.token_embedding;
     final_norm_ = &parameters_.text.final_norm;
     lm_head_    = &parameters_.text.output_head;
+    lm_head_rotation_ = &parameters_.text.output_head_rotation;
     mtp_        = parameters_.mtp ? &*parameters_.mtp : nullptr;
     if (mtp_enabled() && mtp_ == nullptr) {
         throw std::invalid_argument("MTP state requires selected MTP parameters");
@@ -585,7 +582,8 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         }
     } else {
         Tensor output_logits = matrix_window(logits, T);
-        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        project_head(hidden, mtp_->output_head, mtp_->output_head_rotation, output_logits, work_,
+                     ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
     }
@@ -705,7 +703,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, *lm_head_, logits, work_, stream);
+        project_head(hidden, *lm_head_, *lm_head_rotation_, logits, work_, stream);
     }
     work_.reset();
 }
@@ -765,7 +763,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+        project_head(flat_hidden, *lm_head_, *lm_head_rotation_, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }
@@ -1274,7 +1272,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                project(last_xf, *lm_head_, logits, work_, s);
+                project_head(last_xf, *lm_head_, *lm_head_rotation_, logits, work_, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

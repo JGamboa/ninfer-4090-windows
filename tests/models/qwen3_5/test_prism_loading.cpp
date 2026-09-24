@@ -27,7 +27,7 @@ void valid(const std::filesystem::path& path) {
     artifact::Reader reader(path);
     const auto plan = qwen::plan_load(reader, {.speculative = SpeculativeBackend::Mtp});
     const auto& prism = plan.config().text.prism_hadamard;
-    require(prism && prism->rotated_inputs.size() == 13 && prism->signs.size() == 2,
+    require(prism && prism->rotated_inputs.size() == 14 && prism->signs.size() == 2,
             "prism_hadamard block was not parsed");
     const auto& signs = plan.weights().text.hadamard_signs;
     require(signs.size() == 2 && plan.parameter(signs.at(1024)).shape == artifact::Shape{1024} &&
@@ -39,9 +39,10 @@ void valid(const std::filesystem::path& path) {
     for (const auto id : {gdn.query, gdn.z, gdn.output, attention.gate, attention.output, mlp.down}) {
         require(format_of(plan, reader, id) == "t2_g128_fp16", "rotated projection is not t2");
     }
-    require(format_of(plan, reader, gdn.a_projection) == "bf16" &&
-                format_of(plan, reader, plan.weights().text.output_head) == "q8_g32_fp16",
-            "unrotated weights changed format");
+    require(format_of(plan, reader, plan.weights().text.output_head) == "t2_g128_fp16" &&
+                format_of(plan, reader, gdn.a_projection) == "bf16" &&
+                format_of(plan, reader, plan.weights().text.token_embedding) == "q8_g32_fp16",
+            "rotated head or unrotated weights changed format");
     require(plan.weights().mtp.has_value(), "copied MTP head was not bound");
 }
 

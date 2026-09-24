@@ -150,6 +150,8 @@ void validate_prism_hadamard(const Bindings& b, const TextConfig& config) {
         if (name.starts_with("text/layers/")) {
             const auto slash = name.find('/', std::string_view("text/layers/").size());
             role             = std::string_view(name).substr(slash + 1);
+        } else if (name == "text/output_head") {
+            role = "output_head";
         }
         const bool rotated = prism && !role.empty() && prism->rotated_inputs.contains(role);
         if (ternary != rotated) {

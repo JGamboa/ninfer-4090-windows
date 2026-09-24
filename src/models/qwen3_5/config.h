@@ -67,7 +67,8 @@ struct GdnConfig {
 struct PrismHadamardConfig {
     static constexpr std::uint32_t kBlockSize = 1024;
     std::map<std::uint64_t, std::string> signs; // input width -> BF16 sign-vector parameter
-    std::set<std::string, std::less<>> rotated_inputs; // e.g. "gdn/query", "mlp/down"
+    // Per-layer projections ("gdn/query", "mlp/down", ...) and "output_head" (text/output_head).
+    std::set<std::string, std::less<>> rotated_inputs;
 };
 
 struct DenseConfig {

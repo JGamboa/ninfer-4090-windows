@@ -533,8 +533,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
             Tensor logits = state.execution.work.alloc(
                 DType::BF16,
                 {dimension(target.vocab_size), static_cast<std::int32_t>(k) * batch_size});
-            project(proposal_hidden, state.execution.parameters.draft->output_head, logits,
-                    state.execution.work, state.execution.device.stream);
+            project_head(proposal_hidden, state.execution.parameters.draft->output_head,
+                         state.execution.parameters.draft->output_head_rotation, logits,
+                         state.execution.work, state.execution.device.stream);
             ops::argmax(logits, flat_drafts,
                         dimension(state.execution.parameters.model.resources().public_token_count),
                         state.execution.device.stream);

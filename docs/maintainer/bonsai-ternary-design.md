@@ -807,6 +807,14 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   at 530-580 GB/s), Q8 output head for verification ~1.6 ms, Hadamard ~0.6 ms, the rest in
   attention, GDN and the MTP layer.
 
+- (A+B) M5 head, 2026-09-24: `bonsai2_27b` stores `text/output_head` as the rotated GGUF `t2`
+  words (0.33 GB instead of 1.3 GB Q8) and lists `output_head` in `rotated_inputs`. The runtime
+  applies it through `execution::project_head`, which rotates a workspace copy of the head
+  input (the final hidden is also read in the primal basis by MTP and DFlash). Proposal heads
+  stay Q4 gathered from the primal values. Not supported: DFlash2 with the full (t2) head,
+  whose `linear_topk` admits Q8/FP8 only; use the optimized proposal head. The embedding
+  stays primal Q8 (a ternary gather with the inverse rotation remains open).
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
