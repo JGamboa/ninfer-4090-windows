@@ -1,4 +1,4 @@
-// Cold-weight timing of the Prism ternary projection and the Hadamard rotation at the Bonsai
+// Cold-weight timing (median of repeated runs after a clock warm-up) of the Prism ternary projection and the Hadamard rotation at the Bonsai
 // 2 27B shapes. Weight copies rotate so their total exceeds L2; the reported bandwidth is the
 // ternary weight bytes (codes + scales) read per call divided by the call time.
 #include "core/device.h"
@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -21,17 +22,33 @@ namespace {
 
 constexpr std::size_t kColdBytes = 512ull << 20; // well above the 72 MiB L2 of an RTX 4090
 constexpr int kIterations        = 40;
+constexpr int kRepeats           = 7; // report the median repeat
+
+double median(std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    return values[values.size() / 2];
+}
+
+// Run a timed body kRepeats times and return the median microseconds per iteration.
+template <class Body>
+double median_us(cudaEvent_t start, cudaEvent_t stop, Body&& body) {
+    std::vector<double> samples;
+    for (int repeat = 0; repeat < kRepeats; ++repeat) {
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < kIterations; ++i) body(i);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        samples.push_back(1000.0 * ms / kIterations);
+    }
+    return median(samples);
+}
 
 struct Shape {
     const char* role;
     int n, k;
 };
-
-float time_ms(cudaEvent_t start, cudaEvent_t stop) {
-    float ms = 0;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    return ms;
-}
 
 } // namespace
 
@@ -54,6 +71,14 @@ int main(int argc, char** argv) {
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    {
+        // Bring the GPU to steady clocks before the first measurement.
+        void* scratch = nullptr;
+        CUDA_CHECK(cudaMalloc(&scratch, kColdBytes));
+        for (int i = 0; i < 200; ++i) CUDA_CHECK(cudaMemsetAsync(scratch, i, kColdBytes));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(scratch));
+    }
     std::printf("%-12s %6s %6s %4s %10s %10s\n", "role", "N", "K", "T", "us/call", "GB/s");
     for (const auto& shape : shapes) {
         const std::array<std::uint64_t, 2> dims{std::uint64_t(shape.n), std::uint64_t(shape.k)};
@@ -83,13 +108,9 @@ int main(int argc, char** argv) {
             for (int c = 0; c < copies; ++c) {
                 ops::detail::t2_project(x, weights[c], outputs, false, nullptr);
             }
-            CUDA_CHECK(cudaEventRecord(start));
-            for (int i = 0; i < kIterations; ++i) {
+            const double us = median_us(start, stop, [&](int i) {
                 ops::detail::t2_project(x, weights[i % copies], outputs, false, nullptr);
-            }
-            CUDA_CHECK(cudaEventRecord(stop));
-            CUDA_CHECK(cudaEventSynchronize(stop));
-            const double us = 1000.0 * time_ms(start, stop) / kIterations;
+            });
             std::printf("%-12s %6d %6d %4d %10.1f %10.1f\n", shape.role, shape.n, shape.k, t, us,
                         double(geometry.bytes) / (us * 1e3));
             CUDA_CHECK(cudaFree(x_data));
@@ -109,12 +130,9 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemset(x_data, 0x3c, std::size_t(k) * t * 2));
             Tensor x(x_data, DType::BF16, {k, t});
             ops::hadamard_1024(x, signs, x, nullptr);
-            CUDA_CHECK(cudaEventRecord(start));
-            for (int i = 0; i < kIterations; ++i) ops::hadamard_1024(x, signs, x, nullptr);
-            CUDA_CHECK(cudaEventRecord(stop));
-            CUDA_CHECK(cudaEventSynchronize(stop));
-            std::printf("%-12s %6d %4d %10.1f\n", "", k, t,
-                        1000.0 * time_ms(start, stop) / kIterations);
+            const double us =
+                median_us(start, stop, [&](int) { ops::hadamard_1024(x, signs, x, nullptr); });
+            std::printf("%-12s %6d %4d %10.1f\n", "", k, t, us);
             CUDA_CHECK(cudaFree(x_data));
         }
         CUDA_CHECK(cudaFree(s_data));

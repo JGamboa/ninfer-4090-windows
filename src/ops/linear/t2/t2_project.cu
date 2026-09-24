@@ -54,15 +54,27 @@ __global__ void __launch_bounds__(kThreads)
         for (int t = 0; t < Tile; ++t) acc[r][t] = 0.0f;
     }
 
+    // Weights are read once: stream them past L1 so the reused x stays resident. The next
+    // slice's codes are requested before the current slice is computed.
+    uint2 next_bits[kRowsPerWarp];
+    __half next_scale[kRowsPerWarp];
+    const auto fetch = [&](int slice) {
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            next_bits[r]  = __ldcs(row_codes[r] + slice);
+            next_scale[r] = __ldcs(row_scales[r] + slice / 4);
+        }
+    };
+    if (lane < slices_per_row) fetch(lane);
     for (int slice = lane; slice < slices_per_row; slice += 32) {
         uint2 bits[kRowsPerWarp];
         float scale[kRowsPerWarp];
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
-            // Weights are read once: stream them past L1 so the reused x stays resident.
-            bits[r]  = __ldcs(row_codes[r] + slice);
-            scale[r] = __half2float(__ldcs(row_scales[r] + slice / 4));
+            bits[r]  = next_bits[r];
+            scale[r] = __half2float(next_scale[r]);
         }
+        if (slice + 32 < slices_per_row) fetch(slice + 32);
         const int column = slice * 32;
         float partial[kRowsPerWarp][Tile];
 #pragma unroll
