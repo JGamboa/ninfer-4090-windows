@@ -931,6 +931,58 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   frame rate roughly doubles the stalls per frame, so the cost follows the compositing work
   more than the frame count.
 
+- (C) Base-3 "t5" prototype (`bench/ops/t5_proto_bench.cu`, 2026-09-24, RTX 4090, display
+  60 Hz). Five trits per byte, 64 columns in 13 bytes (12 bytes of five trits + one of four):
+  1.625 bits per weight, 1.75 with the FP16 group scales, against t2's 2.125 (ideal time
+  ratio 0.824). A unit is half a scale group and two 32-column slices, so the stored slice sums
+  remove the code offset unchanged; K = 5120/6144/17408 give 80/96/272 units per row, a
+  multiple of 16, so a half-warp per row pair leaves no lane idle. Same codes, scales and int8
+  activation for both formats, weight copies beyond L2, GEMV only (quantization excluded),
+  median of 7 x 40 calls. Outputs match the production t2 GEMV to <= 2.2e-3 of the output norm
+  (BF16 rounding and summation order). Ratios t5/t2, T = 1 / 3 / 4, per shape (in_proj, qkvg,
+  gate+up, o_proj, down) and weighted by one MTP round's calls (48/16/64/64/64):
+
+  | Variant (CTA threads / rows per half-warp) | T = 1 | T = 3 | T = 4 |
+  |---|---|---|---|
+  | table: 243 x 10-bit codes in shared memory, t2 words reassembled (64/2) | 0.76-0.96 | 0.88-0.98, round 0.91 | 0.91-1.09 |
+  | table, 32/4 | 0.80-0.91 | 0.81-0.92, round 0.86 | 0.96-1.28 |
+  | table, 64/4 | 0.81-0.95 | 0.81-0.96, round 0.87 | 0.91-1.18 |
+  | table read from a precomputed global copy | = table | = table | = table |
+  | table x8 copies (lane & 7), 32-bit | 0.83-0.95 | 0.96-1.12 | 1.05-1.22 |
+  | table x32 copies (one per lane), 16-bit | 1.06-1.38 | 1.11-1.55 | 1.15-1.89 |
+  | diagnostic: conflict-free table index | 0.78-0.86 | 0.81-0.90, round 0.86 | 0.85-1.03 |
+  | diagnostic: no decode (bytes used as codes) | 0.73-0.98 | 0.76-0.84, round 0.80 | 0.75-0.97 |
+  | **arithmetic (TQ1_0), natural-order activation, 64/2** | **0.74-0.91, round 0.81** | **0.78-0.85, round 0.81** | **0.80-0.95, round 0.86** |
+  | arithmetic, 32/4 | 0.76-0.90 | 0.82-0.91, round 0.84 | 0.86-1.09 |
+  | arithmetic, 64/4 | 0.81-1.15 | 0.79-0.96, round 0.87 | 0.82-1.05 |
+
+  T = 8 (table 64/2 1.25-2.2, arithmetic 64/2 1.19-1.71) is slower than t2 even without
+  decode (1.14-1.8): with 64-column units and Tile 8 the kernel holds 32 activation `uint4`
+  per lane and runs out of dp4a issue. Reading: the table variants are limited by the MIO pipe
+  (13 table reads, 4 weight loads and ~10 activation loads per row and unit, twice t2's), with
+  bank conflicts about half of the excess at T = 3; replication costs more in addressing and
+  shared memory than it saves. The arithmetic variant stores q = ceil(v * 256 / 243) with
+  v = sum_m t_m 3^(4 - m); in unit bytes 4g..4g+3 (g = 0..2) trit m of byte j is column
+  20 g + 4 m + j, byte 12 holds columns 60..63. Even and odd bytes run in 16-bit lanes
+  (`x 3`, shift, mask), so each m yields one dp4a word of four codes against the activation in
+  natural column order: no table, no reassembly, no shift/mask extraction. It reaches the byte
+  ratio at T = 1 and 3 and stays below t2 on every shape through T = 4.
+
+  Arithmetic 64/2 against t2, median of three bench runs, us (ratio):
+
+  | Shape | T = 1 | T = 3 | T = 4 |
+  |---|---|---|---|
+  | gdn in_proj 16384 x 5120 | 27.6 -> 22.2 (0.80) | 27.5 -> 21.3 (0.78) | 28.1 -> 24.7 (0.88) |
+  | attn qkvg 14336 x 5120 | 24.0 -> 18.3 (0.76) | 24.2 -> 20.0 (0.83) | 24.9 -> 23.4 (0.94) |
+  | mlp gate+up 34816 x 5120 | 54.5 -> 42.4 (0.78) | 53.5 -> 42.2 (0.79) | 53.7 -> 46.3 (0.86) |
+  | o_proj 5120 x 6144 | 12.1 -> 11.1 (0.92) | 12.5 -> 11.2 (0.90) | 13.8 -> 12.2 (0.88) |
+  | mlp down 5120 x 17408 | 28.4 -> 24.7 (0.87) | 28.8 -> 23.8 (0.83) | 32.0 -> 26.3 (0.82) |
+  | MTP round (48/16/64/64/64 calls) | 0.82 | 0.81 | 0.86 |
+
+  o_proj (8.4 MB in t2) sits near the fixed launch-and-tail time of a ~12 us kernel: it saves
+  1.3 us per call against ~2.2 us for the byte ratio, 0.06 ms of a round.
+
+
 - (A+B+C) Ternary embedding. `bonsai2_27b` stores `text/token_embedding` as the GGUF's
   rotated `t2` words (0.33 GB instead of the 1.3 GB primal Q8 table) and sets
   `embedding_inverse: true`. A projection and the embedding share the algebra of the logical
@@ -978,16 +1030,46 @@ against the fork's 1363 and 77.1; quick perplexity overall 5.8545.
 
 Next steps, in order:
 
-1. Pending (2026-09-25): measure decode with the monitor cable on the iGPU (motherboard
-   output), lighthouse and Python prompts, and record it beside the 120 Hz and 60 Hz figures
-   in section 9, "Display preemption". Expected: the ~2.2-2.8 ms of compositor stalls per
-   round disappear (~+15-18 %). Until then the display runs at 60 Hz.
-2. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
-   quantization): 257 launches, ~0.75 ms per round, each with an oracle test and a bench.
-3. MTP layer (Q8, 1.3 ms per round) and Q4 proposal head (1.0 ms): measure acceptance with a
-   Q5/Q4 MTP layer before changing the recipe.
-4. Draft 3 wins on code and math and loses on low-acceptance prose; revisit once the T = 4
-   round is cheaper.
+1. MTP layer (Q8, 1.3 ms per round) and Q4 proposal head (1.0 ms), both at ~935 GB/s-1 TB/s:
+   measure six-prompt acceptance with a Q5 and a Q4 MTP layer before changing the recipe.
+2. Replace t2 with the arithmetic base-3 format `t5_g128_fp16` (approved 2026-09-24; section 9,
+   "Base-3 t5 prototype": GEMV round ratio 0.81 at T = 1 and 3, 0.86 at T = 4, every shape
+   faster than t2 through T = 4). Expected ~+12-13 % decode and ~1.2 GB less weight memory
+   (~6.2 GiB with MTP). Exact, so perplexity must equal t2's up to accumulation rounding.
+   t2 is removed (every Bonsai artifact is reconverted); no parallel format.
+
+   Layout (the prototype's `t5a` packing in `bench/ops/t5_proto_bench.cu`):
+   - Codes c = w + 1 in {0, 1, 2} for weight w in {-1, 0, +1} (t2's convention), in the
+     rotated basis with `Weight::input_signs` as today.
+   - A row is K / 64 units of 13 bytes, units in column order; row stride 13 K / 64 bytes
+     (a multiple of 208 since K % 1024 == 0). Fused projections keep their rows in one parent.
+   - Unit u covers columns 64u .. 64u + 63. Byte i < 12, with g = i / 4 and j = i % 4, holds
+     the five trits t_m = c[64u + 20g + 4m + j], m = 0..4. Byte 12 holds t_m = c[64u + 60 + m]
+     for m = 0..3 and t_4 = 0.
+   - Byte value q = ceil(256 v / 243) = (256 v + 242) / 243 with v = sum_m t_m 3^(4 - m)
+     (t_0 most significant). Decode: r = q; for m = 0..4: r = 3 r, t_m = r >> 8, r = r & 255.
+   - Scales: FP16 [N][K / 128], one per 128 columns (two units), in a region after the codes
+     as in t2's geometry.
+   - Activation for the A8 kernels: int8 in natural column order, one FP32 scale per 128
+     columns and the per-32-column slice sums (unit u subtracts slices 2u and 2u + 1).
+   - t5 requires `AllowA8`; there is no A16 route.
+
+   Split: the other session registers the format (Python and C++ geometry, QType/QuantLayout),
+   writes the converter from PTQ1_0 with the exact GGUF trits (PQ2_0 repacked), the recipe and
+   their tests. This session writes the production kernels with FP64 oracles and benches:
+   A8 GEMV for T = 1..4 (prototype 64/2), the prefill GEMM decoding t5 while filling shared
+   memory (qualified at T = 512 against pp512 2648 tok/s), the T = 5..8 route (Tile-8 GEMV
+   or the GEMM, whichever is less slow; Tile-8 GEMV is 1.2-1.7x t2 today) and the embedding
+   gather.
+3. Measure decode with the monitor cable on the iGPU (motherboard output), lighthouse and
+   Python prompts, beside the 120 Hz and 60 Hz figures in section 9, "Display preemption".
+   Expected: the ~2.2-2.8 ms of compositor stalls per round disappear. Until then the display
+   runs at 60 Hz.
+4. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit once the
+   T = 4 round is cheaper (t5 makes it 0.86 of t2), or with an adaptive window.
+5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
+   quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
+   Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).
 
 ## Appendix: sources
 
