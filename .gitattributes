@@ -2,3 +2,5 @@
 # default whitespace checks.
 /third_party/spdlog/include/** -whitespace
 /third_party/spdlog/src/** -whitespace
+# The monitor page is embedded byte for byte (src/serve/CMakeLists.txt); keep LF on every platform.
+/src/serve/monitor_page.html text eol=lf
