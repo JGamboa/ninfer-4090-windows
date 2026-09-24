@@ -799,6 +799,14 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   corpus, within 1 %) still needs a fork run. Hybrid routing (GEMV to T=4, tensor cores from
   T=5, commit `d92397e`): prefill 419 tok/s, MTP decode ~92-95 tok/s.
 
+- (C) Prefill GEMM, 2026-09-24, RTX 4090, commit `59570ed` (64 x 64 tensor-core tiles for
+  T >= 17): gdn in_proj 94 us at T=64 (390 us with 8-token MMA tiles) and 725 us at T=512
+  (~118 TFLOPS effective); end-to-end prefill 915 tok/s (419 before, ~240 with the GEMV only);
+  MTP decode unchanged at ~92 tok/s. Current t2 routing: GEMV T <= 4, 8-token MMA T = 5..16,
+  64-token GEMM T >= 17. Remaining decode round (~19 ms at T=3): t2 projections ~11 ms (GEMV
+  at 530-580 GB/s), Q8 output head for verification ~1.6 ms, Hadamard ~0.6 ms, the rest in
+  attention, GDN and the MTP layer.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
