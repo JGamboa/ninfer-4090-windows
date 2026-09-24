@@ -13,7 +13,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 ROOT = Path(__file__).resolve().parents[2]
 RENDERER = ROOT / "build" / "tests" / "ninfer_jinja_test"
 SOURCES = {
-    version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text()
+    version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text(encoding="utf-8")
     for version in ("qwen3_6", "qwen3_8")
 }
 
@@ -255,6 +255,7 @@ class ChatTemplates(unittest.TestCase):
         result = subprocess.run(
             [str(RENDERER), "--render"],
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=True,
             input="".join(
