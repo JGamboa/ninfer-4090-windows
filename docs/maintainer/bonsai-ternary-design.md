@@ -1182,6 +1182,27 @@ Next steps, in order:
    `ldmatrix`-friendly word layout (fewer MIO instructions), fewer registers for a fourth CTA
    per SM, a 128-token tile (half the decode and L2 activation re-reads per token), and the
    epilogue's output index resolved without local memory.
+
+   `794c216` (ldmatrix A fragments, a 128-token GEMM tile beyond 64 tokens, output index by
+   unrolled selects), validated 2026-09-24 on the RTX 4090 at 60 Hz: `ninfer_linear_t5_test`
+   passes (new T = 72 four-output and K = 17408 residual cases); quick perplexity identical
+   (5.855606; scoring 1193 -> 1617 tok/s); MTP decode on the six prompts gives identical text
+   and acceptance, 146.4 / 187.0 / 179.4 / 144.7 / 164.8 / 176.4 tok/s (mean 166.5 against
+   161.0 before, the GEMV epilogue lost its local memory). `ninfer_bench -p 512,2048 -r 3`:
+   pp512 2570 -> 3061 tok/s (+19 %), pp2048 2582 -> 3349 (+30 %), above t2's 2800 and 2.25x
+   the fork. `ninfer_t5_bench`, rotated route, us before -> after (binaries run back to back):
+
+   | Shape | T = 128 | T = 512 | T = 2048 |
+   |---|---|---|---|
+   | gdn in_proj 16384 x 5120 | 164.9 -> 114.6 | 594.7 -> 477.9 | 2403 -> 1810 |
+   | attn qkvg 14336 x 5120 | 155.7 -> 108.7 | 535.3 -> 402.7 | 2120 -> 1560 |
+   | mlp gate+up 34816 x 5120 | 367.1 -> 288.4 | 1414 -> 996 | 5230 -> 3762 |
+   | o_proj 5120 x 6144 | 78.1 -> 89.3 (+14 %) | 197.7 -> 208.4 (+5 %) | 794.3 -> 677.2 |
+   | mlp down 5120 x 17408 | 244.3 -> 238.1 | 616.1 -> 587.9 | 2628 -> 1985 |
+
+   Only o_proj shows the wave tail of the 128-token tile (80 CTAs at T = 128, 320 for 256
+   slots at T = 512; unrotated A8 +20 % and +19 %); down, with a long K per CTA, gains at every
+   T. That favors choosing the tile by wave fill over split-K for the 5120-row shapes.
 5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
    quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
    Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).
