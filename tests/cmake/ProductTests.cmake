@@ -6,9 +6,12 @@ ninfer_add_test(ninfer_prompt_input_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prompt_input.cpp"
   LIBRARIES ninfer_product_prompt_input)
 
-ninfer_add_test(ninfer_pretty_logging_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_pretty_logging.cpp"
-  LIBRARIES ninfer_product_logging)
+# Captures stderr through POSIX pipe/dup2.
+if(NOT WIN32)
+  ninfer_add_test(ninfer_pretty_logging_test
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_pretty_logging.cpp"
+    LIBRARIES ninfer_product_logging)
+endif()
 
 ninfer_add_test(ninfer_perplexity_evaluation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_perplexity_evaluation.cpp"
