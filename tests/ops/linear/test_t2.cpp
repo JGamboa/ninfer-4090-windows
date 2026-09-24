@@ -274,9 +274,10 @@ int main() {
         // A8: dp4a GEMV at every token template (with a partial row block and a row view), the
         // int8 MMA GEMM with partial 64-token tiles, graph replay, and the residual add.
         constexpr auto a8 = ops::LinearPolicy::AllowA8;
-        const Ternary small(300, 3072, 15u);
+        // An odd row count leaves a partial row block and a warp with one live row.
+        const Ternary small(301, 3072, 15u);
         for (std::int32_t t : {1, 2, 3, 4, 5, 8, 9}) {
-            failures += linear_case(small, 0, 300, t, t == 3, a8);
+            failures += linear_case(small, 0, 301, t, t == 3, a8);
         }
         failures += linear_case(small, 44, 200, 6, false, a8);
         const Ternary gemm(448, 2048, 18u);

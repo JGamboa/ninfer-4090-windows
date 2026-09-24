@@ -148,8 +148,12 @@ __global__ void __launch_bounds__(kRotateThreads)
 // rows, a lane one 32-code slice per step (1024 columns per warp step), weights streamed once.
 // Per slice and row: eight shift/mask code extractions shared by all tokens, then one dp4a per
 // four weights and token.
+//
+// Two warps (four rows) per CTA: at N = 5120 the 1280 small CTAs fill the 4090 in whole waves
+// where 320 eight-warp CTAs left a mostly idle second wave (RTX 4090, ninfer_t2_bench: o_proj
+// 17.2 -> 14.8 us and mlp down 36.0 -> 31.1 us at T = 3; no shape slower).
 
-constexpr int kGemvThreads     = 256;
+constexpr int kGemvThreads     = 64;
 constexpr int kGemvWarps       = kGemvThreads / 32;
 constexpr int kGemvRowsPerWarp = 2;
 
@@ -166,13 +170,17 @@ __global__ void __launch_bounds__(kGemvThreads)
     const int live   = min(Tile, tokens - token0);
     const int row0   = (static_cast<int>(blockIdx.x) * kGemvWarps + warp) * R;
     if (row0 >= n) return;
-    const bool pair           = row0 + 1 < n;
-    const int slices_per_row  = k / 32;
-    const int groups_per_row  = k / 128;
-    const uint2* row_codes[2] = {codes + std::int64_t(row0) * slices_per_row,
-                                 codes + std::int64_t(pair ? row0 + 1 : row0) * slices_per_row};
-    const __half* row_scales[2] = {scales + std::int64_t(row0) * scale_row_halves,
-                                   scales + std::int64_t(pair ? row0 + 1 : row0) * scale_row_halves};
+    const int slices_per_row = k / 32;
+    const int groups_per_row = k / 128;
+    // Rows past n alias the last row; their results are never stored.
+    const uint2* row_codes[R];
+    const __half* row_scales[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const std::int64_t row = min(row0 + r, n - 1);
+        row_codes[r]           = codes + row * slices_per_row;
+        row_scales[r]          = scales + row * scale_row_halves;
+    }
 
     float acc[R][Tile];
 #pragma unroll
