@@ -913,12 +913,33 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   121 -> ~86. End to end (two runs each, draft 2): lighthouse 110.8 -> 116.3 tok/s, Python
   158.2 -> 165.3, train 149.2 -> 157.7 (+5 %). In the round profile the t2 GEMV falls from
   10.8 to 9.9 ms and the round from 15.9 to 15.1 ms; N = 5120 projections 29.2 -> 24.1 us. The
-  t2 head is 40 us slower with small CTAs (475 us). In the round gate+up still takes 66.6 us
-  against 57.5 us in the bench (~0.6 ms per round, cause open).
+  t2 head is 40 us slower with small CTAs (475 us).
+
+- (C) Display preemption. The in-round excess over `ninfer_t2_bench` (gate+up mean 66.6 us
+  against 51.7 us) is not in the kernels: per-kernel medians match the bench under the same
+  nsys tracing (gate+up 53.9 vs 51.7 us, gdn in_proj 27.0 vs 26.1, qkvg 23.8 vs 23.1). About
+  six kernels per round are stretched by a median 286 us (p90 1.05 ms), ~2.8 ms of a ~15 ms
+  round, across every kernel type; round wall p10 13.6 ms, median 14.8, p90 17.2. The stall
+  times phase-lock at 8.334 ms (119.99 Hz, concentration 0.51; 60 and 144 Hz 0.02): the 4090
+  also composites the 3840x2160 120 Hz desktop under WDDM, and every frame preempts CUDA.
+  Unprofiled rounds (1.73 tokens at 116.3 tok/s = 14.9 ms) carry the same cost. The remedy is
+  outside NInfer: drive the display from the i9-13900K iGPU, or lower its refresh rate.
+
+  At 60 Hz (still 3840x2160): lighthouse 116.3 -> 122.0 tok/s, Python 165.3 -> 173.2 (two runs
+  each, same acceptance); stalls now lock to 59.99 Hz, ~450 per second against ~490 at 120 Hz,
+  2.2 ms per round (15 %) against 2.8 ms (18.5 %); round median 14.8 -> 14.0 ms. Halving the
+  frame rate roughly doubles the stalls per frame, so the cost follows the compositing work
+  more than the frame count.
 
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also
   drives a 3840x2160 120 Hz desktop), PCIe 4.0 x16, Core i9-13900K, CUDA 13.4.
+
+  Measuring on this machine: the desktop compositor preempts CUDA every display frame (see
+  "Display preemption"), 2.8 ms of a ~15 ms MTP round at 120 Hz and 2.2 ms at 60 Hz. Drive the
+  display from the iGPU for decode numbers; otherwise use 60 Hz, keep animated windows still
+  during the run, and state the display setting next to every tok/s figure. Earlier figures in
+  this section were taken at 120 Hz.
 
 ### 9.1 Current state and next steps (living; update in place)
 
@@ -932,10 +953,10 @@ against the fork's 1363 and 77.1; quick perplexity overall 5.8545.
 
 Next steps, in order:
 
-1. Why gate+up runs ~9 us slower inside the round than in `ninfer_t2_bench` (66.6 vs 57.5 us,
-   ~0.6 ms per round): compare the artifact's gate/up parent layout and the round's DRAM
-   neighbours with the bench, then try staging the activation in shared memory and 16-byte
-   weight loads with a deeper prefetch (the remaining GEMV headroom is ~750-830 -> ~900 GB/s).
+1. Pending (2026-09-25): measure decode with the monitor cable on the iGPU (motherboard
+   output), lighthouse and Python prompts, and record it beside the 120 Hz and 60 Hz figures
+   in section 9, "Display preemption". Expected: the ~2.2-2.8 ms of compositor stalls per
+   round disappear (~+15-18 %). Until then the display runs at 60 Hz.
 2. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
    quantization): 257 launches, ~0.75 ms per round, each with an oracle test and a bench.
 3. MTP layer (Q8, 1.3 ms per round) and Q4 proposal head (1.0 ms): measure acceptance with a
