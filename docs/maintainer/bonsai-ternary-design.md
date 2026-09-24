@@ -783,6 +783,22 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   acceptance is below Qwen3.8's because the copied BF16 head was trained on the unquantized
   model; two drafts beat three.
 
+- (A+B+C) Perplexity, 2026-09-24, RTX 4090, `ninfer-perplexity --corpus
+  eval/corpora/perplexity-1m/manifest.json --quick --kv-dtype bf16` (context 4096, stride 2048):
+
+  | domain | Qwen3.8-27B Q4/Q5 (15.9 GiB) | Bonsai 2 27B t2 (8.58 GiB) |
+  |---|---|---|
+  | english_reference | 6.443 | 8.082 (+25 %) |
+  | english_long_form | 7.180 | 9.285 (+29 %) |
+  | chinese_reference | 6.800 | 8.181 (+20 %) |
+  | ninfer_code | 1.674 | 1.894 (+13 %) |
+  | overall | 4.801 | 5.853 (+22 %) |
+
+  The first windows agree to three or four digits between the GEMV route and the tensor-core
+  route (8.8295 / 8.8298, 8.2687 / 8.2741). The M4 criterion against the PrismML fork (same
+  corpus, within 1 %) still needs a fork run. Hybrid routing (GEMV to T=4, tensor cores from
+  T=5, commit `d92397e`): prefill 419 tok/s, MTP decode ~92-95 tok/s.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
