@@ -195,6 +195,14 @@ int main() {
         for (std::int32_t t : {4, 5, 8, 9, 17, 40}) failures += linear_case(tiled, 0, 320, t, t == 17);
         failures += linear_case(tiled, 32, 256, 7, false);
     }
+    {
+        // Rows a multiple of 64 take the prefill GEMM for T >= 17: one and several 64-token
+        // tiles, partial tiles, a row view starting at a 64-row boundary, and the residual add.
+        const Ternary gemm(448, 2048, 8u);
+        for (std::int32_t t : {17, 64, 65, 130}) failures += linear_case(gemm, 0, 448, t, t == 65);
+        failures += linear_case(gemm, 64, 320, 40, false);
+        failures += linear_add_case(gemm, 70);
+    }
     // Bonsai decode shapes (N, K) at decode and MTP-verify widths.
     for (const auto [n, k] : std::array<std::pair<int, int>, 3>{{{5120, 6144}, {5120, 17408}, {16384, 5120}}}) {
         const Ternary w(n, k, 1000u + n + k);

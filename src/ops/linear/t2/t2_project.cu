@@ -1,6 +1,7 @@
 #include "ops/linear/t2/t2_project.h"
 
 #include "core/device.h"
+#include "ops/linear/t2/t2_gemm.cuh"
 #include "ops/linear/t2/t2_mma.cuh"
 
 #include <cuda_bf16.h>
@@ -210,6 +211,22 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     }
     if (end != w.n) {
         throw std::invalid_argument("t2_project: output rows must cover the weight rows");
+    }
+    if (tokens >= 17 && w.n % t2_gemm::kRows == 0) {
+        // Prefill: 64-token tiles read the weights once per 64 tokens.
+        t2_gemm::Outputs gemm_outputs{};
+        for (int i = 0; i < kMaxOutputs; ++i) {
+            gemm_outputs.data[i] = packed.data[i];
+            gemm_outputs.end[i]  = packed.end[i];
+        }
+        const dim3 grid(static_cast<unsigned>(w.n / t2_gemm::kRows),
+                        static_cast<unsigned>((tokens + t2_gemm::kTokens - 1) / t2_gemm::kTokens));
+        t2_gemm::t2_gemm_kernel<<<grid, t2_gemm::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, gemm_outputs,
+            accumulate);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     if (tokens >= 5 && w.n % t2_mma::kRows == 0) {
         // Measured on the RTX 4090: the GEMV wins up to T = 4 (MTP verification), the tensor
