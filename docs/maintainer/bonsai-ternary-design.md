@@ -833,6 +833,18 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   and the t2 head `AllowA8`, so this route needs a reconversion; A16Only artifacts keep the
   BF16 routes. `ninfer_t2_bench` reports both paths per shape and T.
 
+  Measured 2026-09-24 on the RTX 4090 (commit `386b00e`, `ninfer_linear_t2_test` passes both
+  paths). `ninfer_t2_bench`, A16 -> A8 us: mlp gate+up T=3 75.6 -> 58.7, T=4 104.7 -> 60.3,
+  T=512 1532 -> 1168; mlp down T=3 44.5 -> 35.7, T=512 811 -> 511; gdn in_proj T=3 39.8 ->
+  32.8; T=1 and T=8 unchanged (the GEMV now runs at 650-800 GB/s at T=3..4). End to end with
+  the reconverted `AllowA8` artifact: MTP decode (draft 2, `--lm-head-draft`) 92.6 -> 99.5
+  tok/s (18.4 ms per round, 41.4 % acceptance); quick perplexity 8.0827 / 9.2857 / 8.1834 /
+  1.8944, overall 5.8543 (A16 5.8535, +0.01 %), scored at 1060 tok/s.
+
+- Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
+  processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also
+  drives a 3840x2160 120 Hz desktop), PCIe 4.0 x16, Core i9-13900K, CUDA 13.4.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
