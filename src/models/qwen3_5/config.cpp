@@ -109,10 +109,11 @@ PrismHadamardConfig prism_hadamard(const Json& value) {
         value.at("block_size") != PrismHadamardConfig::kBlockSize) {
         throw ArtifactError("prism_hadamard: unsupported version, transform, sign mode or block");
     }
-    if (value.at("embedding_inverse") != false) {
-        throw ArtifactError("prism_hadamard: a rotated token embedding is not implemented");
+    if (!value.at("embedding_inverse").is_boolean()) {
+        throw ArtifactError("prism_hadamard: embedding_inverse must be boolean");
     }
     PrismHadamardConfig out;
+    out.embedding_inverse = value.at("embedding_inverse").get<bool>();
     const auto& widths = value.at("sign_widths");
     const auto& signs  = value.at("signs");
     if (!widths.is_array() || widths.empty() || !signs.is_object() ||

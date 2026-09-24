@@ -35,6 +35,11 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
 std::size_t t2_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
                                         std::int32_t max_tokens);
 
+// Embedding gather from a T2_G128_FP16 table [vocab, K]: out[:, t] = row ids[t] of the logical
+// table, i.e. the decoded stored row z' or, with table.input_signs, S (H_1024 z') / 32 per
+// 1024-column block (the W' H S algebra of a rotated projection). ids I32 [T], out BF16 [K, T].
+void t2_embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
+
 // Throws unless w is a resident T2_G128_FP16 TernaryRowK128 view with K % 1024 == 0.
 void validate_t2_weight(const Weight& w, const char* op);
 

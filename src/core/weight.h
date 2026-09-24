@@ -50,8 +50,9 @@ struct Weight {
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
     // T2_G128_FP16 only: BF16 +-1 [k] Prism sign vector of a weight stored in the rotated basis.
-    // The logical weight is W' H S: the projection multiplies W' by the 1024-block normalized
-    // Walsh-Hadamard rotation (1/32) H (signs * x) of its input (ninfer/ops/hadamard.h).
+    // The logical weight is W' H S: a projection multiplies W' by the 1024-block normalized
+    // Walsh-Hadamard rotation (1/32) H (signs * x) of its input (ninfer/ops/hadamard.h); an
+    // embedding table's logical row is signs * (1/32) H z' of its stored row z'.
     const void* input_signs = nullptr;
 };
 

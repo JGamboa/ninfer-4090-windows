@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/embedding.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ops/op_tester.h"
@@ -229,6 +230,41 @@ int attention_case(const Ternary& w, std::int32_t t,
     return failures;
 }
 
+// Embedding gather: the logical row ids[t] of the table, i.e. the decoded stored row or, for a
+// rotated table, signs * H(z') / 32 per 1024-column block (FP64 Sylvester oracle).
+int embedding_case(const Ternary& w, const std::vector<std::int32_t>& ids) {
+    // A row of the logical table W' H S is (z' H) S: the signs follow the butterfly.
+    const auto t = static_cast<std::int32_t>(ids.size());
+    std::vector<double> expected(std::size_t(w.k) * t);
+    for (std::int32_t token = 0; token < t; ++token) {
+        for (std::int32_t block = 0; block < w.k; block += 1024) {
+            for (int r = 0; r < 1024; ++r) {
+                double value = w.weight(ids[token], block + r);
+                if (!w.signs.empty()) {
+                    double sum = 0;
+                    for (int c = 0; c < 1024; ++c) {
+                        const double term = w.weight(ids[token], block + c);
+                        sum += std::popcount(unsigned(r & c)) & 1 ? -term : term;
+                    }
+                    value = sum / 32.0 * w.signs[block + r];
+                }
+                expected[std::size_t(token) * w.k + block + r] = value;
+            }
+        }
+    }
+    DeviceBuffer device_ids(ids.size() * 4);
+    device_ids.copy_from_host(ids.data(), ids.size() * 4);
+    GuardedDeviceBuffer out(std::size_t(w.k) * t * 2);
+    Tensor tids(device_ids.p, DType::I32, {t});
+    Tensor tout(out.data(), DType::BF16, {w.k, t});
+    ops::embedding(tids, w.rows(0, w.n), tout, nullptr);
+    cuda_synchronize();
+    const std::string label = std::string("t2 embedding") + (w.signs.empty() ? "" : " rotated") +
+                              " T=" + std::to_string(t);
+    return verify_reduction(label, from_device_bf16(out.data(), expected.size()), expected, kA16) +
+           out.verify_guards(label.c_str());
+}
+
 } // namespace
 
 int main() {
@@ -308,6 +344,15 @@ int main() {
         attention.rotate(24u);
         failures += attention_case(attention, 3, a8);
         failures += attention_case(attention, 2, a16);
+    }
+    {
+        // Embedding tables: first, last and repeated ids; plain and rotated.
+        Ternary table(301, 3072, 31u);
+        const std::vector<std::int32_t> ids{0, 300, 7, 7, 150};
+        failures += embedding_case(table, ids);
+        table.rotate(32u);
+        failures += embedding_case(table, ids);
+        failures += embedding_case(table, {42});
     }
     std::cout << (failures ? "FAIL" : "OK") << " t2 A16/A8\n";
     return failures ? 1 : 0;

@@ -29,10 +29,15 @@ def down_not_ternary(model, recipe, sources):
     recipe.assign("text/layers/*/mlp/down", format="q8_g32_fp16", method="grouped_absmax")
 
 
+def embedding_not_ternary(model, recipe, sources):
+    recipe.assign("text/token_embedding", format="q8_g32_fp16", method="grouped_absmax")
+
+
 CASES = (
-    ("without_prism_block", "is not a prism_hadamard rotated input"),
+    ("without_prism_block", "is not a prism_hadamard rotated weight"),
     ("without_down_rotation", "mlp/down: t2_g128_fp16 weight is not a prism_hadamard"),
-    ("down_not_ternary", "lists this input but it is not t2_g128_fp16"),
+    ("down_not_ternary", "lists this weight but it is not t2_g128_fp16"),
+    ("embedding_not_ternary", "token_embedding: prism_hadamard lists this weight"),
 )
 
 

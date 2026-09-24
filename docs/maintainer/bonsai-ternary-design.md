@@ -260,8 +260,8 @@ keys; `rotated_inputs` lists the per-layer parameter suffixes stored as `t2_g128
 }
 ```
 
-`embedding_inverse` is `false` in v1 because the converter un-rotates the embedding offline
-(section 2.2). Startup (agent B) must refuse an artifact whose `rotated_inputs` list does not match
+`embedding_inverse` was `false` in v1 (the converter un-rotated the embedding offline, section
+2.2); `bonsai2_27b` now stores the rotated `t2` table and sets it `true` (section 9). Startup (agent B) must refuse an artifact whose `rotated_inputs` list does not match
 the set of `t2_g128_fp16` tensors the model binds, and must refuse `t2` tensors without this block.
 
 ### 2.1 Which tensors are `t2_g128_fp16`
@@ -281,7 +281,7 @@ single-parent form that NVFP4/FP8 use, so every fused projection is one object:
 | `mlp/gate`, `mlp/up` | gate 17408, up 17408 | 34816 × 5120 | `ffn_gate`, `ffn_up` |
 | `mlp/down` | — | 5120 × 17408 | `ffn_down` |
 | `text/output_head` | — | 248320 × 5120 | `output` (v1: dequantized, folded, `q8_g32_fp16`; M5: `t2`) |
-| `text/token_embedding` | — | 248320 × 5120 | `token_embd` (v1: dequantized, un-rotated, `q8_g32_fp16`) |
+| `text/token_embedding` | — | 248320 × 5120 | `token_embd` (v1: dequantized, un-rotated, `q8_g32_fp16`; now `t2` with `embedding_inverse`) |
 
 Row-level fusion for `t2` is a plain row concatenation of `codes` and `scales`, so the converter
 reuses the existing parameter registration (`qwen3_5.py` `attention`/`gdn`/`dense` builders) and
@@ -915,6 +915,17 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   10.8 to 9.9 ms and the round from 15.9 to 15.1 ms; N = 5120 projections 29.2 -> 24.1 us. The
   t2 head is 40 us slower with small CTAs (475 us). In the round gate+up still takes 66.6 us
   against 57.5 us in the bench (~0.6 ms per round, cause open).
+
+- (A+B+C) Ternary embedding. `bonsai2_27b` stores `text/token_embedding` as the GGUF's
+  rotated `t2` words (0.33 GB instead of the 1.3 GB primal Q8 table) and sets
+  `embedding_inverse: true`. A projection and the embedding share the algebra of the logical
+  matrix `W' H S`: `Parameters` attaches the width-5120 signs to the table
+  (`Weight::input_signs`), and `ops::embedding` routes T2 to `t2_embedding` (one CTA per
+  1024 columns and token: decode, FP32 shared-memory butterfly, `* signs / 32`, one BF16
+  rounding), the same `signs * H(z')` the converter's `unrotate_rows` used for the Q8 table.
+  The loader requires `embedding_inverse` exactly when the table is `t2`. Oracle:
+  `ninfer_linear_t2_test` (explicit FP64 Sylvester matrix, signs after the butterfly).
+  Requires reconversion; MTP and DFlash read the same table through `ops::embedding`.
 
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also

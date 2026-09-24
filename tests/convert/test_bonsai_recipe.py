@@ -12,13 +12,12 @@ import numpy as np
 import pytest
 import torch
 
-from tools.artifact.codecs.row_split import dequantize_row_split
 from tools.artifact.codecs.ternary import decode_ternary_words, unpack_ternary_codes
 from tools.artifact.reader import Artifact
 from tools.convert.sources.ninfer_artifact import NInferArtifactStore
 
 from .bonsai_fixtures import (
-    CONV, DV, H, HEAD_DIM, HEADS, INTER, KG, NK, NV, REP, VG, convert_bonsai, hadamard,
+    CONV, DV, H, HEAD_DIM, HEADS, INTER, KG, NK, NV, REP, VG, convert_bonsai,
 )
 
 def _grouped_to_tiled(j):
@@ -95,27 +94,16 @@ def test_attention_and_mlp_parents_keep_the_bf16_path_row_assembly(converted):
     )
 
 
-def test_output_head_is_rotated_t2_and_embedding_is_primal_q8(converted):
-    fixture, signs, _, out = converted
-    h = hadamard(1024)
+def test_output_head_and_embedding_keep_the_rotated_t2_words(converted):
+    fixture, _, _, out = converted
     with Artifact(out) as artifact:
-        head = _parent(artifact, "text/output_head")
-        assert head.format == "t2_g128_fp16"
-        codes, scales = decode_ternary_words(artifact.read_object(head.id), head.shape)
-        stored_codes, stored_scales = fixture.ternary["output.weight"]
-        np.testing.assert_array_equal(unpack_ternary_codes(codes).numpy(), stored_codes)
-        np.testing.assert_array_equal(scales.numpy(), stored_scales)
-        for name, gguf in (("text/token_embedding", "token_embd.weight"),):
+        for name, gguf in (("text/output_head", "output.weight"), ("text/token_embedding", "token_embd.weight")):
             obj = _parent(artifact, name)
-            assert obj.format == "q8_g32_fp16"
-            got = dequantize_row_split(
-                artifact.read_object(obj.id), obj.format, obj.shape, dtype=torch.float32
-            ).numpy()
-            codes, scales = fixture.ternary[gguf]
-            rotated = (codes.astype(np.float64) - 1) * np.repeat(scales.astype(np.float64), 128, axis=1)
-            primal = (rotated @ h) * signs[H][None, :].astype(np.float64)
-            error = np.linalg.norm(got - primal) / np.linalg.norm(primal)
-            assert error < 1e-2, (name, error)
+            assert obj.format == "t2_g128_fp16", name
+            codes, scales = decode_ternary_words(artifact.read_object(obj.id), obj.shape)
+            stored_codes, stored_scales = fixture.ternary[gguf]
+            np.testing.assert_array_equal(unpack_ternary_codes(codes).numpy(), stored_codes)
+            np.testing.assert_array_equal(scales.numpy(), stored_scales)
 
 
 def test_gdn_vectors_norms_and_hadamard_metadata(converted):
@@ -148,6 +136,7 @@ def test_gdn_vectors_norms_and_hadamard_metadata(converted):
         config = store.directory.components["text"]["config"]["prism_hadamard"]
     assert config["block_size"] == 1024 and config["sign_widths"] == [H, INTER]
     assert config["signs"] == {str(w): f"text/hadamard/signs_{w}" for w in (H, INTER)}
+    assert config["embedding_inverse"] is True
     assert set(config["rotated_inputs"]) == {
         "attention/query", "attention/key", "attention/gate", "attention/value",
         "attention/output", "gdn/query", "gdn/key", "gdn/value", "gdn/z", "gdn/output",

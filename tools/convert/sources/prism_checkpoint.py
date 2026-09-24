@@ -9,8 +9,10 @@ views per ternary matrix:
   ternary tensor (the v1 Q8 output head and embedding) therefore folds the rotation
   automatically.
 - encoded rows: the exact rotated ternary words as `t2_g128_fp16`, for `import_encoded`.
-  Their input axis stays in the rotated basis; the runtime applies the Hadamard to the
-  activation (`prism_hadamard` text config).
+  Their column axis stays in the rotated basis; the runtime applies the Hadamard to a
+  projection's activation, or to a gathered embedding row (`prism_hadamard` text config).
+  Projections (`prism.hadamard.weight_names`) and the embedding
+  (`inverse_weight_names`) share the algebra: the logical matrix is `W' H S`.
 
 Conventions measured by M0 (`docs/maintainer/bonsai-ternary-conversion.md`):
 
@@ -266,10 +268,10 @@ class PrismCheckpoint:
         entry = self._entry(name)
         if not self.ternary(name):
             raise ValueError(f"{name}: {entry.gguf} is not a ternary tensor")
-        if entry.gguf not in self.rotated:
+        if entry.gguf not in self.rotated and entry.gguf not in self.inverse:
             raise ValueError(
                 f"{name}: {entry.gguf} is not Hadamard-folded; its ternary words are not "
-                "a rotated projection"
+                "a rotated weight"
             )
         if not 0 <= begin < end <= entry.shape[0]:
             raise ValueError(f"{name}: invalid encoded rows [{begin},{end})")

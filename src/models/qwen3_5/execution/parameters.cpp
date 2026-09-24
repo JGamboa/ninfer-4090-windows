@@ -286,6 +286,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
+    prepare.rotate(text.token_embedding);
     text.output_head     = prepare.linear(w.text.output_head_use);
     prepare.rotate(text.output_head.weight);
     text.final_norm      = prepare.tensor(w.text.final_norm);

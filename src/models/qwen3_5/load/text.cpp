@@ -153,11 +153,13 @@ void validate_prism_hadamard(const Bindings& b, const TextConfig& config) {
         } else if (name == "text/output_head") {
             role = "output_head";
         }
-        const bool rotated = prism && !role.empty() && prism->rotated_inputs.contains(role);
+        const bool rotated = prism && (name == "text/token_embedding"
+                                           ? prism->embedding_inverse
+                                           : !role.empty() && prism->rotated_inputs.contains(role));
         if (ternary != rotated) {
             throw artifact::ArtifactError(
-                name + (ternary ? ": t2_g128_fp16 weight is not a prism_hadamard rotated input"
-                                : ": prism_hadamard lists this input but it is not t2_g128_fp16"));
+                name + (ternary ? ": t2_g128_fp16 weight is not a prism_hadamard rotated weight"
+                                : ": prism_hadamard lists this weight but it is not t2_g128_fp16"));
         }
         if (rotated) {
             const auto width = weight.reference.shape.at(1);

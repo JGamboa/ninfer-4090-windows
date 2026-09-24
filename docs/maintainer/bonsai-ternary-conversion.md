@@ -154,7 +154,7 @@ What the recipe writes:
 | parameters | format | source |
 |---|---|---|
 | layer attention q/k/gate/v, o; GDN q/k/v/z, out; MLP gate/up, down | `t2_g128_fp16`, one parent per fused group | rotated GGUF words, rows in NInfer order |
-| `text/token_embedding`, `text/output_head` | `q8_g32_fp16` (`grouped_absmax`) | primal-basis values `(W' @ H) * s` |
+| `text/token_embedding`, `text/output_head` | `t2_g128_fp16` (`import_encoded`) | rotated GGUF words; the runtime applies `H`/`S` (`embedding_inverse`, `rotated_inputs: output_head`) |
 | GDN `a_projection`, `b_projection` | bf16, separate parents | GGUF BF16, grouped head order |
 | norms, `a_log`, `dt_bias`, `convolution`, q/k norms | as the Qwen3.8 recipe | GGUF F32 with the M0 conventions |
 | `text/hadamard/signs_{5120,6144,17408}` | bf16 | `prism.hadamard.sign_values` |
@@ -186,8 +186,8 @@ tensor's mapping in `prism_checkpoint.py` is wrong.
 
 Synthetic coverage (`tests/convert/test_bonsai_recipe.py`): a Bonsai-shaped PQ2_0 GGUF (4
 layers, nontrivial 2x2 head permutation) and a reference artifact with a Q8 MTP head go
-through `bonsai_base` and the CLI; the test rebuilds the expected t2 parents, primal Q8
-head/embedding, vectors and MTP words independently.
+through `bonsai_base` and the CLI; the test rebuilds the expected t2 parents, the t2
+head/embedding words, vectors and MTP words independently.
 
 Results of the real run: _pending (Windows machine)_.
 
