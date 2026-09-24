@@ -1203,6 +1203,14 @@ Next steps, in order:
    Only o_proj shows the wave tail of the 128-token tile (80 CTAs at T = 128, 320 for 256
    slots at T = 512; unrotated A8 +20 % and +19 %); down, with a long K per CTA, gains at every
    T. That favors choosing the tile by wave fill over split-K for the 5120-row shapes.
+
+   `7b5e230` keeps 64-token CTAs when the 128-token grid would leave SMs idle and K is short
+   (only o_proj at T <= 128 among the Bonsai shapes), validated 2026-09-24:
+   `ninfer_linear_t5_test` passes; `ninfer_t5_bench 128 512 2048`, two runs, o_proj at T = 128
+   61.8 / 61.2 us rotated (58.6 / 57.9 unrotated), against 89.3 with `794c216` and 78.1 before
+   the tile change (the 64-token kernel now has the `ldmatrix` fragments too); the other
+   shapes match the `794c216` table (in_proj 113-115, qkvg 107-119, gate+up 281-292 us at
+   T = 128; o_proj 187-217 us at T = 512, unchanged within run-to-run noise).
 5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
    quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
    Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).
