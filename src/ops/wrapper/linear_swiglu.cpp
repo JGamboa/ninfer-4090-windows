@@ -59,7 +59,8 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     }
     if (qtype == QType::T2_G128_FP16 && input_rows % 1024 == 0) {
         // v1: BF16 gate and up rows in workspace, then the standalone SwiGLU.
-        return static_cast<std::size_t>(gate_up_rows) * max_tokens * 2 + 512;
+        return static_cast<std::size_t>(gate_up_rows) * max_tokens * 2 + 512 +
+               detail::t2_workspace_capacity_bytes(policy, input_rows, max_tokens);
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
@@ -115,7 +116,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         Tensor gate  = ws.alloc(DType::BF16, {out.ne[0], t});
         Tensor up    = ws.alloc(DType::BF16, {out.ne[0], t});
         Tensor* rows[] = {&gate, &up};
-        detail::t2_project(x, gate_up_weight, rows, /*accumulate=*/false, stream);
+        detail::t2_project(x, gate_up_weight, rows, /*accumulate=*/false, policy, &ws, stream);
         silu_mul(gate, up, out, stream);
         return;
     }

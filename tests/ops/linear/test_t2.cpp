@@ -1,4 +1,4 @@
-// T2_G128_FP16 projections against an FP64 oracle from the format definition
+// T2_G128_FP16 projections (A16 and A8 activation paths) against an FP64 oracle from the format
 // (docs/maintainer/bonsai-ternary-design.md 2): weight (n, k) = (code - 1) * scale[n][k / 128],
 // code = (codes[n][k / 4] >> 2 * (k % 4)) & 3. The weight is built through the production
 // geometry and native Weight view, including a row view of a fused parent.
@@ -26,6 +26,16 @@ namespace {
 
 // One BF16 unit roundoff in relative L2; gross error covers final BF16 storage (A16 criterion).
 constexpr ReductionCriterion kA16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+// The shared Linear A8 criterion: activation quantization allowance plus BF16 storage.
+constexpr ReductionCriterion kA8{0.04, 1.0 / 256.0, 0.06};
+
+ReductionCriterion criterion(ops::LinearPolicy policy) {
+    return ops::allows_a8(policy) ? kA8 : kA16;
+}
+
+const char* policy_name(ops::LinearPolicy policy) {
+    return ops::allows_a8(policy) ? " A8" : " A16";
+}
 
 struct Ternary {
     std::int32_t n = 0, k = 0;
@@ -96,21 +106,22 @@ std::vector<double> oracle(const Ternary& w, std::int32_t first, std::int32_t ro
 }
 
 int linear_case(const Ternary& w, std::int32_t first, std::int32_t rows, std::int32_t t,
-                bool graph) {
+                bool graph, ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     const auto x = activation(w.k, t, 17u * t + rows);
     auto device_x = to_device_bf16(x);
     GuardedDeviceBuffer out(std::size_t(rows) * t * 2);
     Tensor tx(device_x.p, DType::BF16, {w.k, t});
     Tensor to(out.data(), DType::BF16, {rows, t});
     const Weight view = w.rows(first, rows);
-    DeviceArena workspace(256);
+    DeviceArena workspace(
+        ops::linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, w.k, policy, 1, t) + 256);
     if (graph) {
         cudaStream_t stream;
         cudaGraph_t captured;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::linear(tx, view, to, ops::LinearPolicy::A16Only, workspace, stream);
+        ops::linear(tx, view, to, policy, workspace, stream);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) CUDA_CHECK(cudaGraphLaunch(executable, stream));
@@ -119,17 +130,19 @@ int linear_case(const Ternary& w, std::int32_t first, std::int32_t rows, std::in
         CUDA_CHECK(cudaGraphDestroy(captured));
         CUDA_CHECK(cudaStreamDestroy(stream));
     } else {
-        ops::linear(tx, view, to, ops::LinearPolicy::A16Only, workspace, nullptr);
+        ops::linear(tx, view, to, policy, workspace, nullptr);
         cuda_synchronize();
     }
     const std::string label = "t2 linear [" + std::to_string(rows) + "," + std::to_string(w.k) +
-                              "] rows+" + std::to_string(first) + " T=" + std::to_string(t);
+                              "] rows+" + std::to_string(first) + " T=" + std::to_string(t) +
+                              policy_name(policy);
     return verify_reduction(label, from_device_bf16(out.data(), std::size_t(rows) * t),
-                            oracle(w, first, rows, x, t), kA16) +
+                            oracle(w, first, rows, x, t), criterion(policy)) +
            out.verify_guards(label.c_str());
 }
 
-int linear_add_case(const Ternary& w, std::int32_t t) {
+int linear_add_case(const Ternary& w, std::int32_t t,
+                    ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     const auto x        = activation(w.k, t, 91u + t);
     auto residual_value = activation(w.n, t, 92u + t);
     auto expected       = oracle(w, 0, w.n, x, t);
@@ -138,17 +151,20 @@ int linear_add_case(const Ternary& w, std::int32_t t) {
     auto device_residual = to_device_bf16(residual_value);
     Tensor tx(device_x.p, DType::BF16, {w.k, t});
     Tensor tr(device_residual.p, DType::BF16, {w.n, t});
-    DeviceArena workspace(256);
-    ops::linear_add(tx, w.rows(0, w.n), tr, ops::LinearPolicy::A16Only, workspace, nullptr);
+    DeviceArena workspace(
+        ops::linear_add_workspace_capacity_bytes(QType::T2_G128_FP16, w.n, w.k, policy, 1, t) +
+        256);
+    ops::linear_add(tx, w.rows(0, w.n), tr, policy, workspace, nullptr);
     cuda_synchronize();
     return verify_reduction("t2 linear_add [" + std::to_string(w.n) + "," + std::to_string(w.k) +
-                                "] T=" + std::to_string(t),
+                                "] T=" + std::to_string(t) + policy_name(policy),
                             from_device_bf16(device_residual.p, expected.size()), expected,
-                            kA16);
+                            criterion(policy));
 }
 
 // The fused attention parent is stored query, key, gate, value.
-int attention_case(const Ternary& w, std::int32_t t) {
+int attention_case(const Ternary& w, std::int32_t t,
+                   ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     const auto x  = activation(w.k, t, 71u + t);
     auto device_x = to_device_bf16(x);
     const std::array<std::int32_t, 4> rows{6144, 1024, 6144, 1024};
@@ -159,16 +175,19 @@ int attention_case(const Ternary& w, std::int32_t t) {
         tensors[i] = Tensor(outputs[i].p, DType::BF16, {rows[i], t});
     }
     Tensor tx(device_x.p, DType::BF16, {w.k, t});
-    DeviceArena workspace(256);
+    DeviceArena workspace(
+        ops::attn_input_proj_workspace_capacity_bytes(QType::T2_G128_FP16, w.n, w.k, policy, 1, t) +
+        256);
     ops::attn_input_proj(tx, w.rows(0, w.n), tensors[0], tensors[2], tensors[1], tensors[3],
-                         ops::LinearPolicy::A16Only, workspace, nullptr);
+                         policy, workspace, nullptr);
     cuda_synchronize();
     int failures = 0, first = 0;
     const std::array<const char*, 4> names{"query", "key", "gate", "value"};
     for (int i = 0; i < 4; ++i) {
-        failures += verify_reduction(std::string("t2 attn_input_proj ") + names[i],
+        failures += verify_reduction(std::string("t2 attn_input_proj ") + names[i] +
+                                         policy_name(policy),
                                      from_device_bf16(outputs[i].p, std::size_t(rows[i]) * t),
-                                     oracle(w, first, rows[i], x, t), kA16);
+                                     oracle(w, first, rows[i], x, t), criterion(policy));
         first += rows[i];
     }
     return failures;
@@ -213,7 +232,27 @@ int main() {
         const Ternary attention(14336, 5120, 77u);
         failures += attention_case(attention, 2);
         failures += attention_case(attention, 6); // tensor-core route, four outputs
+        failures += attention_case(attention, 3, ops::LinearPolicy::AllowA8);
     }
-    std::cout << (failures ? "FAIL" : "OK") << " t2 A16\n";
+    {
+        // A8: dp4a GEMV at every token template (with a partial row block and a row view), the
+        // int8 MMA GEMM with partial 64-token tiles, graph replay, and the residual add.
+        constexpr auto a8 = ops::LinearPolicy::AllowA8;
+        const Ternary small(300, 3072, 15u);
+        for (std::int32_t t : {1, 2, 3, 4, 5, 8, 9}) {
+            failures += linear_case(small, 0, 300, t, t == 3, a8);
+        }
+        failures += linear_case(small, 44, 200, 6, false, a8);
+        const Ternary gemm(448, 2048, 18u);
+        for (std::int32_t t : {9, 64, 65, 130}) failures += linear_case(gemm, 0, 448, t, t == 65, a8);
+        failures += linear_case(gemm, 64, 320, 40, false, ops::LinearPolicy::AllowA4);
+        failures += linear_add_case(gemm, 70, a8);
+        failures += linear_add_case(gemm, 3, a8);
+        for (const auto [n, k] : std::array<std::pair<int, int>, 2>{{{5120, 17408}, {16384, 5120}}}) {
+            const Ternary w(n, k, 2000u + n + k);
+            for (std::int32_t t : {1, 3, 8, 32}) failures += linear_case(w, 0, n, t, false, a8);
+        }
+    }
+    std::cout << (failures ? "FAIL" : "OK") << " t2 A16/A8\n";
     return failures ? 1 : 0;
 }

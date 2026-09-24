@@ -1,6 +1,7 @@
 #include "ops/linear/t2/t2_project.h"
 
 #include "core/device.h"
+#include "ops/linear/t2/t2_a8.cuh"
 #include "ops/linear/t2/t2_gemm.cuh"
 #include "ops/linear/t2/t2_mma.cuh"
 
@@ -169,6 +170,72 @@ void launch(const Tensor& x, const Weight& w, const Outputs& outputs, bool accum
 
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15) == 0; }
 
+std::size_t round_up_256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+
+struct QuantizedX {
+    Tensor q, scale, group_sum, slice_sum;
+};
+
+QuantizedX quantize(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream) {
+    const int k = x.ne[0], tokens = x.ne[1];
+    QuantizedX result{workspace.alloc(DType::I8, {k, tokens}),
+                      workspace.alloc(DType::FP32, {k / 128, tokens}),
+                      workspace.alloc(DType::I32, {k / 128, tokens}),
+                      workspace.alloc(DType::I32, {k / 32, tokens})};
+    const dim3 grid(static_cast<unsigned>(k / 512), static_cast<unsigned>(tokens));
+    t2_a8::quantize_kernel<<<grid, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), k, static_cast<std::uint32_t*>(result.q.data),
+        static_cast<float*>(result.scale.data), static_cast<int*>(result.group_sum.data),
+        static_cast<int*>(result.slice_sum.data));
+    CUDA_CHECK(cudaGetLastError());
+    return result;
+}
+
+template <int Tile>
+void launch_a8_gemv(const QuantizedX& q, const Weight& w, int tokens,
+                    const t2_a8::Outputs& outputs, bool accumulate, cudaStream_t stream) {
+    constexpr int kRowsBlock = t2_a8::kGemvWarps * t2_a8::kGemvRowsPerWarp;
+    const dim3 grid(static_cast<unsigned>((w.n + kRowsBlock - 1) / kRowsBlock),
+                    static_cast<unsigned>((tokens + Tile - 1) / Tile));
+    t2_a8::gemv_kernel<Tile><<<grid, t2_a8::kGemvThreads, 0, stream>>>(
+        static_cast<const uint4*>(q.q.data), static_cast<const float*>(q.scale.data),
+        static_cast<const int*>(q.slice_sum.data), static_cast<const uint2*>(w.qdata),
+        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.n, w.k, tokens, outputs,
+        accumulate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void project_a8(const Tensor& x, const Weight& w, const Outputs& packed, bool accumulate,
+                WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope             = workspace.scope();
+    const QuantizedX q     = quantize(x, workspace, stream);
+    const int tokens       = x.ne[1];
+    t2_a8::Outputs outputs{};
+    for (int i = 0; i < kMaxOutputs; ++i) {
+        outputs.data[i] = packed.data[i];
+        outputs.end[i]  = packed.end[i];
+    }
+    if (tokens > kMaxTile && w.n % t2_a8::kGemmRows == 0) {
+        const dim3 grid(static_cast<unsigned>(w.n / t2_a8::kGemmRows),
+                        static_cast<unsigned>((tokens + t2_a8::kGemmTokens - 1) /
+                                              t2_a8::kGemmTokens));
+        t2_a8::gemm_kernel<<<grid, t2_a8::kGemmThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
+            static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, outputs,
+            accumulate);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    switch (tokens) {
+    case 1: launch_a8_gemv<1>(q, w, tokens, outputs, accumulate, stream); break;
+    case 2: launch_a8_gemv<2>(q, w, tokens, outputs, accumulate, stream); break;
+    case 3: launch_a8_gemv<3>(q, w, tokens, outputs, accumulate, stream); break;
+    case 4: launch_a8_gemv<4>(q, w, tokens, outputs, accumulate, stream); break;
+    default: launch_a8_gemv<kMaxTile>(q, w, tokens, outputs, accumulate, stream); break;
+    }
+}
+
 } // namespace
 
 void validate_t2_weight(const Weight& w, const char* op) {
@@ -182,8 +249,20 @@ void validate_t2_weight(const Weight& w, const char* op) {
     }
 }
 
+std::size_t t2_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
+                                        std::int32_t max_tokens) {
+    if (input_rows <= 0 || input_rows % 1024 || max_tokens <= 0) {
+        throw std::invalid_argument("t2 workspace: requires K % 1024 == 0 and positive T");
+    }
+    if (!allows_a8(policy)) return 0;
+    const std::size_t k = static_cast<std::size_t>(input_rows);
+    const std::size_t t = static_cast<std::size_t>(max_tokens);
+    return round_up_256(k * t) + 2 * round_up_256(k / 128 * t * 4) + round_up_256(k / 32 * t * 4);
+}
+
 void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outputs,
-                bool accumulate, cudaStream_t stream) {
+                bool accumulate, LinearPolicy policy, WorkspaceArena* workspace,
+                cudaStream_t stream) {
     validate_t2_weight(w, "t2_project");
     const int tokens = x.ne[1];
     if (x.dtype != DType::BF16 || x.ne[0] != w.k || tokens <= 0 || x.ne[2] != 1 ||
@@ -211,6 +290,10 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     }
     if (end != w.n) {
         throw std::invalid_argument("t2_project: output rows must cover the weight rows");
+    }
+    if (allows_a8(policy) && workspace != nullptr) {
+        project_a8(x, w, packed, accumulate, *workspace, stream);
+        return;
     }
     if (tokens >= 17 && w.n % t2_gemm::kRows == 0) {
         // Prefill: 64-token tiles read the weights once per 64 tokens.

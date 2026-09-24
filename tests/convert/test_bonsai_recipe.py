@@ -155,6 +155,21 @@ def test_gdn_vectors_norms_and_hadamard_metadata(converted):
     }
 
 
+def test_ternary_projections_admit_a8_activations(converted):
+    _, _, _, out = converted
+    with Artifact(out) as artifact:
+        policies = {use["parameter"]: use.get("activation_policy") for use in artifact.directory.uses}
+    ternary = {
+        name for name in policies
+        if name == "text/output_head"
+        or (name.startswith("text/layers/") and name.endswith(("/query", "/key", "/gate", "/value",
+                                                               "/output", "/z", "/up", "/down")))
+    }
+    assert "text/output_head" in ternary and "text/layers/1/mlp/down" in ternary
+    assert {policies[name] for name in ternary} == {"AllowA8"}
+    assert policies["text/layers/0/gdn/a_projection"] != "AllowA8"
+
+
 def test_mtp_is_copied_word_for_word(converted):
     _, _, reference, out = converted
     with NInferArtifactStore(reference) as source, NInferArtifactStore(out) as result:

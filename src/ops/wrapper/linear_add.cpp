@@ -139,10 +139,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                                                min_tokens, max_tokens);
     }
     if (qtype == QType::T2_G128_FP16) {
-        if (output_rows <= 0 || input_rows <= 0 || input_rows % 1024) {
-            throw std::invalid_argument("linear_add workspace: t2 requires K % 1024 == 0");
-        }
-        return 0;
+        if (output_rows <= 0) { throw std::invalid_argument("linear_add workspace: t2 rows"); }
+        return detail::t2_workspace_capacity_bytes(policy, input_rows, max_tokens);
     }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
@@ -252,9 +250,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
 
     if (w.qtype == QType::T2_G128_FP16) {
         // The caller rotated x; the residual is added in FP32 before one BF16 rounding.
-        (void)ws;
         Tensor* outputs[] = {&residual_out};
-        detail::t2_project(x, w, outputs, /*accumulate=*/true, stream);
+        detail::t2_project(x, w, outputs, /*accumulate=*/true, policy, &ws, stream);
         return;
     }
 

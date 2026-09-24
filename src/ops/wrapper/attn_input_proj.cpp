@@ -143,7 +143,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         }
         // Parent rows are query, key, gate, value (the caller rotated x).
         Tensor* outputs[] = {&q, &k, &gate, &v};
-        detail::t2_project(x, weight, outputs, /*accumulate=*/false, stream);
+        detail::t2_project(x, weight, outputs, /*accumulate=*/false, policy, workspace, stream);
         return;
     }
 
@@ -224,7 +224,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         if (parent_rows != 14336 || input_rows != 5120) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported t2 profile");
         }
-        return 0;
+        return detail::t2_workspace_capacity_bytes(policy, input_rows, max_tokens);
     case QType::Q4_G64_FP16:
     case QType::Q5_G64_FP16:
     case QType::Q6_G64_FP16:

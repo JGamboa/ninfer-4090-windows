@@ -732,7 +732,7 @@ ColdFusion fine-tune, not the Qwen3.8 base).
     has a single consumer; GDN `g`/`beta` are computed from the primal `h` first).
   - Loading validates `prism_hadamard` against the bound formats in both directions and binds
     the sign vectors by width; there is no execution refusal.
-  - Tests to run on the 4090: `ninfer_hadamard_test`, `ninfer_linear_t2_a16_test` (FP64
+  - Tests to run on the 4090: `ninfer_hadamard_test`, `ninfer_linear_t2_test` (FP64
     oracles, graph replay), `ninfer_qwen3_5_prism_loading_interop_test` (runs here too, CPU).
   - Known v1 costs (M4): T > 16 re-reads the weights once per 16 tokens (slow prefill), a
     standalone Hadamard launch per rotated projection, unfused SwiGLU.
@@ -764,7 +764,7 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 
 - (A+B+C) First end-to-end results, 2026-09-24, RTX 4090 (Windows, CUDA 13.4), artifact
   `bonsai2_27b_t2.ninfer` (9.00 GiB of weights; `bonsai_mapping_check` all t2 rows ~0.88,
-  direct rows >= 0.97): `ninfer_hadamard_test` and `ninfer_linear_t2_a16_test` pass. Greedy
+  direct rows >= 0.97): `ninfer_hadamard_test` and `ninfer_linear_t2_test` pass. Greedy
   generation is coherent (512-token story, no degradation). Warm decode with the t2 kernel of
   commit `000f4a5` (`ninfer_t2_bench`, median of 7 cold-weight repeats):
 
@@ -814,6 +814,24 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   stay Q4 gathered from the primal values. Not supported: DFlash2 with the full (t2) head,
   whose `linear_topk` admits Q8/FP8 only; use the optimized proposal head. The embedding
   stays primal Q8 (a ternary gather with the inverse rotation remains open).
+
+- (A+C) PrismML fork reference, 2026-09-24, RTX 4090, fork build b10709 on
+  `Ternary-Bonsai-2-27B-PTQ1_0.gguf` (5.53 GiB): `llama-bench -fa 1` pp512 1363 tok/s, tg128
+  77.1 tok/s; `llama-perplexity -c 4096` on the `00.txt` file of each domain: wikitext 8.178,
+  pg19 8.446, zhwiki 7.119, ninfer 1.899. llama-perplexity scores only the second half of 15
+  4096-token chunks, so only wikitext and ninfer cover comparable text (NInfer 8.082 and
+  1.894, within ~1 %).
+
+- (A+C) A8 t2 route (option D). Under `AllowA8`/`AllowA4` with a workspace, `t2_project`
+  quantizes the rotated activation to symmetric int8, one FP32 scale per token and 128-column
+  group (the weight scale group), stored with every 16-column block's 4x4 bytes transposed so
+  that `(code_word >> 2j) & 0x03030303` lines the unsigned codes up with activation word
+  `4s + j`. Stored per-slice and per-group sums of q remove the code offset
+  (`(c - 1).q = c.q - sum(q)`). Kernels (`t2_a8.cuh`): a dp4a GEMV through T = 8 (same
+  schedule as the A16 GEMV) and a 64 x 64 int8 m16n8k32 MMA GEMM beyond T = 8. The criterion is
+  the shared Linear A8 criterion (relative L2 0.04). `bonsai2_27b` marks every t2 projection
+  and the t2 head `AllowA8`, so this route needs a reconversion; A16Only artifacts keep the
+  BF16 routes. `ninfer_t2_bench` reports both paths per shape and T.
 
 ## Appendix: sources
 

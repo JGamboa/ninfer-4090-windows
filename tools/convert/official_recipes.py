@@ -286,6 +286,7 @@ def bonsai2_27b(model, recipe, sources):
                 format=TERNARY_FORMAT,
                 method=import_encoded,
                 source=model.source(name, gguf, TERNARY_FORMAT),
+                activation_policy="AllowA8",
             )
             rotated.add("output_head")
         elif name.startswith("text/layers/") and name.endswith(_BONSAI_TERNARY):
@@ -294,6 +295,7 @@ def bonsai2_27b(model, recipe, sources):
                 format=TERNARY_FORMAT,
                 method=import_encoded,
                 source=model.source(name, gguf, TERNARY_FORMAT),
+                activation_policy="AllowA8",
             )
             rotated.add(name.split("/", 3)[3])
         else:
