@@ -982,6 +982,25 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   o_proj (8.4 MB in t2) sits near the fixed launch-and-tail time of a ~12 us kernel: it saves
   1.3 us per call against ~2.2 us for the byte ratio, 0.06 ms of a round.
 
+  Prefill GEMM prototype (`t5a_gemm_kernel`, same bench, T > 8): the production t2 GEMM's
+  schedule (64 rows x 64 tokens, four warps, m16n8k32 s8, 128-column double-buffered stages)
+  with each thread decoding one (row, unit) into 16 natural four-column code words in shared
+  memory (A fragments read them directly; B is the t2 GEMM's ldmatrix of a natural-order
+  activation). Outputs are bitwise equal to the t2 GEMM (exact integer group sums, same
+  epilogue). Time ratio t5/t2 at T = 512 (in_proj, qkvg, gate+up, o_proj, down; weighted by a
+  layer's 48/16/64/64/64 calls):
+  - double-buffered code words (36-word stride, ~36 KB per CTA, 2 CTAs per SM): 1.17, 1.15,
+    1.06, 1.04, 1.25; weighted 1.11 (T = 64: 0.95-1.11);
+  - 32-word XOR-swizzled stride, token scales and sums prefetched into registers instead of
+    shared memory (32 KB, 3 CTAs): 1.19-1.41, worse;
+  - diagnostic without decode (raw bytes as code words): 1.07-1.21, as slow as with decode, so
+    the decode is not the cost;
+  - single-buffered code words (one extra barrier per stage, ~25 KB, 3 CTAs): 1.06, 1.09, 1.02,
+    1.26, 1.16; weighted 1.075 (T = 64: 0.997-1.11).
+  The remaining gap is structural: four times the t2 shared-memory code footprint, synchronous
+  byte loads instead of `cp.async`, and four 32-bit A reads per fragment pair instead of two
+  64-bit reads plus shift/mask.
+
 
 - (A+B+C) Ternary embedding. `bonsai2_27b` stores `text/token_embedding` as the GGUF's
   rotated `t2` words (0.33 GB instead of the 1.3 GB primal Q8 table) and sets

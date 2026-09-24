@@ -349,6 +349,187 @@ __global__ void __launch_bounds__(kT5Threads)
     }
 }
 
+// Prefill GEMM for t5a, the production t2 GEMM's schedule (64 rows x 64 tokens, four warps of
+// 32 x 32, m16n8k32 s8, one 128-column scale group per double-buffered stage). Thread (row,
+// unit) decodes its 13 bytes into 16 natural four-column code words in shared memory; the next
+// stage's bytes are loaded before the MMAs and decoded after them. A fragments read the code
+// words directly (a0 = columns 4 lid .. 4 lid + 3), B fragments are the t2 GEMM's ldmatrix of a
+// natural-order activation.
+constexpr int kG5Rows       = 64;
+constexpr int kG5Tokens     = 64;
+constexpr int kG5Threads    = 128;
+constexpr int kG5StageK     = 128;
+// 32 code words per row and stage; the four-word group index is XORed with the row (mod 8) so
+// the A reads of a warp (gid, lid) hit 32 distinct banks. 16 KiB per stage: three CTAs per SM.
+__device__ __forceinline__ int g5_word(int row, int word) { return row * 32 + (word ^ ((row & 7) << 2)); }
+
+struct G5Stage {
+    std::uint8_t x[kG5Tokens * kG5StageK];
+    float scale[kG5Tokens];
+    int sum[kG5Tokens];
+};
+
+// Decode 0: arithmetic decode; 1: diagnostic, raw bytes stored as code words (no decode).
+template <int Decode>
+__global__ void __launch_bounds__(kG5Threads)
+    t5a_gemm_kernel(const std::uint8_t* __restrict__ qx, const float* __restrict__ group_scale,
+                    const int* __restrict__ group_sum, const std::uint8_t* __restrict__ codes,
+                    const __half* __restrict__ scales, int n, int k, int tokens,
+                    __nv_bfloat16* __restrict__ out) {
+    using namespace ninfer::ops;
+    __shared__ __align__(128) G5Stage stages[2];
+    __shared__ __align__(128) std::uint32_t code_words[kG5Rows * 32]; // single buffer
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int gid    = lane >> 2;
+    const int lid    = lane & 3;
+    const int wm     = warp & 1;
+    const int wn     = warp >> 1;
+    const int row0   = static_cast<int>(blockIdx.x) * kG5Rows;
+    const int token0 = static_cast<int>(blockIdx.y) * kG5Tokens;
+    const int live   = min(kG5Tokens, tokens - token0);
+    const int steps  = k / kG5StageK;
+    const int groups = k / 128;
+    const std::int64_t row_bytes = std::int64_t(k / kUnitColumns) * kUnitBytes;
+    const int my_row  = tid >> 1;
+    const int my_unit = tid & 1;
+    const std::uint8_t* my_codes = codes + std::int64_t(row0 + my_row) * row_bytes;
+
+    std::uint32_t raw[4];
+    unsigned shift = 0;
+    const auto fetch = [&](int step) {
+        const std::int64_t start = std::int64_t(2 * step + my_unit) * kUnitBytes;
+        const auto* base = reinterpret_cast<const std::uint32_t*>(my_codes + (start & ~std::int64_t(3)));
+        shift = unsigned(start & 3) * 8u;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) raw[i] = __ldcs(base + i);
+    };
+    const auto decode_store = [&]() {
+        const std::uint32_t a[4] = {__funnelshift_r(raw[0], raw[1], shift),
+                                    __funnelshift_r(raw[1], raw[2], shift),
+                                    __funnelshift_r(raw[2], raw[3], shift), raw[3] >> shift};
+        std::uint32_t words[16];
+        if constexpr (Decode == 0) {
+            t5a_decode(a, words);
+        } else {
+#pragma unroll
+            for (int w = 0; w < 16; ++w) words[w] = a[w & 3] & 0x03030303u;
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            *reinterpret_cast<uint4*>(&code_words[g5_word(my_row, my_unit * 16 + 4 * q)]) =
+                make_uint4(words[4 * q], words[4 * q + 1], words[4 * q + 2], words[4 * q + 3]);
+        }
+    };
+    const auto stage_x = [&](int step, G5Stage& s) {
+#pragma unroll
+        for (int i = 0; i < kG5Tokens * (kG5StageK / 16) / kG5Threads; ++i) {
+            const int item   = tid + i * kG5Threads;
+            const int token  = item >> 3;
+            const int chunk  = item & 7;
+            const int source = token < live ? token0 + token : token0;
+            cp_async_zfill<16>(&s.x[token * kG5StageK + ((chunk ^ (token & 7)) << 4)],
+                               qx + std::int64_t(source) * k + std::int64_t(step) * kG5StageK + chunk * 16,
+                               token < live ? 16 : 0);
+        }
+        const int token  = tid & (kG5Tokens - 1);
+        const int source = token < live ? token0 + token : token0;
+        const std::int64_t index = std::int64_t(source) * groups + step;
+        if (tid < kG5Tokens) {
+            cp_async_zfill<4>(&s.scale[token], group_scale + index, token < live ? 4 : 0);
+        } else {
+            cp_async_zfill<4>(&s.sum[token], group_sum + index, token < live ? 4 : 0);
+        }
+    };
+
+    float acc[2][4][4] = {};
+    fetch(0);
+    decode_store();
+    stage_x(0, stages[0]);
+    cp_commit();
+    for (int step = 0; step < steps; ++step) {
+        if (step + 1 < steps) {
+            stage_x(step + 1, stages[(step + 1) & 1]);
+            fetch(step + 1);
+        }
+        cp_commit();
+        cp_wait<1>();
+        __syncthreads();
+        const G5Stage& s = stages[step & 1];
+        int group[2][4][4] = {};
+#pragma unroll
+        for (int ks = 0; ks < kG5StageK / 32; ++ks) {
+            unsigned b[4][2];
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int b_row = wn * 32 + nt * 8 + (lane & 7);
+                const int chunk = ks * 2 + ((lane >> 3) & 1);
+                ldmatrix_x2(b[nt][0], b[nt][1], smem_addr(&s.x[b_row * kG5StageK + ((chunk ^ (b_row & 7)) << 4)]));
+            }
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                const int r       = wm * 32 + mt * 16 + gid;
+                const unsigned a0 = code_words[g5_word(r, 8 * ks + lid)];
+                const unsigned a1 = code_words[g5_word(r + 8, 8 * ks + lid)];
+                const unsigned a2 = code_words[g5_word(r, 8 * ks + 4 + lid)];
+                const unsigned a3 = code_words[g5_word(r + 8, 8 * ks + 4 + lid)];
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    mma_s8(group[mt][nt][0], group[mt][nt][1], group[mt][nt][2], group[mt][nt][3], a0,
+                           a1, a2, a3, b[nt][0], b[nt][1]);
+                }
+            }
+        }
+        float token_scale[4][2];
+        int token_sum[4][2];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int token    = wn * 32 + nt * 8 + 2 * lid + j;
+                token_scale[nt][j] = s.scale[token];
+                token_sum[nt][j]   = s.sum[token];
+            }
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int r        = row0 + wm * 32 + mt * 16 + gid;
+            const float top    = __half2float(__ldg(scales + std::int64_t(r) * groups + step));
+            const float bottom = __half2float(__ldg(scales + std::int64_t(r + 8) * groups + step));
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int j      = e & 1;
+                    const float unit = (e < 2 ? top : bottom) * token_scale[nt][j];
+                    acc[mt][nt][e] = fmaf(unit, static_cast<float>(group[mt][nt][e] - token_sum[nt][j]),
+                                          acc[mt][nt][e]);
+                }
+            }
+        }
+        __syncthreads();
+        if (step + 1 < steps) decode_store();
+    }
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int row = row0 + wm * 32 + mt * 16 + gid + half * 8;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int token = wn * 32 + nt * 8 + 2 * lid + j;
+                    if (token < live) {
+                        out[std::int64_t(token0 + token) * n + row] = __float2bfloat16_rn(acc[mt][nt][2 * half + j]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Natural-order int8 activation for t5a: lane l of a group holds columns 4 l .. 4 l + 3.
 __global__ void __launch_bounds__(128)
     quantize_natural(const __nv_bfloat16* __restrict__ x, int k, std::uint32_t* __restrict__ qx,
@@ -570,6 +751,30 @@ int main(int argc, char** argv) {
 
             // 0: production t2; 1: t5 table; 2: t5 arithmetic.
             const auto run = [&](int kernel, int copy, __nv_bfloat16* out) {
+                if (t > 8) {
+                    // Prefill: production t2 GEMM against the t5 GEMM; no table variant.
+                    const dim3 grid(n / t2::kGemmRows, (t + t2::kGemmTokens - 1) / t2::kGemmTokens);
+                    if (kernel == 0) {
+                        t2::Outputs outputs{};
+                        outputs.data[0] = out;
+                        outputs.end[0]  = n;
+                        for (int i = 1; i < t2::kMaxOutputs; ++i) outputs.end[i] = INT_MAX;
+                        t2::gemm_kernel<<<grid, t2::kGemmThreads>>>(
+                            reinterpret_cast<const std::uint8_t*>(a.qx), a.group_scale, a.group_sum,
+                            t2_codes[copy % t2_copies], t2_scales[copy % t2_copies], k / 128, k, t,
+                            outputs, false);
+                    } else if (kernel == 1) {
+                        t5a_gemm_kernel<1><<<grid, kG5Threads>>>(
+                            reinterpret_cast<const std::uint8_t*>(an.qx), an.group_scale, an.group_sum,
+                            t5a_codes[copy % t5_copies], t5_scales[copy % t5_copies], n, k, t, out);
+                    } else if (kernel == 2) {
+                        t5a_gemm_kernel<0><<<grid, kG5Threads>>>(
+                            reinterpret_cast<const std::uint8_t*>(an.qx), an.group_scale, an.group_sum,
+                            t5a_codes[copy % t5_copies], t5_scales[copy % t5_copies], n, k, t, out);
+                    }
+                    CHECK(cudaGetLastError());
+                    return;
+                }
                 if (kernel == 0) {
                     launch(-1, a, t2_codes[copy % t2_copies], t2_scales[copy % t2_copies], n, k, t, out);
                 } else if (kernel == 1) {
@@ -594,6 +799,7 @@ int main(int argc, char** argv) {
             double norm = 0.0, max_rel[3] = {0.0, 0.0, 0.0};
             for (std::size_t i = 0; i < h2.size(); ++i) norm = std::max(norm, double(std::fabs(bf16_to_float(h2[i]))));
             for (int kernel = 1; kernel < 3; ++kernel) {
+                if (t > 8 && kernel == 1) continue; // the diagnostic GEMM is not exact
                 CHECK(cudaMemset(out5, 0, std::size_t(n) * t * 2));
                 run(kernel, 0, out5);
                 CHECK(cudaDeviceSynchronize());
