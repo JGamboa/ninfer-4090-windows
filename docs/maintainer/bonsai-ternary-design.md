@@ -1001,6 +1001,26 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   byte loads instead of `cp.async`, and four 32-bit A reads per fragment pair instead of two
   64-bit reads plus shift/mask.
 
+- (C) t5 production kernels (`src/ops/linear/t2/t5_a8.cuh`, `t2_embedding.cu`): natural-order
+  plain and rotated A8 quantizers, the arithmetic GEMV (64 threads, two rows per half-warp;
+  from T = 5 the decoded words are reused across four-token chunks), the single-buffered
+  prefill GEMM, and a T5 embedding gather (one four-column word per thread, then the same
+  inverse rotation). `t2_project` requires AllowA8 and a workspace for a T5 weight; every
+  ternary wrapper dispatch accepts T5. `ninfer_linear_t5_test` (FP64 oracle, all routes,
+  A16Only refused) passes. `ninfer_t2_bench`, whole rotated A8 call (quantization included),
+  t5/t2 on 2026-09-24 (display 60 Hz): T = 1 0.85-0.95, T = 3 0.88-0.96 (round 0.87),
+  T = 4 0.93-1.03, T = 5 1.21-1.63, T = 8 1.21-1.72, T = 512 1.07-1.18.
+
+  Accepted regressions. T = 5..8 is compute-bound: per unit and row the t5 GEMV issues ~150
+  decode instructions plus 128 dp4a against t2's 32 extractions plus 128 dp4a; it occurs in
+  prefills of at most eight tokens (~3.5 ms more per such call). An eight-token tensor-core
+  route would remove the dp4a work if it ever matters. Prefill projections are ~7-12 % slower
+  (GEMM above). Decoding A fragments in registers from compact shared bytes was not built: in
+  m16n8k32 the lane with `lid` needs unit words lid, lid + 4, lid + 8, lid + 12, which map to
+  a different (group, trit) per lane of a warp, so a lane either diverges or decodes whole
+  units (~4x the per-thread decode of the shared-memory variant, whose decode is not its
+  bottleneck).
+
 
 - (A+B+C) Ternary embedding. `bonsai2_27b` stores `text/token_embedding` as the GGUF's
   rotated `t2` words (0.33 GB instead of the 1.3 GB primal Q8 table) and sets

@@ -82,8 +82,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaFree(scratch));
     }
-    std::printf("%-12s %6s %6s %4s %10s %10s %10s %10s %12s\n", "role", "N", "K", "T", "A16 us",
-                "A16 GB/s", "A8 us", "A8 GB/s", "A8+rot us");
+    std::printf("%-12s %6s %6s %4s %10s %10s %10s %10s %12s %12s %8s\n", "role", "N", "K", "T",
+                "A16 us", "A16 GB/s", "A8 us", "A8 GB/s", "A8+rot us", "t5+rot us", "t5/t2");
     for (const auto& shape : shapes) {
         const std::array<std::uint64_t, 2> dims{std::uint64_t(shape.n), std::uint64_t(shape.k)};
         const auto geometry =
@@ -100,6 +100,22 @@ int main(int argc, char** argv) {
             parents[c] = {geometry, static_cast<const std::byte*>(buffers[c])};
             weights[c] = native_weight(
                 WeightView{{dims[0], dims[1]}, {{&parents[c], 0, dims[0] * dims[1]}}});
+        }
+        // The same shape as a T5 (base-3) weight, timed rotated under A8 like production.
+        const auto geometry5 =
+            weight_geometry(QType::T5_G128_FP16, QuantLayout::TernaryRowK128, dims);
+        const int copies5 = int((kColdBytes + geometry5.bytes - 1) / geometry5.bytes);
+        std::vector<void*> buffers5(copies5);
+        std::vector<WeightParent> parents5(copies5);
+        std::vector<Weight> weights5(copies5);
+        for (int c = 0; c < copies5; ++c) {
+            CUDA_CHECK(cudaMalloc(&buffers5[c], geometry5.bytes));
+            CUDA_CHECK(cudaMemset(buffers5[c], 0x55 + c, geometry5.code_bytes));
+            CUDA_CHECK(cudaMemset(static_cast<char*>(buffers5[c]) + geometry5.scale_offset, 0x1c,
+                                  geometry5.scale_bytes));
+            parents5[c] = {geometry5, static_cast<const std::byte*>(buffers5[c])};
+            weights5[c] = native_weight(
+                WeightView{{dims[0], dims[1]}, {{&parents5[c], 0, dims[0] * dims[1]}}});
         }
         void* signs = nullptr;
         CUDA_CHECK(cudaMalloc(&signs, std::size_t(shape.k) * 2));
@@ -129,14 +145,25 @@ int main(int argc, char** argv) {
                                             &workspace, nullptr);
                 });
             }
-            std::printf("%-12s %6d %6d %4d %10.1f %10.1f %10.1f %10.1f %12.1f\n", shape.role,
-                        shape.n, shape.k, t, us[0], double(geometry.bytes) / (us[0] * 1e3), us[1],
-                        double(geometry.bytes) / (us[1] * 1e3), us[2]);
+            for (auto& weight : weights5) weight.input_signs = signs;
+            for (int c = 0; c < copies5; ++c) {
+                ops::detail::t2_project(x, weights5[c], outputs, false, ops::LinearPolicy::AllowA8,
+                                        &workspace, nullptr);
+            }
+            const double us5 = median_us(start, stop, [&](int i) {
+                ops::detail::t2_project(x, weights5[i % copies5], outputs, false,
+                                        ops::LinearPolicy::AllowA8, &workspace, nullptr);
+            });
+            std::printf("%-12s %6d %6d %4d %10.1f %10.1f %10.1f %10.1f %12.1f %12.1f %8.3f\n",
+                        shape.role, shape.n, shape.k, t, us[0],
+                        double(geometry.bytes) / (us[0] * 1e3), us[1],
+                        double(geometry.bytes) / (us[1] * 1e3), us[2], us5, us5 / us[2]);
             CUDA_CHECK(cudaFree(x_data));
             CUDA_CHECK(cudaFree(y_data));
         }
         CUDA_CHECK(cudaFree(signs));
         for (void* buffer : buffers) CUDA_CHECK(cudaFree(buffer));
+        for (void* buffer : buffers5) CUDA_CHECK(cudaFree(buffer));
     }
 
     std::printf("\n%-12s %6s %4s %10s\n", "hadamard", "K", "T", "us/call");

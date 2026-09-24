@@ -5,6 +5,7 @@
 #include "ops/linear/t2/t2_a8.cuh"
 #include "ops/linear/t2/t2_gemm.cuh"
 #include "ops/linear/t2/t2_mma.cuh"
+#include "ops/linear/t2/t5_a8.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -177,8 +178,9 @@ struct QuantizedX {
     Tensor q, scale, group_sum, slice_sum;
 };
 
-// Quantizes x, or its Prism rotation when the weight carries input signs (one fused kernel).
-QuantizedX quantize(const Tensor& x, const void* signs, WorkspaceArena& workspace,
+// Quantizes x, or its Prism rotation when the weight carries input signs (one fused kernel),
+// in the t2 (4x4-transposed) or t5 (natural) column order.
+QuantizedX quantize(const Tensor& x, const void* signs, bool natural, WorkspaceArena& workspace,
                     cudaStream_t stream) {
     const int k = x.ne[0], tokens = x.ne[1];
     QuantizedX result{workspace.alloc(DType::I8, {k, tokens}),
@@ -192,11 +194,21 @@ QuantizedX quantize(const Tensor& x, const void* signs, WorkspaceArena& workspac
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     if (signs != nullptr) {
         const dim3 grid(static_cast<unsigned>(k / 1024), static_cast<unsigned>(tokens));
-        t2_a8::rotate_quantize_kernel<<<grid, t2_a8::kRotateThreads, 0, stream>>>(
-            input, static_cast<const __nv_bfloat16*>(signs), k, q, scale, gsum, ssum);
+        const auto* s = static_cast<const __nv_bfloat16*>(signs);
+        if (natural) {
+            t5_a8::rotate_quantize_kernel<<<grid, t5_a8::kRotateThreads, 0, stream>>>(
+                input, s, k, q, scale, gsum, ssum);
+        } else {
+            t2_a8::rotate_quantize_kernel<<<grid, t2_a8::kRotateThreads, 0, stream>>>(
+                input, s, k, q, scale, gsum, ssum);
+        }
     } else {
         const dim3 grid(static_cast<unsigned>(k / 512), static_cast<unsigned>(tokens));
-        t2_a8::quantize_kernel<<<grid, 128, 0, stream>>>(input, k, q, scale, gsum, ssum);
+        if (natural) {
+            t5_a8::quantize_kernel<<<grid, 128, 0, stream>>>(input, k, q, scale, gsum, ssum);
+        } else {
+            t2_a8::quantize_kernel<<<grid, 128, 0, stream>>>(input, k, q, scale, gsum, ssum);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     return result;
@@ -219,7 +231,7 @@ void launch_a8_gemv(const QuantizedX& q, const Weight& w, int tokens,
 void project_a8(const Tensor& x, const Weight& w, const Outputs& packed, bool accumulate,
                 WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope             = workspace.scope();
-    const QuantizedX q     = quantize(x, w.input_signs, workspace, stream);
+    const QuantizedX q     = quantize(x, w.input_signs, false, workspace, stream);
     const int tokens       = x.ne[1];
     t2_a8::Outputs outputs{};
     for (int i = 0; i < kMaxOutputs; ++i) {
@@ -247,17 +259,61 @@ void project_a8(const Tensor& x, const Weight& w, const Outputs& packed, bool ac
     }
 }
 
+template <int Tile>
+void launch_t5_gemv(const QuantizedX& q, const Weight& w, int tokens,
+                    const t2_a8::Outputs& outputs, bool accumulate, cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned>((w.n + t5_a8::kGemvRowsPerCta - 1) / t5_a8::kGemvRowsPerCta),
+                    static_cast<unsigned>((tokens + Tile - 1) / Tile));
+    t5_a8::gemv_kernel<Tile><<<grid, t5_a8::kGemvThreads, 0, stream>>>(
+        static_cast<const uint4*>(q.q.data), static_cast<const float*>(q.scale.data),
+        static_cast<const int*>(q.slice_sum.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.n, w.k, tokens, outputs,
+        accumulate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void project_t5(const Tensor& x, const Weight& w, const Outputs& packed, bool accumulate,
+                WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope         = workspace.scope();
+    const QuantizedX q = quantize(x, w.input_signs, true, workspace, stream);
+    const int tokens   = x.ne[1];
+    t2_a8::Outputs outputs{};
+    for (int i = 0; i < kMaxOutputs; ++i) {
+        outputs.data[i] = packed.data[i];
+        outputs.end[i]  = packed.end[i];
+    }
+    if (tokens > kMaxTile && w.n % t5_a8::kGemmRows == 0) {
+        const dim3 grid(static_cast<unsigned>(w.n / t5_a8::kGemmRows),
+                        static_cast<unsigned>((tokens + t5_a8::kGemmTokens - 1) /
+                                              t5_a8::kGemmTokens));
+        t5_a8::gemm_kernel<<<grid, t5_a8::kGemmThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
+            static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, outputs,
+            accumulate);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    switch (tokens) {
+    case 1: launch_t5_gemv<1>(q, w, tokens, outputs, accumulate, stream); break;
+    case 2: launch_t5_gemv<2>(q, w, tokens, outputs, accumulate, stream); break;
+    case 3: launch_t5_gemv<3>(q, w, tokens, outputs, accumulate, stream); break;
+    case 4: launch_t5_gemv<4>(q, w, tokens, outputs, accumulate, stream); break;
+    default: launch_t5_gemv<kMaxTile>(q, w, tokens, outputs, accumulate, stream); break;
+    }
+}
+
 } // namespace
 
 void validate_t2_weight(const Weight& w, const char* op) {
-    if (w.qtype != QType::T2_G128_FP16 || w.layout != QuantLayout::TernaryRowK128 ||
+    if (!ternary_qtype(w.qtype) || w.layout != QuantLayout::TernaryRowK128 ||
         w.scale_dtype != DType::FP16 || w.group_size != 128 || w.n <= 0 || w.k % 1024 ||
         w.qdata == nullptr || w.qhigh != nullptr || w.scales == nullptr ||
         (reinterpret_cast<std::uintptr_t>(w.qdata) & 15) ||
         (reinterpret_cast<std::uintptr_t>(w.scales) & 15) || w.scale_nb[1] != w.k / 64 ||
         (reinterpret_cast<std::uintptr_t>(w.input_signs) & 1)) {
         throw std::invalid_argument(std::string(op) +
-                                    ": weight must be T2_G128_FP16 ternary rows with K%1024=0");
+                                    ": weight must be T2/T5_G128_FP16 ternary rows with K%1024=0");
     }
 }
 
@@ -304,6 +360,13 @@ void t2_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     }
     if (end != w.n) {
         throw std::invalid_argument("t2_project: output rows must cover the weight rows");
+    }
+    if (w.qtype == QType::T5_G128_FP16) {
+        if (!allows_a8(policy) || workspace == nullptr) {
+            throw std::invalid_argument("t2_project: a T5 weight requires AllowA8 and a workspace");
+        }
+        project_t5(x, w, packed, accumulate, *workspace, stream);
+        return;
     }
     if (allows_a8(policy) && workspace != nullptr) {
         project_a8(x, w, packed, accumulate, *workspace, stream);

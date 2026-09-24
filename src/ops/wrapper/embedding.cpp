@@ -234,6 +234,7 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         detail::embed_gather_fp8_launch(ids, table, out, stream);
         break;
     case QType::T2_G128_FP16:
+    case QType::T5_G128_FP16:
         require_weight_2d(table);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);

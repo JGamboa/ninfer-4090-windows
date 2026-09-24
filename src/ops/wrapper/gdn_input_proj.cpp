@@ -311,7 +311,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         return;
     }
 
-    if (weight.qtype == QType::T2_G128_FP16) {
+    if (ternary_qtype(weight.qtype)) {
         constexpr std::int32_t kHidden  = 5120;
         constexpr std::int32_t kQkvRows = 10240;
         constexpr std::int32_t kZRows   = 6144;
@@ -477,7 +477,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         return;
     }
 
-    if (weight.qtype == QType::T2_G128_FP16) {
+    if (ternary_qtype(weight.qtype)) {
         constexpr std::int32_t kHidden    = 5120;
         constexpr std::int32_t kQueryRows = 2048;
         constexpr std::int32_t kKeyRows   = 2048;
@@ -668,7 +668,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         return;
     }
 
-    if (weight.qtype == QType::T2_G128_FP16) {
+    if (ternary_qtype(weight.qtype)) {
         constexpr std::int32_t kHidden    = 5120;
         constexpr std::int32_t kQueryRows = 2048;
         constexpr std::int32_t kKeyRows   = 2048;
@@ -827,7 +827,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
-    if (parent_qtype == QType::T2_G128_FP16 && parent_rows == 16384 && input_rows == 5120) {
+    if (ternary_qtype(parent_qtype) && parent_rows == 16384 && input_rows == 5120) {
         return detail::t2_workspace_capacity_bytes(policy, input_rows, max_tokens);
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
@@ -897,7 +897,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::T2_G128_FP16 && parent_rows == 16384 && input_rows == 5120) {
+    if (ternary_qtype(parent_qtype) && parent_rows == 16384 && input_rows == 5120) {
         return composed_snapshot_capacity(
             10240, batch_size * max_width,
             detail::t2_workspace_capacity_bytes(policy, input_rows, batch_size * max_width));
@@ -951,7 +951,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::T2_G128_FP16 && parent_rows == 16384 && input_rows == 5120) {
+    if (ternary_qtype(parent_qtype) && parent_rows == 16384 && input_rows == 5120) {
         return detail::t2_workspace_capacity_bytes(policy, input_rows, batch_size * max_width);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
