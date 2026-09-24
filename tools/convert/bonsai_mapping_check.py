@@ -63,7 +63,7 @@ def compare(gguf: Path, reference: Path, base: Path, layers=(0, 3), max_rows=204
                 value = float(_row_cosine(ours, theirs)[0])
                 extra = f"max|diff| {float((ours - theirs).abs().max()):.4g}"
             threshold = TERNARY_MIN if ternary else DIRECT_MIN
-            rows_out.append((name, "t2" if ternary else "direct", value, extra, value >= threshold))
+            rows_out.append((name, "ternary" if ternary else "direct", value, extra, value >= threshold))
     return rows_out
 
 

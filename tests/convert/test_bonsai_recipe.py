@@ -174,22 +174,3 @@ def test_mtp_is_copied_word_for_word(converted):
             else:
                 assert torch.equal(source.dequantize(name), result.dequantize(name)), name
 
-
-def test_t5_conversion_keeps_the_exact_gguf_trits(tmp_path, monkeypatch):
-    # The recipe's stored ternary format switched to base-3 t5 (design doc 9.1, step 2).
-    import tools.convert.official_recipes as recipes
-
-    monkeypatch.setattr(recipes, "TERNARY_FORMAT", "t5_g128_fp16")
-    fixture, _, _, out, _ = convert_bonsai(tmp_path)
-    with Artifact(out) as artifact:
-        for name, gguf in (
-            ("text/output_head", "output.weight"),
-            ("text/token_embedding", "token_embd.weight"),
-            ("text/layers/1/gdn/output", "blk.1.ssm_out.weight"),
-        ):
-            obj = _parent(artifact, name)
-            assert (obj.format, obj.layout) == ("t5_g128_fp16", "ternary_row_k128_v1"), name
-            codes, scales = decode_ternary_words(artifact.read_object(obj.id), obj.shape, obj.format)
-            stored_codes, stored_scales = fixture.ternary[gguf]
-            np.testing.assert_array_equal(unpack_ternary_codes(codes, obj.format).numpy(), stored_codes)
-            np.testing.assert_array_equal(scales.numpy(), stored_scales)

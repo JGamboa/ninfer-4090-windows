@@ -110,7 +110,7 @@ ROW_SCALE_V1 = Layout(
 TERNARY_ROW_K128_V1 = Layout(
     "ternary_row_k128_v1",
     256,
-    frozenset(("t2_g128_fp16", "t5_g128_fp16")),
+    frozenset(("t5_g128_fp16",)),
 )
 
 LAYOUTS = MappingProxyType(
@@ -269,7 +269,7 @@ def row_scale_geometry(
 def ternary_geometry(
     format: str | TernaryFormat, shape: Sequence[int]
 ) -> TernaryGeometry:
-    """Row-major code plane (the format's packing), then a 256-aligned FP16 scale plane."""
+    """Row-major base-3 code plane, then a 256-aligned row-major FP16 scale plane."""
     spec = _format(format)
     if not isinstance(spec, TernaryFormat):
         raise ValueError("ternary_row_k128_v1 requires a ternary format")

@@ -1,8 +1,7 @@
 """Exact ternary codes and FP16 group scales in ternary_row_k128_v1 layout.
 
-Codes are uint8 in {0, 1, 2} (weight ``c - 1``); a format's ``packing`` defines the code
-bytes (`tools/artifact/formats.py` `TernaryFormat`): ``slot2`` for `t2_g128_fp16`, scaled
-base 3 in 13-byte units of 64 columns for `t5_g128_fp16`.
+Codes are uint8 in {0, 1, 2} (weight ``c - 1``), stored as scaled base 3 in 13-byte units of
+64 columns (`t5_g128_fp16`; the byte layout is `tools/artifact/formats.py` `TernaryFormat`).
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ from ..formats import TernaryFormat, get_format
 from ..layouts import ternary_geometry
 from ._tensor_bytes import Payload, _payload_length, _payload_tensor
 
-_SHIFTS = (0, 2, 4, 6)
 
 
 def _ternary(format: str | TernaryFormat) -> TernaryFormat:
@@ -51,13 +49,7 @@ def pack_ternary_codes(
     codes: torch.Tensor, format: str | TernaryFormat
 ) -> torch.Tensor:
     """Pack uint8 codes in {0, 1, 2} [rows, K] into the format's code bytes."""
-    spec = _ternary(format)
-    if spec.packing == "slot2":
-        # Weight k occupies bits 2 * (k % 4) of byte k // 4 (PQ2_0 order).
-        _check_codes(codes, 4)
-        quads = codes.reshape(codes.shape[0], -1, 4).to(torch.int32)
-        packed = quads[..., 0] | (quads[..., 1] << 2) | (quads[..., 2] << 4) | (quads[..., 3] << 6)
-        return packed.to(torch.uint8)
+    _ternary(format)
     _check_codes(codes, 64)
     rows = codes.shape[0]
     units = codes.reshape(rows, -1, 64).to(torch.int32)
@@ -82,13 +74,9 @@ def unpack_ternary_codes(
     packed: torch.Tensor, format: str | TernaryFormat
 ) -> torch.Tensor:
     """Inverse of :func:`pack_ternary_codes`; returns uint8 codes [rows, K]."""
-    spec = _ternary(format)
+    _ternary(format)
     if packed.dtype != torch.uint8 or packed.dim() != 2:
         raise TypeError("packed ternary codes must be a uint8 matrix")
-    if spec.packing == "slot2":
-        words = packed.to(torch.int32)
-        slots = [(words >> shift) & 3 for shift in _SHIFTS]
-        return torch.stack(slots, dim=-1).reshape(packed.shape[0], -1).to(torch.uint8)
     if packed.shape[1] % 13:
         raise TypeError("base-3 ternary rows must be whole 13-byte units")
     trits = _base3_trits(packed)
@@ -105,21 +93,16 @@ def unpack_ternary_codes(
 def validate_ternary_words(
     codes: torch.Tensor, scales: torch.Tensor, format: str | TernaryFormat
 ) -> None:
-    """Reject invalid code bytes (slot 3; a base-3 byte outside the 243 encodings or a
-    nonzero padding trit) and non-finite FP16 scales."""
-    spec = _ternary(format)
-    if spec.packing == "slot2":
-        words = codes.to(torch.int32)
-        if bool(torch.stack([((words >> s) & 3) == 3 for s in _SHIFTS]).any()):
-            raise ValueError("ternary codes must not contain the invalid slot value 3")
-    else:
-        trits = _base3_trits(codes)
-        value = (trits * _BASE3_WEIGHTS).sum(dim=-1)
-        canonical = (256 * value + 242) // 243
-        if bool((canonical != codes.to(torch.int32).reshape(value.shape)).any()):
-            raise ValueError("base-3 ternary bytes must be canonical encodings")
-        if bool((trits[..., 12, 4] != 0).any()):
-            raise ValueError("base-3 ternary byte 12 must have a zero fifth trit")
+    """Reject code bytes outside the 243 canonical encodings, a nonzero padding trit, and
+    non-finite FP16 scales."""
+    _ternary(format)
+    trits = _base3_trits(codes)
+    value = (trits * _BASE3_WEIGHTS).sum(dim=-1)
+    canonical = (256 * value + 242) // 243
+    if bool((canonical != codes.to(torch.int32).reshape(value.shape)).any()):
+        raise ValueError("base-3 ternary bytes must be canonical encodings")
+    if bool((trits[..., 12, 4] != 0).any()):
+        raise ValueError("base-3 ternary byte 12 must have a zero fifth trit")
     if not bool(torch.isfinite(scales.float()).all()):
         raise ValueError("ternary scales must be finite FP16 values")
 

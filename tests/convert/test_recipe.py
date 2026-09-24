@@ -274,7 +274,7 @@ def test_private_component_storage_cannot_be_packed_with_target_weights():
 def _ternary_source(name, rows, seed):
     generator = torch.Generator().manual_seed(seed)
     logical = torch.randint(0, 3, (rows, 256), dtype=torch.uint8, generator=generator)
-    codes = pack_ternary_codes(logical, "t2_g128_fp16")
+    codes = pack_ternary_codes(logical, "t5_g128_fp16")
     scales = torch.rand((rows, 2), generator=generator).to(torch.float16)
 
     def no_values(begin, end):
@@ -285,7 +285,7 @@ def _ternary_source(name, rows, seed):
         name,
         no_values,
         lambda begin, end: EncodedRows(
-            "t2_g128_fp16", codes[begin:end], scales[begin:end]
+            "t5_g128_fp16", codes[begin:end], scales[begin:end]
         ),
     )
     return source, codes, scales
@@ -301,18 +301,18 @@ def test_ternary_import_fuses_packing_group_rows_exactly(tmp_path):
         model.add(Parameter(name, source.shape, source, inputs=("input",)))
     model.packing_groups = [("query", "key", "z")]
     recipe = Recipe(model)
-    recipe.assign("*", format="t2_g128_fp16", method=import_encoded)
+    recipe.assign("*", format="t5_g128_fp16", method=import_encoded)
     prepared = recipe.prepare(device="cpu", rows_per_chunk=4)
     assert len(prepared.weights) == 1
     spec = prepared.weights[0].spec
     assert (spec.shape, spec.layout) == ((15, 256), "ternary_row_k128_v1")
-    path = tmp_path / "t2.ninfer"
+    path = tmp_path / "t5.ninfer"
     _write(path, model, prepared)
     expected = encode_ternary(
         torch.cat([codes for _, codes, _ in parts.values()]),
         torch.cat([scales for _, _, scales in parts.values()]),
         (15, 256),
-        "t2_g128_fp16",
+        "t5_g128_fp16",
     )
     with Artifact(path) as artifact:
         assert artifact.read_object(spec.id) == expected

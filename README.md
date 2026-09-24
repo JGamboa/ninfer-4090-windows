@@ -5,8 +5,8 @@ natively on **Windows** (MSVC + CUDA, no WSL, no Docker) and on Linux. It runs t
 of the same architecture:
 
 - **[Prism ML Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)**
-  — Qwen3.8-27B compressed to ternary weights {−1, 0, +1}. This branch adds it: **~116–173
-  tok/s decode** (prompt-dependent) from a 7.7 GB artifact with image input. That is 1.5–2.2x the
+  — Qwen3.8-27B compressed to ternary weights {−1, 0, +1}. This branch adds it: **~141–178
+  tok/s decode** (prompt-dependent) from a 6.6 GB artifact with image input. That is 1.8–2.3x the
   decode speed of Prism's own llama.cpp fork on the same card, at the same perplexity.
 - **Qwen3.8-27B** (the official NInfer groupwise artifact), inherited from the upstream 4090
   port: 148.6 tok/s code decode, 262K context. See [Qwen3.8-27B on the RTX 4090](#qwen38-27b-on-the-rtx-4090).
@@ -24,24 +24,26 @@ of the same architecture:
 ### Results on the RTX 4090
 
 Same machine for every row: RTX 4090 at stock clocks, Core i9-13900K, Windows 11, driver
-595.97, CUDA 13.4. Greedy decoding. NInfer uses MTP speculative decoding with 2 draft tokens
-and `--lm-head-draft`. The Prism fork is llama.cpp build b10709 (`PrismML-Eng/llama.cpp`) on
-`Ternary-Bonsai-2-27B-PTQ1_0.gguf`.
+595.97, CUDA 13.4, display at 60 Hz. Greedy decoding. NInfer uses MTP speculative decoding with
+2 draft tokens and `--lm-head-draft`. The Prism fork is llama.cpp build b10709
+(`PrismML-Eng/llama.cpp`) on `Ternary-Bonsai-2-27B-PTQ1_0.gguf`.
 
 | Measurement | NInfer (this branch) | Prism llama.cpp fork |
 |---|---:|---:|
-| Decode, short story (MTP) | **116 tok/s** (122 with the display at 60 Hz) | — |
-| Decode, Python code (MTP) | **165 tok/s** (173 at 60 Hz) | — |
-| Decode, no speculation (`tg128`) | 85 tok/s | 77 tok/s |
-| Prefill (`pp512`) | **2,648 tok/s** | 1,363 tok/s |
-| Perplexity, wikitext / code corpus | 8.085 / 1.895 | 8.178 / 1.899 |
-| Weights in VRAM (text + MTP head) | 7.45 GiB | 5.5 GiB |
-| Vision tower | 23 ms per image | via `--mmproj` |
+| Decode, short story (MTP) | **142 tok/s** | — |
+| Decode, Python code (MTP) | **178 tok/s** | — |
+| Decode, mean of six prompts (MTP) | **163 tok/s** | — |
+| Decode, no speculation (`tg128`) | **101 tok/s** | 77 tok/s |
+| Prefill (`pp512`) | **2,428 tok/s** | 1,363 tok/s |
+| Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
+| Weights in VRAM, text only | 5.52 GiB | 5.53 GiB |
+| Weights in VRAM with the MTP head | ~6.5 GiB | — |
+| Vision tower | 22 ms per image | via `--mmproj` |
 
 - The decode rows depend on the text: MTP drafts are accepted more often in predictable output
-  (code, math: 165–173 tok/s) than in free prose (116–122 tok/s).
+  (code, math: 170–178 tok/s) than in free prose (141–142 tok/s).
 - Perplexity: wikitext and code are the two corpora where both tools score comparable text.
-  NInfer's quick run over four corpora gives an overall 5.8545 (Qwen3.8-27B Q4/Q5: 4.80).
+  NInfer's quick run over four corpora gives an overall 5.8556 (Qwen3.8-27B Q4/Q5: 4.80).
 - The fork's prefill figure uses the PTQ1_0 packing; Prism's model card says its PQ2_0 packing
   processes prompts faster, so part of the prefill gap is the file format, not the engine.
 - The RTX 4090 in these measurements also drives a 4K desktop. See
@@ -50,23 +52,24 @@ and `--lm-head-draft`. The Prism fork is llama.cpp build b10709 (`PrismML-Eng/ll
 ### Why it is fast
 
 At one token per step, decode reads every weight once per token, so the speed is set by memory
-bandwidth. Both engines are close to that limit without speculation (85 against 77 tok/s). The
-difference comes from three places:
+bandwidth. Without speculation NInfer reads the same bytes as the fork (both store about 1.75
+bits per weight) and decodes 101 against 77 tok/s. With speculation the difference grows, for
+three reasons:
 
 1. **MTP speculative decoding.** The Bonsai GGUF has no MTP head, so the converter copies the one
    from Qwen3.8-27B (same architecture). Each round, the MTP layer proposes two tokens and the
    ternary model verifies three positions while reading its weights once. A round costs about
-   15 ms and yields about 1.8 tokens.
+   13 ms and yields about 1.8 tokens.
 2. **Kernels specialized for this model and this card.** The ternary weights are stored as
-   2-bit codes with one FP16 scale per 128 weights (`t2_g128_fp16`). Decode quantizes
-   activations to int8 and multiplies with `dp4a`; prefill uses int8 tensor cores. Prism's
-   Hadamard rotation is fused into the activation quantization, and the whole decode round
-   replays as one CUDA Graph.
+   scaled base 3, five weights per byte, with one FP16 scale per 128 weights (`t5_g128_fp16`).
+   A few integer operations turn four bytes into `dp4a` operands. Decode quantizes activations
+   to int8 and multiplies with `dp4a`; prefill uses int8 tensor cores. Prism's Hadamard rotation
+   is fused into the activation quantization, and the whole decode round replays as one CUDA
+   Graph.
 3. **Prefill in large tiles.** The int8 tensor-core GEMM reads the weights once per 64 tokens.
 
-The costs: about 2 GB more VRAM than the fork (2-bit codes instead of 1.6–1.75 bits, plus the MTP
-head), and an MTP head that was trained for Qwen3.8, not for Bonsai, so acceptance varies with the
-content.
+The costs: about 1 GB of VRAM for the MTP head, and an MTP head that was trained for Qwen3.8, not
+for Bonsai, so acceptance varies with the content.
 
 ### Quick start (Windows)
 
@@ -134,13 +137,14 @@ slower on prose (about −10 %); 2 is the better default. `ninfer.exe --help` an
   ternary codes bit-exact, including the output head and the token embedding. A reader for
   Prism's Qwen3-VL `mmproj` adds the vision tower (the Qwen3.8 tower, confirmed by
   `bonsai_vision_check`).
-- **Format** `t2_g128_fp16`: 2-bit ternary codes, one FP16 scale per 128 weights, rows of fused
-  projections in one parent object.
-- **Kernels** (`src/ops/linear/t2`): an A16 GEMV and tensor-core GEMMs, an int8 activation path
-  (`dp4a` GEMV, `m16n8k32` GEMM), the Prism Hadamard rotation fused into activation
+- **Format** `t5_g128_fp16`: scaled base-3 ternary codes (13 bytes per 64 weights), one FP16
+  scale per 128 weights, rows of fused projections in one parent object. The converter repacks
+  Prism's trits exactly; perplexity equals that of an earlier 2-bit layout to every printed digit.
+- **Kernels** (`src/ops/linear/t5`): an int8 activation path (`dp4a` GEMV for decode,
+  `m16n8k32` tensor-core GEMM for prefill), the Prism Hadamard rotation fused into activation
   quantization, and a ternary embedding gather with the inverse rotation. Each kernel is tested
-  against an independent FP64 oracle (`ninfer_linear_t2_test`) and benchmarked with
-  `ninfer_t2_bench`.
+  against an independent FP64 oracle (`ninfer_linear_t5_test`) and benchmarked with
+  `ninfer_t5_bench`.
 - **Runtime**: every ternary weight carries its Hadamard sign vector, so the model code passes
   ordinary activations. The loader checks that the artifact's rotation metadata matches the
   formats it binds.

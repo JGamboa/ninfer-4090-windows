@@ -192,8 +192,8 @@ def test_assert_prism_ternary_gguf_validates_required_metadata(tmp_path):
             assert_prism_ternary_gguf(store)
 
 
-@pytest.mark.parametrize("format", ["t2_g128_fp16", "t5_g128_fp16"])
-def test_ternary_rows_repack_the_stored_codes_exactly(tmp_path, format):
+def test_ternary_rows_repack_the_stored_codes_exactly(tmp_path):
+    format = "t5_g128_fp16"
     from tools.artifact.codecs.ternary import dequantize_ternary_words
     from tools.convert.sources.prism_gguf import ternary_rows
 
@@ -215,16 +215,15 @@ def test_ternary_rows_repack_the_stored_codes_exactly(tmp_path, format):
     with GgufStore(path) as store:
         for name in ("ptq.weight", "pq.weight"):
             codes, scales = ternary_rows(store, name, 1, 3, format)
-            row_bytes = 64 if format == "t2_g128_fp16" else 52
-            assert codes.shape == (2, row_bytes) and scales.shape == (2, 2)
+            assert codes.shape == (2, 52) and scales.shape == (2, 2)
             np.testing.assert_array_equal(
                 dequantize_ternary_words(codes, scales, format=format).numpy(),
                 dequantize_rows(store, name, 1, 3).numpy(),
             )
 
 
-@pytest.mark.parametrize("format", ["t2_g128_fp16", "t5_g128_fp16"])
-def test_ternary_rows_reject_the_invalid_pq2_0_code(tmp_path, format):
+def test_ternary_rows_reject_the_invalid_pq2_0_code(tmp_path):
+    format = "t5_g128_fp16"
     from tools.convert.sources.prism_gguf import ternary_rows
 
     path = tmp_path / "bad.gguf"

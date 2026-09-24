@@ -8,8 +8,7 @@ views per ternary matrix:
   (`unrotate_rows`), for the embedding the primal table. A recipe that re-quantizes a
   ternary tensor (the v1 Q8 output head and embedding) therefore folds the rotation
   automatically.
-- encoded rows: the exact rotated ternary words in a requested ternary format
-  (`t2_g128_fp16` or `t5_g128_fp16`), for `import_encoded`.
+- encoded rows: the exact rotated ternary words as `t5_g128_fp16`, for `import_encoded`.
   Their column axis stays in the rotated basis; the runtime applies the Hadamard to a
   projection's activation, or to a gathered embedding row (`prism_hadamard` text config).
   Projections (`prism.hadamard.weight_names`) and the embedding

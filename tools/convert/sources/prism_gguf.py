@@ -7,8 +7,8 @@ test_prism_gguf.py` checks the vectorized decoders here against a literal scalar
 transliteration of the same C loops.
 
 Both codecs first produce the stored codes {0, 1, 2} and FP16 block scales;
-:func:`ternary_rows` repacks them exactly into ternary words (`t2_g128_fp16` or
-`t5_g128_fp16`, design doc sections 2 and 9.1)
+:func:`ternary_rows` repacks them exactly into `t5_g128_fp16` words (design doc sections 2
+and 9.1)
 and :func:`dequantize_rows` reproduces the reference C dequantization `(code - 1) * d`.
 """
 
@@ -129,7 +129,7 @@ _CODE_DECODERS = {
 def ternary_rows(
     store: GgufStore, name: str, row_begin: int, row_end: int, format: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact ternary words of a row range in `format` (`t2_g128_fp16` or `t5_g128_fp16`):
+    """Exact ternary words of a row range in `format` (`t5_g128_fp16`):
     packed uint8 code bytes `[rows, code_row_bytes]` and float16 scales `[rows, K/128]`.
     The GGUF's trits are repacked exactly; nothing is expanded to floats."""
     info = store.tensor(name)

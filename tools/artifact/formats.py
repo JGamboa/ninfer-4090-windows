@@ -45,27 +45,20 @@ class Fp8RowFormat:
 
 @dataclass(frozen=True, slots=True)
 class TernaryFormat:
-    """Ternary {-1, 0, +1} weights with one binary16 scale per K group.
+    """Ternary {-1, 0, +1} weights with one binary16 scale per K group, scaled base 3.
 
-    Code ``c`` in ``{0, 1, 2}`` represents ``c - 1``. ``packing`` selects the code bytes:
-
-    - ``slot2``: four codes per byte, weight ``k`` in bits ``2 * (k % 4)`` of byte ``k // 4``
-      (code 3 is invalid);
-    - ``base3``: 64-column units of 13 bytes (TQ1_0-style scaled base 3). Byte ``i < 12`` of
-      unit ``u``, with ``g = i // 4`` and ``j = i % 4``, holds the trits
-      ``t_m = c[64 u + 20 g + 4 m + j]`` (m = 0..4); byte 12 holds ``t_m = c[64 u + 60 + m]``
-      for m = 0..3 and ``t_4 = 0``. The byte is ``q = (256 v + 242) // 243`` with
-      ``v = sum_m t_m 3^(4 - m)``; decode ``r = q``, then per m: ``r *= 3``, ``t_m = r >> 8``,
-      ``r &= 255``. Only the 243 values ``q(v)`` are valid bytes.
+    Code ``c`` in ``{0, 1, 2}`` represents ``c - 1``. A row is 64-column units of 13 bytes
+    (TQ1_0-style scaled base 3). Byte ``i < 12`` of unit ``u``, with ``g = i // 4`` and
+    ``j = i % 4``, holds the trits ``t_m = c[64 u + 20 g + 4 m + j]`` (m = 0..4); byte 12 holds
+    ``t_m = c[64 u + 60 + m]`` for m = 0..3 and ``t_4 = 0``. The byte is
+    ``q = (256 v + 242) // 243`` with ``v = sum_m t_m 3^(4 - m)``; decode ``r = q``, then per m:
+    ``r *= 3``, ``t_m = r >> 8``, ``r &= 255``. Only the 243 values ``q(v)`` are valid bytes.
     """
 
     name: str
     group_size: int
-    packing: str
 
     def code_row_bytes(self, k: int) -> int:
-        if self.packing == "slot2":
-            return k // 4
         return k // 64 * 13
 
 
@@ -84,8 +77,7 @@ Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
-T2_G128_FP16 = TernaryFormat("t2_g128_fp16", 128, "slot2")
-T5_G128_FP16 = TernaryFormat("t5_g128_fp16", 128, "base3")
+T5_G128_FP16 = TernaryFormat("t5_g128_fp16", 128)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -95,7 +87,7 @@ QUANT_FORMATS = MappingProxyType(
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
 TERNARY_FORMATS = MappingProxyType(
-    {item.name: item for item in (T2_G128_FP16, T5_G128_FP16)}
+    {item.name: item for item in (T5_G128_FP16,)}
 )
 NUMERIC_FORMATS = MappingProxyType(
     {
@@ -186,7 +178,6 @@ __all__ = [
     "Q8_G32_FP16",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
-    "T2_G128_FP16",
     "T5_G128_FP16",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",

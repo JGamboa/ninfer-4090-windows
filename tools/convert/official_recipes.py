@@ -184,8 +184,8 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
-# The stored ternary format of every Bonsai projection, head and embedding. The base-3
-# `t5_g128_fp16` replaces it once its production kernels land (design doc 9.1, step 2).
+# The stored ternary format of every Bonsai projection, head and embedding: scaled base 3,
+# the exact GGUF trits (design doc section 2 and 9.1).
 TERNARY_FORMAT = "t5_g128_fp16"
 
 _BONSAI_TERNARY = (
@@ -261,7 +261,7 @@ def _bonsai_mtp(model, recipe, reference: NInferArtifactStore) -> None:
 
 
 def bonsai2_27b(model, recipe, sources):
-    """Prism Ternary Bonsai 2: t2 projections, output head and embedding, copied MTP.
+    """Prism Ternary Bonsai 2: t5 projections, output head and embedding, copied MTP.
 
     Sources: ``gguf`` (the PTQ1_0/PQ2_0 GGUF); with the ``mtp`` component, ``mtp`` (an
     existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word); with the
