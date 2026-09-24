@@ -847,6 +847,21 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   rotates a BF16 workspace copy. The t2 workspace capacity covers that copy under A16Only.
   Oracle: `ninfer_linear_t2_test` rotates x with an explicit FP64 Sylvester matrix.
 
+  Measured 2026-09-24 on the RTX 4090 (commit `9573282`, same `E:\LLM\bonsai2_27b_a8.ninfer`,
+  no reconversion). `ninfer_linear_t2_test` prints `OK t2 A16/A8`. `ninfer_t2_bench`, two runs,
+  A8 -> A8+rot us: T <= 8 within ~1-2 us on every role (single outliers of ~10 us did not
+  repeat); T=512 +10 to +67 us (gdn in_proj 569 -> 614, o_proj 185 -> 201, mlp down 524 ->
+  592, about the standalone `hadamard` cost at that T). End to end: MTP decode (draft 2,
+  `--lm-head-draft`) 99.5 -> 111.3 / 110.4 tok/s over two runs (4.6 s for 512 tokens in 295
+  rounds, ~15.6 ms per round), prefill 1.09k tok/s on the 62-token prompt; acceptance 41.4 ->
+  36.7 % (1.73 tok/round, the greedy text changed after ~a paragraph as expected from the
+  unrounded rotation). Quick perplexity 8.0854 / 9.2865 / 8.1811 / 1.8945, overall 5.8545
+  (5.8543 before, +0.003 %), scored at 1347 tok/s (1060 before). The full tree now builds
+  under MSVC: the GDN replay tests no longer call `std::sqrt` in a constant expression, the
+  context-cost fixture checks the attention-pair sum without `__int128`, the Q4 SwiGLU variants
+  bench uses the current `QType` name, and the artifact materialization test (GNU ld `--wrap`)
+  is registered only off Windows.
+
 - Test machine: RTX 4090 at stock clocks (500 W limit, no throttling under load; CUDA
   processes run in P2 with memory at 10251 of 10501 MHz), driver 595.97 WDDM (the 4090 also
   drives a 3840x2160 120 Hz desktop), PCIe 4.0 x16, Core i9-13900K, CUDA 13.4.
@@ -855,27 +870,21 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 
 State at `9573282`: t2 conversion (`bonsai2_27b`, t2 head, `AllowA8`), A16 and A8 t2 routes,
 weight-owned rotation fused into the A8 quantization, MSVC test-build fixes. Working artifact:
-`E:\LLM\bonsai2_27b_a8.ninfer` (no reconversion needed for the fused rotation). Baseline before
-the fusion: decode 99.5 tok/s (MTP draft 2, `--lm-head-draft`, 41.4 % acceptance), quick
-perplexity 8.0827 / 9.2857 / 8.1834 / 1.8944, overall 5.8543 at 1060 tok/s. Fork reference:
-pp512 1363 tok/s, tg128 77.1 tok/s.
+`E:\LLM\bonsai2_27b_a8.ninfer` (no reconversion needed for the fused rotation). The fused
+rotation is validated on the RTX 4090 (section 9): decode 111 tok/s (MTP draft 2,
+`--lm-head-draft`, 36.7 % acceptance, ~15.6 ms per round), quick perplexity 8.0854 / 9.2865 /
+8.1811 / 1.8945, overall 5.8545 at 1347 tok/s. Fork reference: pp512 1363 tok/s, tg128 77.1
+tok/s.
 
 Next steps, in order:
 
-1. Validate `dd33aff` (fused rotation) on the RTX 4090: `cmake --build build -j` (if an
-   unrelated test fails under MSVC, fix it portably as in `9e20e65`/`9573282`), then
-   `ninfer_linear_t2_test` (expects `OK t2 A16/A8`, includes rotated weights against an FP64
-   Sylvester oracle), `ninfer_t2_bench 1 3 4 8 512` (`A8+rot us` should be within a few us of
-   `A8 us`), the lighthouse generation and the quick perplexity above. Record the results in
-   section 9. Output text may differ slightly: the rotated activation is no longer rounded to
-   BF16 before quantization.
-2. Whole-round profile with A8 (`nsys profile --cuda-graph-trace=node --force-export=true`
-   around the lighthouse generation) to attribute the ~18 ms MTP round now that t2
-   projections run at 650-800 GB/s: attention, GDN recurrence, MTP layer, output head,
-   quantization kernels.
-3. Prefill against the fork (pp512 1363 tok/s): measure a 512-token prompt; if the A8 GEMM
+1. Whole-round profile with A8 (`nsys profile --cuda-graph-trace=node --force-export=true`
+   around the lighthouse generation) to attribute the ~15.6 ms MTP round: attention, GDN
+   recurrence, MTP layer, output head, quantization kernels. Also check whether the acceptance
+   drop (41.4 -> 36.7 %) is prompt-specific by measuring acceptance on a few other prompts.
+2. Prefill against the fork (pp512 1363 tok/s): measure a 512-token prompt; if the A8 GEMM
    (64 x 64 tiles, `t2_a8.cuh`) dominates, try 128-row tiles or a deeper cp.async pipeline.
-4. From the profile, fuse what remains cheap to fuse (SwiGLU into the down quantization,
+3. From the profile, fuse what remains cheap to fuse (SwiGLU into the down quantization,
    residual/norm neighbours), each with an oracle test and a bench before/after.
 
 ## Appendix: sources
