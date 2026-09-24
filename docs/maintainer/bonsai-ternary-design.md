@@ -762,6 +762,27 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   Qwen3.5 export convention). These are covered by synthetic tests only until
   `python -m tools.convert.bonsai_mapping_check` runs on the real files (conversion doc).
 
+- (A+B+C) First end-to-end results, 2026-09-24, RTX 4090 (Windows, CUDA 13.4), artifact
+  `bonsai2_27b_t2.ninfer` (9.00 GiB of weights; `bonsai_mapping_check` all t2 rows ~0.88,
+  direct rows >= 0.97): `ninfer_hadamard_test` and `ninfer_linear_t2_a16_test` pass. Greedy
+  generation is coherent (512-token story, no degradation). Warm decode with the t2 kernel of
+  commit `000f4a5` (`ninfer_t2_bench`, median of 7 cold-weight repeats):
+
+  | role (N x K) | T=1 | T=2 | T=3 | T=4 | T=8 |
+  |---|---|---|---|---|---|
+  | gdn in_proj 16384 x 5120 | 756 GB/s | 680 | 589 | 512 | 242 |
+  | mlp gate+up 34816 x 5120 | 833 | 742 | 630 | 541 | 232 |
+  | mlp down 5120 x 17408 | 758 | 623 | 532 | 445 | 219 |
+  | Hadamard (any width) | ~5 us per call | | | | |
+
+  End to end (`ninfer --greedy --spec mtp --draft-tokens 2`): 96.1 tok/s on a short answer
+  (62 % acceptance), 87.0 tok/s on a 512-token story (43.6 %, 1.87 tok/round, 21.6 ms per
+  round), prefill ~230 tok/s. The PrismML fork reference is 81.2 tok/s without speculation.
+  The t2 projections account for ~11 ms and the Hadamard launches ~1.3 ms of a round; the
+  remaining ~9 ms is not yet attributed (next: whole-round Nsight Systems profile). MTP
+  acceptance is below Qwen3.8's because the copied BF16 head was trained on the unquantized
+  model; two drafts beat three.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
