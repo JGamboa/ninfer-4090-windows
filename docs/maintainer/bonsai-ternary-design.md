@@ -1055,6 +1055,24 @@ ColdFusion fine-tune, not the Qwen3.8 base).
   its benchmark. The prototype bench was removed with t2 (its baseline); its code is in
   `97dd83b`.
 
+- (A+C) Draft-side experiments, 2026-09-24, t5 artifact, display 60 Hz, six prompts.
+  MTP layer in Q5, Q4 or the official Qwen3.8 Q4/Q5 mix (requantized from the Q8 reference,
+  `mtp/input_projection` kept Q8; converter overrides): not measurable without kernel work. The
+  MTP composition takes its K/V projections through `linear_pair`, which accepts only Q8
+  RowSplit, and its attention input needs one contiguous parent (the Q4/Q5 mix splits it).
+  Engine startup refuses all three variants; the expected gain was at most ~0.5 ms per round.
+
+  Proposal head of 34816 rows (`--proposal-rows 34816`, a registered Q4 shape) against the
+  default 131072: identical greedy text on every prompt (verification uses the full head);
+  tok/s 141.3 -> 147.2, 173.8 -> 180.9, 168.8 -> 172.9, 140.9 -> 135.1 (Spanish), 165.8 ->
+  166.7, 175.2 -> 183.5 (mean +2.1 %); acceptance 42.4 -> 41.2, 65.8 -> 61.7, 61.4 -> 57.1,
+  41.9 -> 33.2, 58.4 -> 52.0, 64.6 -> 63.7 %. The shortlist ranking
+  (`tools/freq_corpus/fixtures/ranking`, teacher-forced chat counts: English 21 M, Chinese
+  18 M, other languages 7.5 M, code 3.1 M, math 1.1 M emitted tokens) covers 93.8 % of English,
+  92.3 % of Chinese but 80.9 % of other-language tokens at 32768 rows (98.2 % at 131072), so
+  prose outside English and Chinese loses. Kept at 131072; 34816 is an option for English or
+  code workloads.
+
 
 - (A+B+C) Ternary embedding. `bonsai2_27b` stores `text/token_embedding` as the GGUF's
   rotated `t2` words (0.33 GB instead of the 1.3 GB primal Q8 table) and sets
@@ -1120,8 +1138,10 @@ prompts (mean 163, draft 2, `--lm-head-draft`, ~13.0 ms per round); tg128 101 to
 
 Next steps, in order:
 
-1. MTP layer (Q8, 1.3 ms per round) and Q4 proposal head (1.0 ms), both at ~935 GB/s-1 TB/s:
-   measure six-prompt acceptance with a Q5 and a Q4 MTP layer before changing the recipe.
+1. Done 2026-09-24 (section 9, "Draft-side experiments"): a Q4/Q5 MTP layer needs Q4/Q5
+   routes in the MTP composition (`linear_pair` and a split attention parent) and was not
+   pursued; a 34816-row proposal head gains 2.1 % on average but loses on Spanish prose, so the
+   default stays 131072.
 2. Measure decode with the monitor cable on the iGPU (motherboard output), the six prompts,
    beside the 60 Hz figures of section 9. Expected: the ~2.2 ms of compositor stalls per round
    disappear. Until then the display runs at 60 Hz.
