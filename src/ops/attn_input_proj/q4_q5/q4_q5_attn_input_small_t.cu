@@ -7,6 +7,7 @@
 #include "ops/linear/q4/q4_ksplit_strided_store.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+#include "ops/linear/q5/q5_ksplit_mma.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
 #include "ops/linear/q5/q5_rowsplit_rowblock_small_t.cuh"
@@ -110,8 +111,20 @@ void launch_q4_ksplit_band(const Tensor& x, const Weight& weight, Tensor& q, Ten
     case 12:
         launch_q4_ksplit_exact<12>(x, weight, q, key, stream);
         return;
+    case 13:
+        launch_q4_ksplit_exact<13>(x, weight, q, key, stream);
+        return;
+    case 14:
+        launch_q4_ksplit_exact<14>(x, weight, q, key, stream);
+        return;
+    case 15:
+        launch_q4_ksplit_exact<15>(x, weight, q, key, stream);
+        return;
+    case 16:
+        launch_q4_ksplit_exact<16>(x, weight, q, key, stream);
+        return;
     default:
-        throw std::invalid_argument("attention Q4 K-split band covers T in [7,12]");
+        throw std::invalid_argument("attention Q4 K-split band covers T in [7,16]");
     }
 }
 
@@ -126,13 +139,18 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
     case 10:
     case 11:
     case 12:
+    case 13:
+    case 14:
+    case 15:
+    case 16:
         // K-split for the Q4 parent across the whole parent-split range. Complete-op measurement
         // (both parents launched, all four outputs, one graph, one probe run per column count):
         // 73.0-77.6 us at T=9..12 against 100.1-105.7 us for the row-split SIMT that R0 used there,
         // and 107.8-108.3 us for the grouped form the resolver switches to at T=13. The resolver
         // boundary at 13 is right for the grouped-vs-row-split question, but it hid this: the split
-        // form with a K-split Q4 parent is 24-29% faster than both. T=2..6 keep the SIMT tile, where
-        // a 16-wide K-split tile would waste more MMA work than it saves.
+        // form with a K-split Q4 parent is 24-29% faster than both. The range now reaches the DFlash2
+        // verification widths (T <= 16) with the Q5 parent on its K-split MMA as well. T=2..6 keep
+        // the SIMT tile, where a 16-wide K-split tile would waste more MMA work than it saves.
         launch_q4_ksplit_band(x, weight, q, key, stream);
         return;
     case 2:
@@ -143,7 +161,7 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
         launch_q4_simt_route<Q4AttnSimtR8C4Schedule>(x, weight, q, key, stream);
         return;
     default:
-        throw std::invalid_argument("attention Q4 split-output requires T in [1,12]");
+        throw std::invalid_argument("attention Q4 split-output requires T in [1,16]");
     }
 }
 
@@ -201,22 +219,20 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate,
     }
 }
 
-template <int ColsPerTile>
-void launch_q5_simt(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                    cudaStream_t stream) {
-    constexpr int kRowsPerBlock = 8;
-    constexpr int kStages       = 2;
-    constexpr int kThreads      = kRowsPerBlock * 32;
-    const std::int32_t cols     = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(div_up(kParentRows, kRowsPerBlock)),
-                    static_cast<unsigned>(div_up(cols, ColsPerTile)), 1u);
-    q5_rowsplit_gemm_simt_kernel<Q5RowSplitSimtSchedule, ColsPerTile, kRowsPerBlock, kStages, true,
-                                 kSplitRow><<<grid, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.qhigh),
-        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(gate.data),
-        static_cast<__nv_bfloat16*>(value.data), kParentRows, gate.ne[0], kHidden, cols,
-        weight.padded_shape[1], 5);
+// T=9..16: 16 rows per CTA, eight warps splitting K, Q5 codes and high bits decoded for BF16
+// MMAs; gate rows [0, 6144) land in gate and value rows in value, each with its own stride.
+void launch_q5_ksplit(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                      cudaStream_t stream) {
+    const Q5KSplitOutput out{static_cast<__nv_bfloat16*>(gate.data), kSplitRow,
+                             static_cast<int>(gate.nb[1] / sizeof(__nv_bfloat16)),
+                             static_cast<__nv_bfloat16*>(value.data),
+                             static_cast<int>(value.nb[1] / sizeof(__nv_bfloat16))};
+    q5_ksplit_mma_kernel<kHidden, 16, false>
+        <<<kParentRows / Q5KSplitMmaSchedule::kRowsPerCta, Q5KSplitMmaSchedule::kThreads, 0,
+           stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                     static_cast<const std::uint8_t*>(weight.qdata),
+                     static_cast<const std::uint8_t*>(weight.qhigh),
+                     static_cast<const std::uint8_t*>(weight.scales), out, x.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -258,11 +274,12 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         launch_q5_rowblock(x, weight, gate, value, stream);
         return;
     }
-    if (x.ne[1] <= 12) {
-        launch_q5_simt<4>(x, weight, gate, value, stream);
+    if (x.ne[1] <= 16) {
+        // T=9..12 previously ran a 4-column SIMT tile, and T=13..16 the grouped form at ~245 GB/s.
+        launch_q5_ksplit(x, weight, gate, value, stream);
         return;
     }
-    throw std::invalid_argument("attention Q5 split-output requires T in [1,12]");
+    throw std::invalid_argument("attention Q5 split-output requires T in [1,16]");
 }
 
 } // namespace

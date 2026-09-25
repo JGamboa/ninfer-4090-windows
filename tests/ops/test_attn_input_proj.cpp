@@ -168,7 +168,7 @@ int run_q4_q5() {
     for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})
         failures +=
             run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only);
-    for (int t : {1, 8, 12, 13, 16, 32, 63, 64, 65, 96, 104, 105, 127, 128, 129, 192, 193})
+    for (int t : {1, 8, 12, 13, 16, 17, 32, 63, 64, 65, 96, 104, 105, 127, 128, 129, 192, 193})
         failures +=
             run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only, true);
     return failures;

@@ -42,7 +42,7 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
             "Q4/Q5 attention input: exact problem or column count is not admitted");
     }
 
-    if (problem.cols <= 12) return {Q4Q5AttnInputScheduleId::ParentSplitFixed};
+    if (problem.cols <= 16) return {Q4Q5AttnInputScheduleId::ParentSplitFixed};
     if (problem.cols <= 32) return {Q4Q5AttnInputScheduleId::MixedR32C32S2};
     if (problem.cols <= 64) return {Q4Q5AttnInputScheduleId::MixedR32C64S3};
     if (problem.cols <= 104) return {Q4Q5AttnInputScheduleId::PairR32C64S3};
