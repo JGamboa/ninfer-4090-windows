@@ -416,7 +416,7 @@ scripts, desktop at 60 Hz and server off.
 
   d15's text is unchanged, so its +26 % is a like-for-like speedup. d12 now produces exactly
   d6's text. On this prompt d6 is still the fastest configuration (129 tok/s), but d12 is
-  within 10 % of it (116.5); it was 35 % behind after `a29aed7` and 30 % behind at `c4b6038`.
+  within 10 % of it (116.5); it was 23 % behind after `a29aed7` and 22 % behind before it.
 - d12 round (`profiles/nsys/qwen38_dflash2_d12_ksplit16`), per round:
   - wall 43.9 -> 37.7 ms; verification 39.5 -> 33.3 ms; drafter 3.55 ms.
   - 782 launches (+48: the two in_proj sides).
