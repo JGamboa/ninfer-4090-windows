@@ -76,8 +76,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 #else
     constexpr bool kSplitScoreColumns = false;
 #endif
+    // The pair exchange buffer must keep the kernel within the 48 KiB static shared-memory limit
+    // (the 24-warp TokenTile 6 launch with Br = 48 and Bc = 32 has only 64 bytes of room).
+    constexpr std::size_t kStaticSharedBytes =
+        static_cast<std::size_t>(Br) * D + (DynamicArena ? 16 : 4 * Bc * D) +
+        static_cast<std::size_t>(Br) * Bc * sizeof(__half) + Br * sizeof(float) +
+        2 * static_cast<std::size_t>(Bc) * Groups * sizeof(__half);
+    constexpr bool kPairBufferFits = kStaticSharedBytes + 2 * Br * sizeof(float) <= 48 * 1024;
     constexpr int ColSplit =
-        (kSplitScoreColumns && Wc >= 4 * RowTiles && QKNt % 2 == 0) ? 2 : 1;
+        (kSplitScoreColumns && kPairBufferFits && Wc >= 4 * RowTiles && QKNt % 2 == 0) ? 2 : 1;
     constexpr int QKNtL           = QKNt / ColSplit;
     constexpr int ProducerWarps   = RowTiles * ColSplit;
     constexpr int ProducerThreads = ProducerWarps * 32;
