@@ -1214,6 +1214,81 @@ Next steps, in order:
 5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
    quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
    Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).
+6. Decode at short and long context (measured 2026-09-24, RTX 4090, display 60 Hz, server off,
+   `E:\LLM\bonsai2_27b_vl.ninfer` at `577bbfb`, MTP draft 2, `--lm-head-draft`, greedy). The
+   per-round figures are over the NVTX `decode` ranges of `nsys profile --trace=cuda,nvtx
+   --cuda-graph-trace=node`; each range holds one MTP round (verify, commit, draft).
+
+   A. Short context (`profiles/nsys/bonsai_t5_mtp_short`): `scenario_story_en_mystery`, 167
+   prompt tokens, 512 generated, `--max-context 8192`, default `bf16` KV. Plain run 149.3 tok/s,
+   274 rounds, 1.86 tokens per round (43.3 % acceptance; this prose prompt is the low end of the
+   six). Per round: 12.82 ms wall, 12.31 ms of kernels (96 % busy), 1007 launches.
+
+   | Per round | ms | % | Launches |
+   |---|---|---|---|
+   | t5 GEMV (T = 3 verify, 256 projections + head) | 7.70 | 62.5 | 257 |
+   | MTP layer, Q8 `q8_ksplit_mma` (2 draft steps) | 1.32 | 10.7 | 15 |
+   | GDN: `recurrent_record` 0.33, `recurrent_fold` 0.30 (one launch), gating 0.19, conv 0.12 | 0.94 | 7.6 | 145 |
+   | Proposal head, Q4 131072 rows (2 x 412 us) | 0.83 | 6.7 | 4 |
+   | `rotate_quantize` (2.7 us per projection) | 0.70 | 5.6 | 257 |
+   | Attention: `small_t_tc_partial_bf16` 0.32, reduce 0.06, rope, output gate (18 calls: 16 layers + 2 MTP) | 0.46 | 3.7 | 72 |
+   | rmsnorm, SwiGLU, residual | 0.35 | 2.8 | 245 |
+   | Sampling, speculative bookkeeping, embedding | 0.03 | 0.2 | 12 |
+
+   The t5 GEMV by shape: gate+up 3.26 ms (64 x 51.0 us), o_proj and down 2.46 ms
+   (128 x 19.2 us), gdn in_proj 1.25 ms (48 x 26.1 us), attention qkvg 0.37 ms (16 x 23.3 us),
+   head 0.35 ms (354 us). The round is kernel-bound with launches graphed; the fusion
+   candidates are small against the GEMV: all rmsnorm/SwiGLU/quantization launches together are
+   1.05 ms (8.5 %).
+
+   B. Needle in a haystack, `--max-context 262144 --prefill-chunk 1024 --no-thinking
+   --max-new 128`. All six return exactly `ORCHID=493817; COLOR=COBALT` (17 tokens, 3.00
+   tokens per round). Decode rates cover six rounds and are indicative only.
+
+   | Prompt | Tokens | KV | Prefill | Prefill tok/s | Decode tok/s |
+   |---|---|---|---|---|---|
+   | `long_niah_8k` | 7680 | int8 | 2.4 s | 3190 | 200.0 |
+   | `long_niah_8k` | 7680 | rk4v4-e8 | 2.5 s | 3120 | 206.7 |
+   | `long_niah_64k` | 64512 | int8 | 24.9 s | 2590 | 160.2 |
+   | `long_niah_64k` | 64512 | rk4v4-e8 | 25.7 s | 2510 | 184.6 |
+   | `long_niah_128k` | 130048 | int8 | 61.0 s | 2130 | 129.1 |
+   | `long_niah_128k` | 130048 | rk4v4-e8 | 65.5 s | 1980 | 139.9 |
+
+   C. 128K decode (`profiles/nsys/bonsai_t5_mtp_128k`, `_128k_rk4`): `long_niah_128k` with
+   reasoning on, `--max-new 1024`. Both stop after 141 tokens with the exact answer (130084
+   prompt tokens). Plain runs: int8 127.3 tok/s, 56 rounds, 2.52 tokens per round; rk4v4-e8
+   123.0 tok/s, 57 rounds, 2.47 (1.1 s of decode, so the difference is within noise; under
+   the profiler rk4v4-e8 is the faster one, as in B).
+
+   | Per round, ms | A (short, bf16) | C int8 | C rk4v4-e8 |
+   |---|---|---|---|
+   | Wall / kernels | 12.82 / 12.31 | 20.75 / 20.20 | 18.51 / 18.06 |
+   | Attention | 0.46 | 8.26 | 6.57 |
+   | of which the split kernel (per call) | 0.32 (18.0 us) | 8.01 (445 us) | 6.36 (353 us) |
+   | of which the split reduce (per call) | 0.06 (3.5 us) | 0.20 (11.1 us) | 0.13 (7.5 us) |
+   | t5 GEMV | 7.70 | 7.75 | 7.40 |
+   | MTP layer (Q8) | 1.32 | 1.15 | 1.27 |
+   | Proposal head (Q4) | 0.83 | 1.08 | 0.82 |
+   | GDN | 0.94 | 0.87 | 0.93 |
+   | `rotate_quantize` | 0.70 | 0.70 | 0.65 |
+   | rmsnorm, SwiGLU, residual | 0.35 | 0.36 | 0.39 |
+   | Launches | 1007 | 1007 | 1025 (+18 `kv_cache_inverse_rotate_output`) |
+
+   Only attention grows with depth: +7.8 ms per round at 130K with int8 (18x) and +6.1 ms
+   with rk4v4-e8. Every other kernel is depth-independent within noise; the int8 proposal-head
+   figure (539 against ~410 us per call) did not recur in the rk4v4-e8 run. Both KV modes run
+   `causal_attention_small_t_i8_tiled_kernel` with the same launch: grid 4 x 85 = 340 CTAs of
+   256 threads, 128 registers and 38.4 KB of shared memory, so two CTAs per SM and 256
+   resident slots on the 128 SMs. That is 1.33 waves, and the second wave fills a third of the
+   GPU. The int8 split reads ~275 MB per call (2112 bytes per token per layer: 8.25 GiB of text
+   KV over 262144 tokens and 16 layers) at ~620 GB/s, about 61 % of the 4090's 1008 GB/s.
+   rk4v4-e8 reads half the bytes (~141 MB) at ~400 GB/s, so its codec rather than DRAM limits
+   it. Levers, in order of evidence: choose the split count for whole waves (256 or 512 CTAs
+   rather than 340; to confirm with `ncu` on one 128K launch), then the rk4v4-e8 decode
+   arithmetic inside the split (at the int8 kernel's bandwidth it would take ~230 us). B's 64K
+   decode (160 int8 against 200 tok/s at 8K) is consistent with the linear growth. Prefill attention is out
+   of this step's scope but also depth-bound: `causal_attention_prompt_i8_kernel` takes 21.7 s
+   of the 61 s int8 128K prefill (2032 calls, 10.7 ms average) and 25.3 s with rk4v4-e8.
 
 ## Appendix: sources
 
