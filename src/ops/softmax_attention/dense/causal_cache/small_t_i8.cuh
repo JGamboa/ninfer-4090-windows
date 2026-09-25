@@ -72,8 +72,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     constexpr float Log2E         = 1.4426950408889634074f;
     constexpr unsigned FullMask   = 0xffffffffu;
+    // Packed V codes occupy the first D / 2 bytes of each staged V row; packed or E8-root keys
+    // are staged behind them until expand_k_tile writes the int8 K tile.
+    constexpr int kPackedKStage = D / 2;
 
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
+    static_assert(!(PackedK || E8Root) || PackedV, "staged packed keys share the packed V rows");
     static_assert(Bc == 32 || Bc == 64);
     static_assert(RowTiles >= 1 && RowTiles <= 3);
     static_assert(Wc % RowTiles == 0);
@@ -402,58 +406,79 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
+            std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
             if (key >= split_start && key < split_end) {
+                const int page_offset = key & kPagedKVPageMask;
                 if constexpr (E8Root) {
-                    const std::int64_t koff = paged_kv_page_head_offset<64, Geometry::KVHeads>(
-                        physical_page, kv_head) + static_cast<std::int64_t>(key & kPagedKVPageMask) * 64 + (d / 4);
-                    const uint32_t src4 = *reinterpret_cast<const uint32_t*>(&reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff]);
-                    const uint8_t c1_0 = static_cast<uint8_t>(src4 & 0xFF);
-                    const uint8_t c2_0 = static_cast<uint8_t>((src4 >> 8) & 0xFF);
-                    const uint8_t c1_1 = static_cast<uint8_t>((src4 >> 16) & 0xFF);
-                    const uint8_t c2_1 = static_cast<uint8_t>((src4 >> 24) & 0xFF);
-                    int8_t dec8_0[8], dec8_1[8];
-                    e8_root_decode_8d_int8(c1_0, c2_0, dec8_0);
-                    e8_root_decode_8d_int8(c1_1, c2_1, dec8_1);
-                    std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
-                    *reinterpret_cast<uint64_t*>(&dst[0]) = *reinterpret_cast<const uint64_t*>(dec8_0);
-                    *reinterpret_cast<uint64_t*>(&dst[8]) = *reinterpret_cast<const uint64_t*>(dec8_1);
-                    const std::int64_t voff = kv_cache_i4_code_index<Geometry>(
-                        physical_page, kv_head, d / 2, key & kPagedKVPageMask);
-                    kv_cache_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
+                    const std::int64_t koff =
+                        paged_kv_page_head_offset<64, Geometry::KVHeads>(physical_page, kv_head) +
+                        static_cast<std::int64_t>(page_offset) * 64 + (d / 4);
+                    ninfer::ops::cp_async<4>(&v_i8[key_l * D + kPackedKStage + d / 4],
+                                             &reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff]);
                 } else if constexpr (PackedK) {
                     const std::int64_t koff = kv_cache_i4_code_index<Geometry>(
-                        physical_page, kv_head, d / 2, key & kPagedKVPageMask);
-                    std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
-                    kv_cache_unpack_i4x16(&reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff], dst);
-                    const std::int64_t voff = kv_cache_i4_code_index<Geometry>(
-                        physical_page, kv_head, d / 2, key & kPagedKVPageMask);
-                    kv_cache_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
+                        physical_page, kv_head, d / 2, page_offset);
+                    ninfer::ops::cp_async<8>(&v_i8[key_l * D + kPackedKStage + d / 2],
+                                             &reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff]);
                 } else {
                     const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
-                        physical_page, kv_head, d, key & kPagedKVPageMask);
-                    std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
+                        physical_page, kv_head, d, page_offset);
                     ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                    if constexpr (PackedV) {
-                        const std::int64_t voff = kv_cache_i4_code_index<Geometry>(
-                            physical_page, kv_head, d / 2, key & kPagedKVPageMask);
-                        kv_cache_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
-                    } else {
-                        ninfer::ops::cp_async<16>(&v_i8[key_l * D + d],
-                                                  &reinterpret_cast<std::int8_t*>(cache_v_codes)[off]);
-                    }
+                }
+                if constexpr (PackedV) {
+                    const std::int64_t voff =
+                        kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d / 2, page_offset);
+                    ninfer::ops::cp_async<8>(&v_i8[key_l * D + d / 2], &cache_v_codes[voff]);
+                } else {
+                    const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
+                        physical_page, kv_head, d, page_offset);
+                    ninfer::ops::cp_async<16>(&v_i8[key_l * D + d],
+                                              &reinterpret_cast<std::int8_t*>(cache_v_codes)[off]);
                 }
             } else {
-                std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));
-                store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                if constexpr (!PackedV) { store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0)); }
             }
         }
         ninfer::ops::cp_commit();
     };
 
+    // Packed keys land in the upper half of each staged V row. After its own cp.async groups
+    // complete, every thread expands exactly the chunks it issued into the int8 K tile, so the
+    // following barrier publishes the tile without another one.
+    auto expand_k_tile = [&](int tile_k0) {
+        if constexpr (PackedK || E8Root) {
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+                const int key_l = chunk / (D / 16);
+                const int dc    = chunk - key_l * (D / 16);
+                const int d     = dc * 16;
+                const int key   = tile_k0 + key_l;
+                if (key < split_start || key >= split_end) { continue; }
+                std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
+                if constexpr (E8Root) {
+                    const std::uint32_t src4 =
+                        load_vec<std::uint32_t>(&v_i8[key_l * D + kPackedKStage + d / 4]);
+                    int8_t dec8_0[8], dec8_1[8];
+                    e8_root_decode_8d_int8(static_cast<uint8_t>(src4 & 0xFF),
+                                           static_cast<uint8_t>((src4 >> 8) & 0xFF), dec8_0);
+                    e8_root_decode_8d_int8(static_cast<uint8_t>((src4 >> 16) & 0xFF),
+                                           static_cast<uint8_t>((src4 >> 24) & 0xFF), dec8_1);
+                    *reinterpret_cast<uint64_t*>(&dst[0]) = *reinterpret_cast<const uint64_t*>(dec8_0);
+                    *reinterpret_cast<uint64_t*>(&dst[8]) = *reinterpret_cast<const uint64_t*>(dec8_1);
+                } else {
+                    kv_cache_unpack_i4x16(
+                        reinterpret_cast<const std::uint8_t*>(&v_i8[key_l * D + kPackedKStage + d / 2]),
+                        dst);
+                }
+            }
+        }
+    };
+
     int physical_page = block_table[first_tile >> kPagedKVPageShift];
     issue_kv_tile(first_tile, physical_page);
     ninfer::ops::cp_wait<0>();
+    expand_k_tile(first_tile);
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
@@ -609,18 +634,27 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     const int grp = d >> 6;
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
-                    vs                = __shfl_sync(FullMask, vs, grp * 8);
-                    const int2 raw    = load_vec<int2>(&v_i8[key_l * D + d]);
-                    const auto* codes = reinterpret_cast<const std::int8_t*>(&raw);
+                    vs = __shfl_sync(FullMask, vs, grp * 8);
+                    // Packed V stays packed in shared memory: nibble i of the word is d + i.
+                    float code[8];
+                    if constexpr (PackedV) {
+                        const std::uint32_t raw = load_vec<std::uint32_t>(&v_i8[key_l * D + d / 2]);
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            code[i] = static_cast<float>(
+                                static_cast<int>(((raw >> (4 * i)) & 0x0fu) ^ 8u) - 8);
+                        }
+                    } else {
+                        const int2 raw     = load_vec<int2>(&v_i8[key_l * D + d]);
+                        const auto* bytes = reinterpret_cast<const std::int8_t*>(&raw);
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { code[i] = static_cast<float>(bytes[i]); }
+                    }
                     int4 values;
-                    values.x = pack_f16x2(static_cast<float>(codes[0]) * vs,
-                                          static_cast<float>(codes[1]) * vs);
-                    values.y = pack_f16x2(static_cast<float>(codes[2]) * vs,
-                                          static_cast<float>(codes[3]) * vs);
-                    values.z = pack_f16x2(static_cast<float>(codes[4]) * vs,
-                                          static_cast<float>(codes[5]) * vs);
-                    values.w = pack_f16x2(static_cast<float>(codes[6]) * vs,
-                                          static_cast<float>(codes[7]) * vs);
+                    values.x = pack_f16x2(code[0] * vs, code[1] * vs);
+                    values.y = pack_f16x2(code[2] * vs, code[3] * vs);
+                    values.z = pack_f16x2(code[4] * vs, code[5] * vs);
+                    values.w = pack_f16x2(code[6] * vs, code[7] * vs);
                     store_vec(dst, values);
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
@@ -671,7 +705,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) {
+            ninfer::ops::cp_wait<0>();
+            expand_k_tile(k0 + Bc);
+        }
         __syncthreads();
     }
 
