@@ -68,7 +68,7 @@ proyecto:
 - **Build:** abre una shell con MSVC (`vcvars64.bat`) y CUDA en el PATH, y corre
   `cmake --build build -j`. Para configurar desde cero, sigue `WINDOWS_PORT.md`, sección "Building on
   Windows" (`-DCMAKE_CUDA_ARCHITECTURES=89`).
-- **Python:** `.venv\Scripts\python.exe` (3.11).
+- **Python:** `.venv\Scripts\python.exe` (3.12; on this machine it has always been 3.12).
 - **Artefactos:**
   - `E:\LLM\bonsai2_27b_vl.ninfer`: Bonsai 2 27B ternario t5, con MTP en Q8 y visión.
   - `E:\LLM\qwen3_8_27b.ninfer`: Qwen3.8 27B Q4/Q5.
