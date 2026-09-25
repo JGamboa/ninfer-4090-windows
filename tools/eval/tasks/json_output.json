@@ -1,0 +1,52 @@
+[
+ {
+  "id": "json.extract_person",
+  "category": "json_output",
+  "messages": [
+   {"role": "user", "content": "Extract the person from this sentence as a JSON object with exactly these keys: name (string), age (integer), city (string), languages (array of strings, in the order mentioned). Output only the JSON.\n\nSentence: María López, 34, lives in Valencia and speaks Spanish, English and Catalan."}
+  ],
+  "check": {"kind": "json_schema",
+   "schema": {"type": "object", "required": ["name", "age", "city", "languages"], "additionalProperties": false, "properties": {"name": {"type": "string"}, "age": {"type": "integer"}, "city": {"type": "string"}, "languages": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3}}},
+   "values": {"/name": "María López", "/age": 34, "/city": "Valencia", "/languages/0": "Spanish", "/languages/2": "Catalan"}}
+ },
+ {
+  "id": "json.classify_tickets",
+  "category": "json_output",
+  "messages": [
+   {"role": "user", "content": "Classify each support ticket by priority. Return only a JSON array of objects with keys \"id\" (integer) and \"priority\" (one of \"low\", \"medium\", \"high\"), in ticket order.\n\n1. The production database is down and no customer can log in.\n2. There is a typo in the footer of the About page.\n3. Exporting large reports to CSV is slow (about two minutes) but it completes correctly."}
+  ],
+  "check": {"kind": "json_schema",
+   "schema": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "object", "required": ["id", "priority"], "properties": {"id": {"type": "integer"}, "priority": {"enum": ["low", "medium", "high"]}}}},
+   "values": {"/0/id": 1, "/0/priority": "high", "/1/priority": "low", "/2/priority": "medium"}}
+ },
+ {
+  "id": "json.order_total",
+  "category": "json_output",
+  "messages": [
+   {"role": "user", "content": "Convert this order into JSON with keys order_id (string), items (array of objects with sku (string), qty (integer), unit_price (number)) and total (number, the sum of qty * unit_price). Output only the JSON.\n\nOrder A-1042: 3 x PEN-01 at 1.50 each, 2 x NB-07 at 4.25 each."}
+  ],
+  "check": {"kind": "json_schema",
+   "schema": {"type": "object", "required": ["order_id", "items", "total"], "properties": {"order_id": {"type": "string"}, "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "object", "required": ["sku", "qty", "unit_price"], "properties": {"sku": {"type": "string"}, "qty": {"type": "integer", "minimum": 1}, "unit_price": {"type": "number"}}}}, "total": {"type": "number"}}},
+   "values": {"/order_id": "A-1042", "/items/0/sku": "PEN-01", "/items/0/qty": 3, "/items/1/unit_price": 4.25, "/total": {"num": 13, "tol": 0.001}}}
+ },
+ {
+  "id": "json.config_types",
+  "category": "json_output",
+  "messages": [
+   {"role": "user", "content": "Parse this configuration line into a JSON object with keys host (string), port (integer), tls (boolean) and proxy (string, or null when there is no proxy). Output only the JSON.\n\nhost=api.internal port=8443 tls=yes proxy=none"}
+  ],
+  "check": {"kind": "json_schema",
+   "schema": {"type": "object", "required": ["host", "port", "tls", "proxy"], "properties": {"host": {"type": "string"}, "port": {"type": "integer"}, "tls": {"type": "boolean"}, "proxy": {"type": ["string", "null"]}}},
+   "values": {"/host": "api.internal", "/port": 8443, "/tls": {"eq": true}, "/proxy": {"eq": null}}}
+ },
+ {
+  "id": "json.sentiment_enum",
+  "category": "json_output",
+  "messages": [
+   {"role": "user", "content": "Label the sentiment of each review as \"positive\", \"negative\" or \"neutral\". Return only a JSON object with keys r1, r2, r3 and r4 and no other keys.\n\nr1: Absolutely love it, works perfectly.\nr2: Broke after two days, a total waste of money.\nr3: The package arrived on Tuesday.\nr4: No me gustó nada, muy decepcionante."}
+  ],
+  "check": {"kind": "json_schema",
+   "schema": {"type": "object", "required": ["r1", "r2", "r3", "r4"], "additionalProperties": false, "properties": {"r1": {"enum": ["positive", "negative", "neutral"]}, "r2": {"enum": ["positive", "negative", "neutral"]}, "r3": {"enum": ["positive", "negative", "neutral"]}, "r4": {"enum": ["positive", "negative", "neutral"]}}},
+   "values": {"/r1": "positive", "/r2": "negative", "/r3": "neutral", "/r4": "negative"}}
+ }
+]

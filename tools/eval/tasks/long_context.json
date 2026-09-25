@@ -1,0 +1,29 @@
+[
+ {
+  "id": "long.needle_4k",
+  "category": "long_context",
+  "needle": {"approx_tokens": 4000, "depth": 0.3, "seed": 4001},
+  "messages": [
+   {"role": "user", "content": "Below is a warehouse ledger. It mentions access codes for several vaults.\n\n<ledger>\n{haystack}\n</ledger>\n\nWhat is the access code for vault {needle_key}? Reply with the code only."}
+  ],
+  "check": {"kind": "needle"}
+ },
+ {
+  "id": "long.needle_16k",
+  "category": "long_context",
+  "needle": {"approx_tokens": 16000, "depth": 0.7, "seed": 16001},
+  "messages": [
+   {"role": "user", "content": "Below is a warehouse ledger. It mentions access codes for several vaults.\n\n<ledger>\n{haystack}\n</ledger>\n\nWhat is the access code for vault {needle_key}? Reply with the code only."}
+  ],
+  "check": {"kind": "needle"}
+ },
+ {
+  "id": "long.needle_32k",
+  "category": "long_context",
+  "needle": {"approx_tokens": 32000, "depth": 0.5, "seed": 32001},
+  "messages": [
+   {"role": "user", "content": "Below is a warehouse ledger. It mentions access codes for several vaults.\n\n<ledger>\n{haystack}\n</ledger>\n\nWhat is the access code for vault {needle_key}? Reply with the code only."}
+  ],
+  "check": {"kind": "needle"}
+ }
+]

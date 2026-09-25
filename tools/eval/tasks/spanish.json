@@ -1,0 +1,68 @@
+[
+ {
+  "id": "es.translate_to_spanish",
+  "category": "spanish",
+  "messages": [
+   {"role": "user", "content": "Traduce al español y responde solo con la traducción: \"The library opens at nine in the morning and closes at six in the evening.\""}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "contains", "normalize": ["case", "whitespace", "accents"], "words": true,
+    "values": ["biblioteca", "abre", ["nueve", "9"], "manana", "cierra", ["seis", "6", "18"], ["tarde", "noche"]]},
+   {"kind": "not_contains", "values": ["library", "opens", "closes", "morning"]}
+  ]}
+ },
+ {
+  "id": "es.translate_to_english",
+  "category": "spanish",
+  "messages": [
+   {"role": "user", "content": "Traduce al inglés y responde solo con la traducción: \"El gato duerme debajo de la mesa de la cocina.\""}
+  ],
+  "check": {"kind": "contains", "words": true,
+   "values": ["cat", ["sleeps", "sleeping", "asleep"], ["under", "beneath", "underneath"], "kitchen table"]}
+ },
+ {
+  "id": "es.change_word_problem",
+  "category": "spanish",
+  "messages": [
+   {"role": "user", "content": "María compra 3 kilos de manzanas a 2,40 euros el kilo y 2 kilos de peras a 3,15 euros el kilo. Paga con un billete de 20 euros. ¿Cuánto dinero recibe de cambio? Termina tu respuesta con una línea de la forma 'Respuesta: <número>'."}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "number", "value": 6.5, "tol": 0.001},
+   {"kind": "language", "lang": "es"}
+  ]}
+ },
+ {
+  "id": "es.ages_equation",
+  "category": "spanish",
+  "messages": [
+   {"role": "user", "content": "Luis tiene el doble de la edad de Ana. Dentro de 5 años, la suma de sus edades será 40. ¿Cuántos años tiene Luis hoy? Termina tu respuesta con una línea de la forma 'Respuesta: <número>'."}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "number", "value": 20},
+   {"kind": "language", "lang": "es"}
+  ]}
+ },
+ {
+  "id": "es.explain_rest_api",
+  "category": "spanish",
+  "messages": [
+   {"role": "user", "content": "Explica en español, en tres o cuatro frases, qué es una API REST."}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "language", "lang": "es", "min_hits": 8},
+   {"kind": "word_count", "min": 25, "max": 160},
+   {"kind": "contains", "normalize": ["case", "whitespace", "accents"], "values": [["http", "recurso"]]}
+  ]}
+ },
+ {
+  "id": "es.spelling_fix",
+  "category": "spanish",
+  "messages": [
+   {"role": "user", "content": "Corrige las faltas de ortografía de esta frase y devuelve solo la frase corregida: \"Ayer fuimos a la vivlioteca y leimos un libro muy interesante sobre la istoria de España.\""}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "contains", "words": true, "values": ["biblioteca", "leímos", "historia", "españa"]},
+   {"kind": "not_contains", "values": ["vivlioteca", "leimos", "istoria"]}
+  ]}
+ }
+]

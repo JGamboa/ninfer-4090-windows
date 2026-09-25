@@ -1,0 +1,73 @@
+[
+ {
+  "id": "if.three_bullets",
+  "category": "instruction_following",
+  "messages": [
+   {"role": "user", "content": "List exactly 3 benefits of unit tests as bullet points, each line starting with \"- \". Output only the three bullet lines and nothing else."}
+  ],
+  "check": {"kind": "bullets", "min": 3, "max": 3, "only": true}
+ },
+ {
+  "id": "if.word_limit",
+  "category": "instruction_following",
+  "messages": [
+   {"role": "user", "content": "Explain what a hash map is in at most 40 words."}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "word_count", "min": 8, "max": 40},
+   {"kind": "contains", "values": [["key", "keys"]]}
+  ]}
+ },
+ {
+  "id": "if.forbidden_words",
+  "category": "instruction_following",
+  "messages": [
+   {"role": "user", "content": "Describe the ocean in exactly two sentences. Do not use the words \"blue\", \"water\" or \"wave\" (or their plurals)."}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "not_contains", "values": ["blue", "water", "waters", "wave", "waves"]},
+   {"kind": "regex", "pattern": "^[^.!?]+[.!?]+\\s+[^.!?]+[.!?]+$", "normalize": ["whitespace"]}
+  ]}
+ },
+ {
+  "id": "if.only_ok",
+  "category": "instruction_following",
+  "messages": [
+   {"role": "system", "content": "You are a health-check endpoint."},
+   {"role": "user", "content": "Reply with only the word OK in uppercase letters, with no punctuation and nothing else."}
+  ],
+  "check": {"kind": "exact", "value": "OK", "normalize": ["whitespace"]}
+ },
+ {
+  "id": "if.caps_title",
+  "category": "instruction_following",
+  "messages": [
+   {"role": "user", "content": "Write a title for a blog post about memory safety in Rust. The title must be written entirely in capital letters, contain at most 8 words, and contain no colon. Output only the title."}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "regex", "pattern": "^[^a-z:\\n]*RUST[^a-z:\\n]*$", "normalize": ["whitespace"]},
+   {"kind": "word_count", "min": 2, "max": 8}
+  ]}
+ },
+ {
+  "id": "if.numbered_steps_done",
+  "category": "instruction_following",
+  "messages": [
+   {"role": "user", "content": "Give exactly 4 numbered steps for making a cup of tea, formatted as \"1. ...\", \"2. ...\" and so on. After the steps, write a final line containing exactly: DONE"}
+  ],
+  "check": {"kind": "all", "checks": [
+   {"kind": "bullets", "min": 4, "max": 4},
+   {"kind": "regex", "pattern": "(?m)^\\s*1\\.\\s.*(?:\\n.*)*^\\s*4\\.\\s"},
+   {"kind": "regex", "pattern": "(?:^|\\n)\\s*DONE\\s*$"}
+  ]}
+ },
+ {
+  "id": "if.answer_in_spanish",
+  "category": "instruction_following",
+  "messages": [
+   {"role": "system", "content": "Always answer in Spanish, whatever language the user writes in."},
+   {"role": "user", "content": "What are two advantages of electric cars? Keep it short."}
+  ],
+  "check": {"kind": "language", "lang": "es"}
+ }
+]

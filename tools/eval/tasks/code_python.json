@@ -1,0 +1,111 @@
+[
+ {
+  "id": "code.fizzbuzz_list",
+  "category": "code_python",
+  "messages": [
+   {"role": "user", "content": "Write a Python function `fizz(n: int) -> list[str]` that returns, for each integer i from 1 to n inclusive, \"FizzBuzz\" if i is divisible by 15, \"Fizz\" if divisible by 3, \"Buzz\" if divisible by 5, and otherwise str(i). For n <= 0 return an empty list. Reply with one ```python code block containing only the implementation."}
+  ],
+  "check": {"kind": "python_exec", "test": [
+   "assert fizz(5) == ['1', '2', 'Fizz', '4', 'Buzz']",
+   "assert fizz(15)[-1] == 'FizzBuzz' and len(fizz(15)) == 15",
+   "assert fizz(0) == [] and fizz(-3) == []",
+   "assert fizz(30).count('FizzBuzz') == 2"
+  ]}
+ },
+ {
+  "id": "code.to_roman",
+  "category": "code_python",
+  "messages": [
+   {"role": "user", "content": "Write a Python function `to_roman(n: int) -> str` that converts an integer from 1 to 3999 into standard Roman numerals using subtractive notation (e.g. 4 -> \"IV\", 9 -> \"IX\"). Raise ValueError for values outside 1..3999. Reply with one ```python code block containing only the implementation."}
+  ],
+  "check": {"kind": "python_exec", "test": [
+   "assert to_roman(1994) == 'MCMXCIV'",
+   "assert to_roman(4) == 'IV' and to_roman(58) == 'LVIII'",
+   "assert to_roman(3999) == 'MMMCMXCIX' and to_roman(1) == 'I'",
+   "for bad in (0, 4000, -1):",
+   "    try:",
+   "        to_roman(bad)",
+   "    except ValueError:",
+   "        pass",
+   "    else:",
+   "        raise AssertionError(bad)"
+  ]}
+ },
+ {
+  "id": "code.merge_intervals",
+  "category": "code_python",
+  "messages": [
+   {"role": "user", "content": "Write a Python function `merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]` that merges overlapping closed intervals. Intervals that touch (e.g. (1, 2) and (2, 3)) also merge. The input may be unsorted; return the merged intervals sorted by start. Reply with one ```python code block containing only the implementation."}
+  ],
+  "check": {"kind": "python_exec", "test": [
+   "norm = lambda xs: [tuple(x) for x in xs]",
+   "assert norm(merge_intervals([(1, 3), (2, 6), (8, 10), (15, 18)])) == [(1, 6), (8, 10), (15, 18)]",
+   "assert norm(merge_intervals([(5, 7), (1, 2), (2, 4)])) == [(1, 4), (5, 7)]",
+   "assert norm(merge_intervals([])) == []",
+   "assert norm(merge_intervals([(1, 10), (2, 3), (4, 5)])) == [(1, 10)]"
+  ]}
+ },
+ {
+  "id": "code.parse_duration",
+  "category": "code_python",
+  "messages": [
+   {"role": "user", "content": "Write a Python function `parse_duration(text: str) -> int` that converts a duration such as \"1h30m\", \"45s\", \"2h\" or \"1h2m3s\" into a number of seconds. Units are h, m and s, each appearing at most once and in that order, each preceded by a non-negative integer. Raise ValueError for anything else, including the empty string. Reply with one ```python code block containing only the implementation."}
+  ],
+  "check": {"kind": "python_exec", "test": [
+   "assert parse_duration('1h30m') == 5400",
+   "assert parse_duration('45s') == 45 and parse_duration('2h') == 7200",
+   "assert parse_duration('1h2m3s') == 3723 and parse_duration('10m') == 600",
+   "for bad in ('', '5x', 'm', '3s2m', 'h1'):",
+   "    try:",
+   "        parse_duration(bad)",
+   "    except ValueError:",
+   "        pass",
+   "    else:",
+   "        raise AssertionError(bad)"
+  ]}
+ },
+ {
+  "id": "code.lru_cache",
+  "category": "code_python",
+  "messages": [
+   {"role": "user", "content": "Implement a Python class `LRUCache` with `__init__(self, capacity: int)`, `get(self, key) -> value` returning -1 when the key is absent, and `put(self, key, value)`. When inserting a new key into a full cache, evict the least recently used key; both get and put count as a use. Reply with one ```python code block containing only the implementation."}
+  ],
+  "check": {"kind": "python_exec", "test": [
+   "c = LRUCache(2)",
+   "c.put(1, 1); c.put(2, 2)",
+   "assert c.get(1) == 1",
+   "c.put(3, 3)",
+   "assert c.get(2) == -1",
+   "c.put(4, 4)",
+   "assert c.get(1) == -1 and c.get(3) == 3 and c.get(4) == 4",
+   "c.put(3, 30); c.put(5, 5)",
+   "assert c.get(3) == 30 and c.get(4) == -1"
+  ]}
+ },
+ {
+  "id": "code.top_words",
+  "category": "code_python",
+  "messages": [
+   {"role": "user", "content": "Write a Python function `top_words(text: str, k: int) -> list[tuple[str, int]]` returning the k most frequent words with their counts. A word is a maximal run of ASCII letters, compared case-insensitively and returned in lowercase. Order by descending count, breaking ties alphabetically. Reply with one ```python code block containing only the implementation."}
+  ],
+  "check": {"kind": "python_exec", "test": [
+   "assert [tuple(x) for x in top_words('the cat and the hat; The end', 2)] == [('the', 3), ('and', 1)]",
+   "assert [tuple(x) for x in top_words('b a B c a b', 3)] == [('b', 3), ('a', 2), ('c', 1)]",
+   "assert list(top_words('', 3)) == []",
+   "assert [tuple(x) for x in top_words(\"don't stop\", 5)] == [('don', 1), ('stop', 1), ('t', 1)]"
+  ]}
+ },
+ {
+  "id": "code.fix_binary_search",
+  "category": "code_python",
+  "messages": [
+   {"role": "user", "content": "This function should return the index of `target` in the sorted list `xs`, or -1 if it is absent, but it has a bug:\n\n```python\ndef binary_search(xs, target):\n    lo, hi = 0, len(xs) - 1\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if xs[mid] == target:\n            return mid\n        if xs[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1\n```\n\nReply with one ```python code block containing the corrected function."}
+  ],
+  "check": {"kind": "python_exec", "test": [
+   "xs = [1, 3, 5, 7, 9, 11]",
+   "assert all(binary_search(xs, v) == i for i, v in enumerate(xs))",
+   "assert binary_search(xs, 4) == -1 and binary_search(xs, 12) == -1 and binary_search(xs, 0) == -1",
+   "assert binary_search([], 1) == -1 and binary_search([2], 2) == 0"
+  ]}
+ }
+]

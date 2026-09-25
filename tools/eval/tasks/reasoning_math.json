@@ -1,0 +1,66 @@
+[
+ {
+  "id": "math.change_due",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "A shop sells notebooks at $3.40 each and pens at $1.15 each. Carla buys 7 notebooks and 12 pens and pays with a $50 bill. How much change does she receive, in dollars? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 12.4, "tol": 0.001}
+ },
+ {
+  "id": "math.percent_chain",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "A price of 80 is increased by 25%, then the new price is decreased by 20%, then that price is increased by 10%. What is the final price? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 88, "tol": 0.001}
+ },
+ {
+  "id": "math.debt_ledger",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "Ana owes Ben 30 euros. Ben owes Carl 50 euros. Carl owes Ana 20 euros. Ana owes Carl 15 euros. Dana owes Ben 10 euros. After every debt is paid exactly as listed, what is Carl's net gain in euros (money received minus money paid)? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 45}
+ },
+ {
+  "id": "math.pointer_chase",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "Box A contains the key to box D. Box E contains a note with the number 902. Box D contains the key to box B. Box C contains a note with the number 417. Box B contains the key to box F. Box G contains the key to box E. Box F contains the key to box C. Starting with only box A open, you repeatedly open the box whose key you just found. What number is on the note you finally reach? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 417}
+ },
+ {
+  "id": "math.variable_chain",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "Let x = 7. Let y = 3x - 4. Let z be the remainder of y divided by 5. Let w = z^3 + y. Let v = w - x*z. What is v? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 11}
+ },
+ {
+  "id": "math.pipes_rate",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "Pipe A alone fills a tank in 6 hours and pipe B alone fills it in 3 hours. A drain alone empties the full tank in 4 hours. Starting empty, with both pipes and the drain open, how many hours does it take to fill the tank? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 4, "tol": 0.001}
+ },
+ {
+  "id": "math.average_speed",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "A car travels 150 km at 60 km/h and then another 150 km at 100 km/h. What is its average speed for the whole 300 km trip, in km/h? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 75, "tol": 0.001}
+ },
+ {
+  "id": "math.inclusion_exclusion",
+  "category": "reasoning_math",
+  "messages": [
+   {"role": "user", "content": "How many integers from 1 to 200 inclusive are divisible by 3 or by 5, but not by 15? End your reply with a line of the form 'Answer: <number>'."}
+  ],
+  "check": {"kind": "number", "value": 80}
+ }
+]
