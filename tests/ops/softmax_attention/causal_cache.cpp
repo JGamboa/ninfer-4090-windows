@@ -2581,6 +2581,13 @@ int run_geometry(const Geometry& geometry, KvCacheStorage storage) {
             failures += run_a3_case(geometry, storage, test_case, MappingPattern::Identity);
         }
 
+        // A prompt-route chunk deep in the cache (~64 key tiles through the prompt kernel's
+        // software pipeline): unmasked interior tiles, masked boundary tiles past an unaligned
+        // base, and a 33-row tail tile whose every key block takes the masked path.
+        failures +=
+            run_a1_case(geometry, storage, {97, 4000, 4097, 407u}, MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, storage, {97, 4000, 4097, 408u}, MappingPattern::Offset);
+
         if (geometry.q_heads == 24) {
             // Deep windows past one resident wave of splits: whole-wave rounding and the
             // two-wave cap (an MTP verification width at ~96K), and the 262144-key limit, where

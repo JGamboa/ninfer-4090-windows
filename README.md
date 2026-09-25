@@ -468,7 +468,11 @@ Python tools run independently of CMake; the standalone HBM probe has its own
   tiles folded into the fp32 running accumulator each tile. The kernel gains 30% at 64K depth
   (109 to 143 TFLOP/s on the `d256-h24-kv4` INT8 append shape); serve prefill gains 5-7% at
   88K-128K. Needle-in-a-haystack retrieval stays exact at both depths and all 84 suite tests
-  pass, which bounds the fp16-accumulation numerics change.
+  pass, which bounds the fp16-accumulation numerics change. The schedule is now
+  warp-specialized and software-pipelined: eight worker warps own the fp32 accumulator and run
+  PV of key tile t while the eight producer warps score tile t + 1, K/V (including packed
+  rk4v4/rk4v4-e8 codes) stage by cp.async one tile ahead, and the accumulator no longer spills
+  around QK.
 - **Causal-tile partitioned key-block traversal.** Interior key blocks (wholly below the causal
   diagonal for the whole CTA tile) run a separate instantiation of the key-block body: KV stages
   with unconditional copies and the softmax drops its masking selects; boundary blocks keep the
