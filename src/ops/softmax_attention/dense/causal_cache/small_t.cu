@@ -366,11 +366,17 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = Geometry::QHeads == 24 ? 256 : 64;
+    const bool rotate_v        = kv_fork_mode_flags(cache.storage).rotate_v;
     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
-        causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                        Offset><<<grid, kReduceBlock, 0, stream>>>(
+        const auto kernel =
+            rotate_v ? causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8,
+                                                                      MultiBatch, Masked, Offset,
+                                                                      Int8>
+                     : causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8,
+                                                                      MultiBatch, Masked, Offset>;
+        kernel<<<grid, kReduceBlock, 0, stream>>>(
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data), static_cast<const std::int32_t*>(pos.data),
             invocation.valid_columns
@@ -403,17 +409,6 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     else
         launch_for_storage.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
-    if (kv_fork_mode_flags(cache.storage).rotate_v) {
-        const int units = invocation.batch_size * invocation.width * Geometry::QHeads *
-                          kKVCacheInt8Groups;
-        kv_cache_inverse_rotate_output_kernel<Geometry::QHeads><<<units, 32, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(out.data), invocation.width, invocation.full_width,
-            invocation.column_begin,
-            invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data));
-        CUDA_CHECK(cudaGetLastError());
-    }
 }
 
 void causal_attention_small_t_launch(
