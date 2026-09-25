@@ -56,9 +56,23 @@ __device__ __forceinline__ unsigned q4_ksplit_bf16_pair(std::uint8_t packed) {
     return result.bits;
 }
 
+// Resident CTAs per SM that the tile's shared staging allows (100 KB per SM on sm_89, 1 KB
+// reserved per CTA), capped at six. The launch bound must not ask for more: under the former fixed
+// bound of six, the 16-column tile (4 resident CTAs by shared memory) was squeezed to ~40 registers
+// and spilled without gaining a single resident warp.
+template <int TileCols>
+constexpr int q4_ksplit_resident_ctas() {
+    constexpr int kSharedBytes = Q4KSplitMmaSchedule::kRowsPerCta * Q4KSplitMmaSchedule::kGroupK / 2 +
+                                 Q4KSplitMmaSchedule::kKWarps * TileCols *
+                                     Q4KSplitMmaSchedule::kTileKPerWarp * 2 +
+                                 Q4KSplitMmaSchedule::kRowsPerCta * Q4KSplitMmaSchedule::kKWarps * 2;
+    constexpr int kCtas = (100 * 1024) / (kSharedBytes + 1024);
+    return kCtas < Q4KSplitMmaSchedule::kMinBlocksPerSm ? kCtas : Q4KSplitMmaSchedule::kMinBlocksPerSm;
+}
+
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSplitStoreEpilogue,
           class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false>
-__launch_bounds__(256, 6) __global__
+__launch_bounds__(256, q4_ksplit_resident_ctas<TileCols>()) __global__
     void q4_ksplit_mma_kernel(const __nv_bfloat16* __restrict__ x,
                               const std::uint8_t* __restrict__ codes,
                               const std::uint8_t* __restrict__ scales,
