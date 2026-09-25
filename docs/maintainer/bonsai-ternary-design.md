@@ -1289,6 +1289,53 @@ Next steps, in order:
    decode (160 int8 against 200 tok/s at 8K) is consistent with the linear growth. Prefill attention is out
    of this step's scope but also depth-bound: `causal_attention_prompt_i8_kernel` takes 21.7 s
    of the 61 s int8 128K prefill (2032 calls, 10.7 ms average) and 25.3 s with rk4v4-e8.
+7. Whole-wave decode splits (`c4b6038`, validated 2026-09-24 on the RTX 4090 at 60 Hz, server
+   off). The split count now rounds up to whole waves of `2 * 128 / KV heads` = 64 splits, with
+   a cap of two waves (128). At 128K the grid goes from 4 x 85 = 340 CTAs to 4 x 128 = 512
+   CTAs; windows of 64 splits or fewer are unchanged.
+   - Build: MSVC and CUDA 13.4, `small_t.cu` included.
+   - Oracle test: `ninfer_softmax_attention_test` passes in full (138 s), including the new
+     24/4-head cases at T = 3 over 98304 keys and T = 1 at 262144 keys, in BF16 and INT8.
+   - NIAH: all five runs return exactly `ORCHID=493817; COLOR=COBALT`. These are 64K and 128K
+     with int8 and rk4v4-e8, plus `long_niah_256k` with rk4v4-e8 (260096 prompt tokens,
+     prefill 3 min 6.8 s at 1390 tok/s). The 256K rk4v4-e8 run exercises the keys-per-split
+     limit with the E8 codec, which the oracle test does not cover. Indicative decode rates
+     (six rounds): 64K 169.8 / 175.5 tok/s, 128K 138.7 / 150.6 (int8 / rk4v4-e8), 256K 116.7.
+     Prefill is unchanged.
+   - Profiles (same commands as 6A and 6C: `profiles/nsys/bonsai_t5_mtp_128k_waves`,
+     `_128k_rk4_waves`, `_short_waves`):
+
+     | Per round, ms | 128K int8 before -> after | 128K rk4v4-e8 before -> after | Short, bf16 KV, before -> after |
+     |---|---|---|---|
+     | Wall | 20.75 -> 19.45 (-6.3 %) | 18.51 -> 17.62 (-4.8 %) | 12.82 -> 12.44 |
+     | Attention | 8.26 -> 7.30 (-11.6 %) | 6.57 -> 5.56 (-15.4 %) | 0.46 -> 0.41 |
+     | Split kernel, per call | 445 -> 386 us | 353 -> 291 us | 18.0 -> 16.1 us |
+     | Split reduce, per call | 11.1 -> 16.7 us | 7.5 -> 13.2 us | 3.5 -> 2.8 us |
+
+     The int8 split now reads its ~275 MB at ~710 GB/s, about 71 % of peak (before ~61 %).
+     Twice as many splits make the reduce slower, but it stays small. The gain is less than
+     the wave count alone predicts (the same work in 2 full waves instead of 1.33 waves, the
+     second one-third full): each split's fixed cost now covers 1016 keys instead of 1530. At
+     short context the split counts stay below one wave (grids 4 x 8 and
+     4 x 32, as before). The whole round there is within run-to-run noise (GEMV 7.70 -> 7.62,
+     MTP layer 1.32 -> 1.12 ms).
+   - Concurrency: `ninfer-serve` with the user's server configuration (rk4v4-e8, `--kv-capacity
+     auto`, 3 lanes, MTP 2, Vision), plus `--no-prefix-reuse` and `--pending-timeout-ms 600000`.
+     Three different ~40K-token prompts (slices of the 64K haystack), `temperature 0`, thinking
+     off, `max_tokens 3072`, sent at once and then one after another. Decode throughput comes
+     from the request log's 5 s windows with no prefill. The binary before `c4b6038` was
+     rebuilt from the three reverted source files.
+
+     | Decode | Before | After |
+     |---|---|---|
+     | Three lanes decoding, aggregate | 166.9 tok/s, 37.09 ms per round | 166.2 tok/s, 37.15 ms per round |
+     | One request at a time | 143.6 tok/s, 14.49 ms per round | 146.3 tok/s, 14.07 ms per round |
+
+     No regression. At 40K and three lanes attention is not the limit. Prefill runs one
+     request at a time (2.7k tok/s each): the second and third requests queue for 14.5 and
+     30 s. With the default `--pending-timeout-ms 30000`, a first attempt without the override
+     lost the third request to `request_queue_timeout` (HTTP 503). Three simultaneous long
+     prompts need a longer pending timeout.
 
 ## Appendix: sources
 
