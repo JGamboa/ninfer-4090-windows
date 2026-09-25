@@ -736,3 +736,24 @@ prompts (MTP 3 alone: 3.9-4.0; d6: 6.5-7.0).
   above d6.
 - Scope: short contexts (under 2K tokens), one lane, no thinking. The launcher runs three lanes
   with thinking; the launcher is unchanged until that is measured through the server.
+
+Through `ninfer-serve` at the launcher's flags (2026-09-25, measured; rk4v4-e8, 100000 context,
+three lanes, `--preserve-thinking`, server sampling defaults, thinking on, `max_tokens` 4096, a fixed
+seed per request, two server starts per variant with the order reversed). Sequential requests, one
+lane active; decode tok/s from the request log:
+
+| Decode tok/s (mean of both starts) | DFlash2 d6, no graphs | MTP 3 + n-gram, graphs |
+|---|---|---|
+| Agent prompts (4) | 169.1 | 165.4 |
+| Free-form prompts (2) | 99.2 | 84.7 |
+| Long-context edits (2; 10.6K and 6.6K-token files) | 138.6 | 258.3 |
+
+- Long-context edits restate a function of the file, and n-gram doubles their speed (long1 151 ->
+  288-300, long2 126 -> 217-229).
+- On the short agent prompts most of the output is thinking, which the pool cannot draft, so the two
+  tie.
+- On free-form prompts d6 stays ahead (99 against 85). The sampled texts also differ between the
+  variants: the transformer answer is 2537 tokens with d6 and 415 with MTP 3.
+- Three concurrent requests: the wall-clock throughput ties (187 against 182 tok/s), but the sampled
+  output lengths differ per variant, so this comparison cannot separate them.
+- The launcher still runs DFlash2 d6; switching is a user decision.

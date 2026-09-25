@@ -2202,8 +2202,28 @@ Next steps, in order:
       - MTP 2 alone reaches ~250 tok/s here because restating text is predictable: acceptance
         nearly fills every round (3.0 of 3 tokens). The ~160-190 tok/s seen before is prose and
         code written from scratch.
-    - Not measured yet: the servers (three lanes, thinking, long contexts). Both launchers are
-      unchanged.
+    - Through `ninfer-serve` at the Bonsai launcher's flags (measured 2026-09-25):
+      - Setup: 262144 context, KV auto, rk4v4-e8, three lanes, Vision, temperature 1.0, top-p
+        0.95, top-k 20, thinking budget 4096, `max_tokens` 4096, a fixed seed per request, two
+        server starts per variant with the order reversed. Decode tok/s comes from the request
+        log. The workload is the six prompts above plus two long-context edits: return one
+        function of `src/serve/request_log.cpp` (10.6K prompt tokens) or
+        `src/serve/serve_options.cpp` (6.6K) with a small change.
+
+      | Decode tok/s, one request at a time | MTP 2 | MTP 2 + n-gram |
+      |---|---|---|
+      | Agent prompts (4) | 211.8 | 319.4 (+51 %) |
+      | Free-form prompts (2) | 156.1 | 163.3 (+5 %) |
+      | Long-context edits (2) | 214.9 | 377.6 (+76 %) |
+
+      - The two starts agree within 1 %. The JSON edit goes from 248 to 427 tok/s and the 10.6K
+        file edit from 215 to 437 tok/s.
+      - Three concurrent requests: the sampled output lengths differ per variant, so the
+        wall-clock throughput (336 against 316 tok/s) and the decode-sum throughput (378 against
+        419 tok/s) disagree in sign. The multi-lane effect is unresolved, not a measured loss.
+      - Qwen3.8 through its launcher is in WINDOWS_PORT.md: long-context edits run 258 against
+        139 tok/s (d6), agent prompts tie, and free-form prompts are 85 against 99.
+      - Both launchers are unchanged pending the user's decision.
 
 ## Appendix: sources
 
