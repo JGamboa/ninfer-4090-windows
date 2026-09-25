@@ -1442,16 +1442,24 @@ Next steps, in order:
    two occupancy limits) has to hold the staged codes.
 
    Baseline oracle (`8b202c4`, run 2026-09-25 on the current kernel). `8b202c4` adds rk4v4-e8
-   cases to `ninfer_softmax_attention_test`, and the test now **fails**: 48 rk4v4-e8 cases
-   miss the reduction criterion (308 s; packed, context and the other KV modes pass). The
-   failing cases are:
-   - T = 1 with a single key, for both geometries (d256-h24-kv4 and d256-h16-kv2);
-   - batched windows W = 1..16 with B = 1..8.
+   cases to `ninfer_softmax_attention_test`.
+   - The full test fails (308 s): the packed, context and non-rk4v4-e8 cases pass, the new
+     rk4v4-e8 cases do not.
+   - `ninfer_softmax_attention_test --rk4v4-e8-only` (the new cases only, including 128K and
+     the DFlash2 widths) also fails, in 170 s: `FAIL causal_softmax_attention rk4v4-e8
+     independent correctness`.
 
-   Every miss is small and alike: |actual - reference| = 0.005-0.007 at |reference| ~ 0.5-1.2,
-   about 0.7-1.5 BF16 ULP, for example `actual=1 reference=0.994812` at one key. The test's
-   informational rk4v4-e8 quantized-vs-BF16 quality line is `mae=0.0060044 rmse=0.00758123
-   rel_rmse=0.102081 max_abs=0.0284158`.
+   The `--rk4v4-e8-only` run prints 46 failure lines, all `reduction criterion failed`:
+   - T = 1 with a single key, for both geometries:
+     `causal_softmax_attention d256-h{24-kv4,16-kv2} rk4v4-e8 mapping=identity T=1 keys=1
+     envelope_max=1: reduction criterion failed at index 50 actual=1 reference=0.994812`.
+   - 44 `causal batch ... rk4v4-e8 W=... B=... phase=0` cases: d256-h24-kv4 with W = 2..16 and
+     B = 1..8, plus d256-h16-kv2 W=1 B=8.
+
+   No cache-code or relative-L2 line fails, and no 128K case appears. Every miss is small and
+   alike: |actual - reference| = 0.0044-0.0068 at |reference| ~ 0.35-1.2, about 0.7-1.5 BF16
+   ULP. The quality line reads: `rk4v4-e8 quantized-vs-bf16 oracle quality mae=0.0060044
+   rmse=0.00758123 rel_rmse=0.102081 max_abs=0.0284158`.
 
    The single-key case rules out the softmax and the split reduction as the cause. There the
    output is exactly the decoded V. The oracle decodes the stored codes in FP64, applies the
@@ -1504,10 +1512,13 @@ Next steps, in order:
      per call) and the Q4 proposal head (412 -> 446 us). The baseline is a day older and
      on another build, so the round comparison is not like for like.
 
-   Verdict: the fusion removes 144 launches and ~0.09 ms of kernel time per round, but no
-   per-round gain is resolved within this session's run-to-run spread. The derived ms per
-   round of four prompts moves by <= 1 %, while two prompts vary by 8 %. A same-session
-   profile of a pre-`c1eb910` build would settle the ~0.1 ms; it was not run.
+   Verdict:
+   - Correct: t5 and `attn_input_proj` tests, PPL 5.8549, Qwen3.8 md5 unchanged.
+   - -144 launches, and the fused kernels' own time 1.03 -> 0.94 ms per round.
+   - The full round shows no measurable change; the difference is within noise.
+
+   The saving is smaller than the round's run-to-run noise, so no clean A/B against a
+   pre-`c1eb910` build was run.
 
 ## Appendix: sources
 
