@@ -520,3 +520,45 @@ With the exact byte counts, gate+up reaches 608 GB/s, not the ~650 estimated abo
 so gate+up (11.4 ms per round, a third of the verification) is ~12 % below what the same
 kernel family already reaches. The small sides (GDN Q4 at 21 us, o_proj at 38 us) pay a
 fixed launch-and-tail cost for their size.
+
+### Phase 3: `q4_ksplit_mma` launch bound (`1acd5db`, 2026-09-25)
+
+`1acd5db` sizes the launch bound of `q4_ksplit_mma` from its shared-memory tile, with no
+register spills. Validated at HEAD `e710b6b` against the `cccaace` build, with the same
+method, desktop at 60 Hz and server off.
+
+- Six tests pass: `ninfer_linear_swiglu_q4_a16_test`, `ninfer_linear_q4_a16_test`,
+  `ninfer_attn_input_proj_test`, `ninfer_gdn_input_proj_test`,
+  `ninfer_gdn_input_proj_conv_snapshot_test` (0 failures against the sampled FP64 reference)
+  and `ninfer_gdn_input_proj_conv_record_test`.
+- d12 round (`profiles/nsys/qwen38_dflash2_d12_phase3`), `q4_ksplit_mma` instances, median
+  over 121 rounds, `cccaace` -> `1acd5db`. GB/s is against the ~845 GB/s read ceiling:
+
+  | Instance | Median us | GB/s | Of the ceiling |
+  |---|---|---|---|
+  | mlp gate+up, 34816 x 5120 (x64 per round) | 155.7 -> 118.2 | 608 -> 801 | 72 -> 95 % |
+  | GDN in_proj Q4 side, 4096 x 5120 (x48) | 20.9 -> 19.0 | 532 -> 585 | 63 -> 69 % |
+  | attn qkvg Q4 side, 7168 x 5120 (x16) | 33.8 -> 31.2 | 576 -> 624 | 68 -> 74 % |
+  | DFlash2 proposal head, 131072 x 5120 (drafter, x1) | 518.8 -> 421.8 | 687 -> 845 | 81 -> 100 % |
+
+  The Q5 instances are unchanged: down 102.0 us, o_proj/out_proj 38.4, GDN Q5 side 61.0,
+  qkvg Q5 side 41.3.
+- Per round: wall 36.0 -> 33.5 ms; verification 31.4 -> 29.0 ms; gate+up 11.4 -> 9.0 ms;
+  drafter 3.53 -> 3.48 ms.
+- Plain runs (`scenario_code_python`, `--no-thinking --greedy --lm-head-draft`), ms per round
+  `cccaace` -> `1acd5db`, and text md5 against `cccaace`:
+
+  | Run | ms per round | tok/s | Text |
+  |---|---|---|---|
+  | DFlash2 d6 | 29.6 -> 30.4 | 126.8 -> 125.4 | identical |
+  | DFlash2 d12 | 35.5 -> 33.1 (-7 %) | 119.7 -> 128.9 | identical |
+  | DFlash2 d15 | 37.1 -> 33.9 (-9 %) | 111.0 -> 122.2 | identical |
+  | Qwen3.8 MTP 3 | 25.9 -> 26.6 | 124.6 -> 122.2 | identical (md5) |
+  | Bonsai MTP 2 | 12.2 -> 12.2 | 149.6 -> 148.8 | identical (md5) |
+
+  d6 and MTP 3 move by about 0.8 ms, within the run-to-run spread of these 3-5 s decodes at
+  60 Hz (±0.5-0.9 ms in the earlier rounds). On this prompt d12 (128.9 tok/s) is now the
+  fastest DFlash2 window, ahead of d6 (125.4).
+
+Across the five commits the d12 round went from 51.4 to 33.5 ms (-35 %), and d12 decode from
+78.7 to 128.9 tok/s.
