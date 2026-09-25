@@ -569,6 +569,9 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    // MTP: the widest verify window V, and the width of the round in flight (read at commit).
+    const std::uint32_t verify_window;
+    std::uint32_t mtp_round_width = 0;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;

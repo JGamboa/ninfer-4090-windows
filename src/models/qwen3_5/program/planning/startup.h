@@ -75,6 +75,8 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
+    // MTP only: the widest verify window V (K<=V<=15); equals K when no host drafts are used.
+    std::uint32_t verify_window             = 0;
     std::uint32_t turn_checkpoint_ring      = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
@@ -98,6 +100,8 @@ struct SequencePlanImpl {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
+    // MTP only: the widest verify window V (K<=V<=15); equals K when no host drafts are used.
+    std::uint32_t verify_window             = 0;
     std::uint32_t turn_checkpoint_ring      = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;

@@ -2001,6 +2001,41 @@ Next steps, in order:
       Vision) it starts with 6.39 GiB of weights and 786432 KV tokens, and answers.
     - Qwen3.8 launcher (MTP 3 with CUDA graphs against DFlash2 d6 without graphs): a tie at
       steady state (108.9 against 108.7 tok/s), so it is not adopted; details in WINDOWS_PORT.md.
+16. N-gram phase 1, stage 1: the MTP verify window `V` split from the proposal depth `k`
+    (HANDOFF.md section 8 idea 4; plan in `docs/maintainer/ngram-speculation-plan.md`).
+    - Scope: the MTP decode buffers, envelopes, workspace, ReplaySSM records and
+      `mtp_prepare_next_round` take `V` (up to 15 drafts, width 16). The MTP proposal, its KV
+      end and page slack keep `k`. A round of width `W` uses exact `[W,B]` views, and the
+      Program still runs `V = k`, so behaviour is unchanged until stage 2 supplies wider
+      drafts.
+    - Tests (RTX 4090, CUDA 13.4, sm_89):
+      - `ninfer_mtp_round_test`: oracle for every `k` in 1..5 and `V` in `k..15`, plus
+        `(15, 3)` at eight accept counts. PASS.
+      - `ninfer_qwen3_5_runtime_mechanisms_test`: a `V = 15, k = 3` layout (16 verify
+        columns, 3 proposal columns, 2 AR steps), and `V < k` is rejected. PASS.
+      - ctest `qwen3_5|mtp_round|speculative`: 100 % (real-artifact tests skip without
+        `NINFER_TEST_ARTIFACT`).
+      - `ninfer_qwen3_5_prefix_real_test` on `qwen3_8_27b.ninfer`: 10 of 11 scenarios pass.
+        The default scenario (host restore) and `shared-replacement` fail identically on
+        the pre-stage build (`cfbb128`, separate worktree), so they are not stage 1
+        regressions; their diagnosis is recorded separately.
+    - Text: greedy, 512 new tokens, six prompts, `--max-context 4096`, old binary
+      (`cfbb128`) against new. Bonsai mix (`bonsai2_27b_vl_mtp_q4q5.ninfer`, MTP 2,
+      `--lm-head-draft`) and Qwen3.8 (MTP 3, `--lm-head-draft`, int8 KV, `--no-thinking`):
+      12 of 12 md5 identical in every run.
+    - MTP-only round time, measured: old and new alternated twice, no other GPU process,
+      display at 60 Hz. ms per round = generated tokens / decode tok/s / rounds, mean of
+      the six prompts.
+
+      | Round | Bonsai old | Bonsai new | Qwen3.8 old | Qwen3.8 new |
+      |---|---|---|---|---|
+      | 1 | 11.949 | 11.909 | 26.290 | 26.240 |
+      | 2 | 11.822 | 11.777 | 25.411 | 24.294 |
+
+      The new build is not slower in any round. Bonsai differs by 0.04-0.05 ms (within
+      noise). Qwen3.8 round 2 drifts 1 ms between runs, as the clock drift seen before, so
+      its -1.1 ms is also noise, not a gain. An earlier run was discarded because another
+      session loaded the 27B model onto the GPU during it.
 
 ## Appendix: sources
 

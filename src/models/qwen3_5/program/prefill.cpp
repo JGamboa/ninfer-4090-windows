@@ -886,7 +886,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
-    const std::uint32_t width = draft_window + 1U;
+    // MTP rounds choose their width per round; DFlash rounds always verify K+1 columns.
+    const std::uint32_t width =
+        speculative_backend == SpeculativeBackend::Mtp ? mtp_round_width : draft_window + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);

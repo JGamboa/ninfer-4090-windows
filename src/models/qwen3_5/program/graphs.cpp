@@ -246,6 +246,8 @@ void ProgramImpl::prepare_graphs() {
         if (io.mtp_decode) {
             *mtp_host_ingress          = {};
             *mtp_host_egress           = {};
+            // Representative rounds use the MTP-only width K+1 (the verify drafts are the
+            // proposal), packed with the same exact strides as decode_mtp_batch.
             const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
             const std::uint32_t width  = draft_window + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
@@ -349,8 +351,9 @@ void ProgramImpl::prepare_graphs() {
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         execution::mtp_decode_batch(
-            mtp_state, 1, draft_window,
-            mtp_causal_attention_envelopes(code_warm.max, draft_window, capacity), nullptr);
+            mtp_state, 1, draft_window + 1U, draft_window,
+            mtp_causal_attention_envelopes(code_warm.max, draft_window, draft_window, capacity),
+            nullptr);
         device.synchronize();
 
         mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
@@ -364,8 +367,10 @@ void ProgramImpl::prepare_graphs() {
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
                 execution::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_causal_attention_envelopes(planned.max, draft_window, capacity),
+                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window + 1U,
+                    draft_window,
+                    mtp_causal_attention_envelopes(planned.max, draft_window, draft_window,
+                                                   capacity),
                     profile.definition);
             }
         }

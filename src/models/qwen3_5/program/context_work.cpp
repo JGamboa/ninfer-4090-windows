@@ -264,16 +264,20 @@ detail::PhysicalResources positive_resource_difference(detail::PhysicalResources
 }
 
 execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
+                                                                      std::uint32_t verify_drafts,
                                                                       std::uint32_t k,
                                                                       std::uint32_t capacity) {
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     execution::MtpCausalAttentionEnvelopes out;
-    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
+    // Target verify and the MTP alignment batch see E+(W-1)+1 keys; the AR steps continue from
+    // the committed frontier, at most E+W, for K-1 more positions.
+    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + verify_drafts + 1ULL)};
     out.batch         = out.target_verify;
     for (std::uint32_t step = 0; step + 1 < k; ++step) {
-        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
+        out.ar[step] = {
+            1, visible(static_cast<std::uint64_t>(max_frontier) + verify_drafts + step + 2ULL)};
     }
     return out;
 }

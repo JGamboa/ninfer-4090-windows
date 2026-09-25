@@ -169,7 +169,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             GdnReplayRecordSpec{
                 .layers          = dimension(config.linear_attention_layers),
                 .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
-                .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
+                // MTP records its widest verify round (V+1); DFlash verifies K+1.
+                .width = static_cast<std::int32_t>(
+                    (plan.speculative_backend == SpeculativeBackend::Mtp ? plan.verify_window
+                                                                         : plan.draft_window) +
+                    1U),
                 .conv_channels   = (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
                 .qk_heads        = (config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0),
                 .value_heads     = (config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0),
@@ -238,6 +242,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .output_rows    = dimension(config.vocab_size),
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
+                                         .verify_window  = plan.speculative_backend ==
+                                                                  SpeculativeBackend::Mtp
+                                                               ? plan.verify_window
+                                                               : 0U,
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring});
     out.prefill_hidden =
@@ -280,6 +288,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
+    // MTP verifies up to V drafts per round (the MTP proposal plus host drafts); its proposal
+    // and prefill keep the MTP depth K (drafts).
+    const auto mtp_verify_drafts = static_cast<std::int32_t>(plan.verify_window);
+    const auto mtp_verify        = mtp_verify_drafts + 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -495,7 +507,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.mtp_prefill = finish(mtp_prefill);
 
         WorkspaceLayoutBuilder mtp_batch;
-        mtp_full_call(mtp_batch, verify, text_envelope, false);
+        mtp_full_call(mtp_batch, mtp_verify, text_envelope, false);
         WorkspaceLayoutBuilder mtp_ar;
         mtp_full_call(mtp_ar, 1, text_envelope, true);
         WorkspaceLayoutBuilder mtp_align;
@@ -503,17 +515,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         WorkspaceLayoutBuilder mtp_proposal;
         proposal_scratch(mtp_proposal, 1);
         const std::size_t accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-            dimension(parameters.model.resources().public_token_count), drafts, drafts, 1, 1);
+            dimension(parameters.model.resources().public_token_count), mtp_verify_drafts,
+            mtp_verify_drafts, 1, 1);
         out.mtp_round = std::max({accept, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
         out.ordinary_round = std::max(out.ordinary_round, finish(mtp_align));
 
         for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
              ++batch) {
-            const std::int32_t aggregate = batch * verify;
+            const std::int32_t aggregate = batch * mtp_verify;
             WorkspaceLayoutBuilder target;
             matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
             target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
-                        GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
+                        GdnWorkspacePath::ReplayRecord, batch, mtp_verify, mtp_verify,
+                        text_envelope);
 
             const auto mtp_decode_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t width) {
                 const std::int32_t tokens = batch * width;
@@ -533,15 +547,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             WorkspaceLayoutBuilder alignment;
-            mtp_decode_core(alignment, verify);
+            mtp_decode_core(alignment, mtp_verify);
             WorkspaceLayoutBuilder ar;
             mtp_decode_core(ar, 1);
             WorkspaceLayoutBuilder proposal;
             proposal_scratch(proposal, batch);
             const std::size_t batch_accept =
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                    dimension(parameters.model.resources().public_token_count), drafts, drafts,
-                    batch, batch);
+                    dimension(parameters.model.resources().public_token_count), mtp_verify_drafts,
+                    mtp_verify_drafts, batch, batch);
             out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
                                       finish(proposal), batch_accept});
         }
@@ -837,6 +851,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    impl->verify_window       = inputs.verify_window;
     // DFlash keeps checkpoint state in its own cyclic mirror that only covers the resident
     // checkpoint; older ring entries could not rebuild it, so the ring stays off there.
     impl->turn_checkpoint_ring =
@@ -863,9 +878,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
+                    // The last AR step sees E+V+K keys (verify window V, depth K).
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
+                        impl->capacity, static_cast<std::uint64_t>(profile.max) +
+                                            impl->verify_window + impl->draft_window);
 #ifdef NINFER_SM86
                     if (final_visible <= 4096) {
                         // The reduced-startup graph set still consumes 35.8 MiB at C1/K3 and
@@ -921,6 +937,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .verify_window       = options.speculative.backend == SpeculativeBackend::Mtp
+                                   ? options.speculative.draft_tokens
+                                   : 0U,
         .turn_checkpoint_ring = options.turn_checkpoint_ring,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,

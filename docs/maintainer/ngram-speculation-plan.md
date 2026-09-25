@@ -27,13 +27,13 @@ encoding, and both tests pin the same vector, so simulated collisions are runtim
 
 | Backend | Draft source | Can take host drafts |
 |---|---|---|
-| MTP | host: `MtpDecodeIngress::current_drafts[C*K]` and `current_extents[C]` are filled from `SequenceState::mtp_drafts` by `ProgramImpl::decode_mtp_batch` (`program/decode.cpp`); the previous round's `MtpDecodeEgress::next_drafts` land there in `ProgramImpl::resolve_pending_raw` (`program/prefill.cpp`) | yes, unchanged data path |
+| MTP | host: `MtpDecodeIngress::current_drafts[C*V]` and `current_extents[C]` are filled from `SequenceState::mtp_drafts` by `ProgramImpl::decode_mtp_batch` (`program/decode.cpp`); the previous round's `MtpDecodeEgress::next_drafts` land there in `ProgramImpl::resolve_pending_raw` (`program/prefill.cpp`) | yes, unchanged data path |
 | DFlash, DFlash2 | device: the drafter writes `draft_tokens` inside the same graph (`execution/draft.cpp`); `DFlashDecodeIngress` has no draft field | no |
 
 The MTP round therefore already verifies externally supplied drafts. Its device body
 (`mtp_decode_batch_body` in `program/speculative/mtp.cpp`) is:
 
-1. `speculative_prepare_verify_inputs` builds `[K+1,B]` ids and positions from anchors,
+1. `speculative_prepare_verify_inputs` builds `[W,B]` ids (round width `W <= V+1`) and positions from anchors,
    `current_drafts` and `current_extents`;
 2. `target_verify_accept` (`program/speculative/target_verification.cpp`) runs
    `TextContext::target_verify_batch` with GDN `RecordForReplay`, then
@@ -47,31 +47,34 @@ deterministic proposal: greedy rows accept the longest prefix equal to the targe
 stochastic rows accept draft `i` with probability `p_i(draft_i)`, which is exact rejection sampling
 for a one-hot proposal. N-gram drafts are one-hot.
 
-What couples MTP to its width today: one startup `draft_window` K sets both the verify width
-`K+1` and the MTP autoregressive depth, and every MTP-specific limit is 5
-(`kMtpDecodeMaximumDrafts` in `program/round_buffers.h`, `kMaximumMtpDraftTokens` in
-`program/internal.h`, `mtp_prepare_next_round` requires `1<=K<=5` in
-`include/ninfer/ops/mtp_round.h`, `mtp_forward_decode_batch` requires `width<=6` in
-`execution/text.cpp`).
+Before Phase 1 stage 1, one startup `draft_window` K set both the verify width `K+1` and the MTP
+autoregressive depth. Stage 1 (below) split them; the MTP depth limit stays 5.
 
 ## Phase 1: pool drafts through the MTP round, verify window up to 15
+
+Progress: stage 1 (split `V` from `k`, tests) is done and recorded in
+[Bonsai ternary design](bonsai-ternary-design.md) section 9.1 item 16; the Program still runs
+`V = k`. Stage 2 is the pool, the draft policy and the second graph width; stage 3 is flags, logs
+and measurement.
 
 ### Model/Program changes
 
 - Split the MTP window into verify window `V` (drafts per round, `1..15`) and MTP depth `k`
-  (`1..5`, the existing `--draft-tokens`). `RoundStateSpec`, `MtpDecodeStateLayout`,
+  (`1..5`, the existing `--draft-tokens`). `RoundStateSpec::verify_window`, the MTP decode layout,
   `MtpDecodeIngress::current_drafts`/`target_rope_positions` and
-  `MtpDecodeEgress::licensed_tokens` use `V`; `next_drafts` keeps `k`.
-- `mtp_prepare_next_round` takes the verify width `V+1` for `alignment_ids` and the proposal depth
-  `k` for `next_extents` and the AR position rows. This changes its Op contract; its oracle test
-  covers the new `(V,k)` domain.
+  `MtpDecodeEgress::licensed_tokens` use `V`; `next_drafts` and the MTP prefill tensors keep `k`.
+  A round of width `W <= V+1` uses exact `[W,B]` views over the `V`-sized buffers. (Done.)
+- `mtp_prepare_next_round` takes the verify width `T = V+1` and the proposal depth `k`
+  (`1 <= k <= 5`, `k+1 <= T <= 16`) for `next_extents` and the AR position rows. Its oracle test
+  covers every `(V,k)`. (Done.)
 - `mtp_forward_decode_batch` admits alignment width up to 16. It uses the same attention/FFN Ops
-  as target verify, which already support `T<=16`, `B<=8`.
+  as target verify, which already support `T<=16`, `B<=8`. (Done.)
 - ReplaySSM records (`planning/startup.cpp`, `GdnReplayRecordSpec::width`) are sized for `V+1`:
   27.3 MiB per lane at `T=16` for the 27B geometry ([ReplaySSM GDN](replayssm-gdn.md) section 6),
-  218 MiB at eight lanes.
-- `ensure_sequence_kv_mapped(frontier + extent + 1, frontier + extent + V)` and the page slack in
-  `planning/startup.cpp` use `V`.
+  218 MiB at eight lanes. (Done.)
+- Target KV for a round is mapped through `frontier + extent + 1`, which covers any `extent <= V`.
+  The MTP KV end (`frontier + extent + k`) and its page slack depend on `k`, not `V`, because the MTP
+  head covers the verified columns plus its `k-1` autoregressive steps.
 - `SpeculativeStats::accepted_per_position` has `V` positions; add drafted/accepted counters per
   source (MTP, pool) so the product can report where accepted tokens came from.
 
@@ -156,11 +159,11 @@ Product and Program:
 
 - `validate_speculative_cli_options`: MTP `1..5`, DFlash/DFlash2 `1..15`
   (`src/product/speculative_options.h`).
-- `kMtpDecodeMaximumDrafts = 5`, `kDFlashDecodeMaximumDrafts = 15`, `kDFlashDecodeMaximumWidth`
-  and the fixed ingress/egress arrays (`src/models/qwen3_5/program/round_buffers.h`).
-- `kMaximumMtpDraftTokens = 5` (`src/models/qwen3_5/program/internal.h`).
+- `kMtpVerifyMaximumDrafts = 15`, `kDFlashDecodeMaximumDrafts = 15`, their widths and the fixed
+  ingress/egress arrays (`src/models/qwen3_5/program/round_buffers.h`);
+  `kMaximumMtpVerifyDrafts = 15` (`src/models/qwen3_5/program/internal.h`).
 - `TextContext::target_verify_batch_impl`: `width <= kDFlashDecodeMaximumWidth`;
-  `mtp_forward_decode_batch`: `width <= 6` (`src/models/qwen3_5/execution/text.cpp`).
+  `mtp_forward_decode_batch`: `width <= 16` (`src/models/qwen3_5/execution/text.cpp`).
 - ReplaySSM record width and KV page slack from `draft_window`
   (`src/models/qwen3_5/program/planning/startup.cpp`); graph profiles
   (`planning/graph_profiles.cpp`); `accepted_per_position` (`program/decode.cpp`).
@@ -184,7 +187,7 @@ Target-verify Ops:
   (`src/ops/wrapper/sampling.cpp`). Wider rounds fall back to the single-block kernel in
   `src/ops/kernel/speculative_round.cuh`, which is correct but scans the whole vocabulary with one
   block per row; the limit should be raised with the rest.
-- `mtp_prepare_next_round`: `K <= 5` (`include/ninfer/ops/mtp_round.h`).
+- `mtp_prepare_next_round`: `T <= 16` (`include/ninfer/ops/mtp_round.h`).
 - Linear, attention-input, GDN-input and FFN GEMMs dispatch by aggregate column count and have
   prefill routes above 16, so they are functional. Their small-T routes stop at 16, and the first
   columns past a route boundary are slow (5120 x 17408 at T=17 measured 300 us against 118 us at

@@ -12,8 +12,12 @@
 
 namespace ninfer::models::qwen3_5 {
 
+// MTP proposes up to kMtpDecodeMaximumDrafts drafts per round (its autoregressive depth K). A
+// round verifies up to kMtpVerifyMaximumDrafts drafts (V): the MTP proposal, optionally extended
+// by host drafts, at width V+1.
 inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
-inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
+inline constexpr std::uint32_t kMtpVerifyMaximumDrafts    = 15;
+inline constexpr std::uint32_t kMtpVerifyMaximumWidth     = kMtpVerifyMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
@@ -21,9 +25,12 @@ struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
-    std::uint32_t draft_window   = 0;
-    SpeculativeBackend backend   = SpeculativeBackend::None;
-    bool causal_scoring          = false;
+    // MTP: proposal depth K. DFlash: drafts per round.
+    std::uint32_t draft_window = 0;
+    // MTP only: the widest verify window V, K<=V<=15. Verify buffers are sized V+1 columns.
+    std::uint32_t verify_window = 0;
+    SpeculativeBackend backend  = SpeculativeBackend::None;
+    bool causal_scoring         = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -43,15 +50,16 @@ struct OrdinaryDecodeEgress {
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
-// product domain; RoundState binds only the configured [K,C] and [K+1,C] prefixes.
+// product domain. A round of width W packs its verify arrays as exact [W-1,B] and [W,B] prefixes;
+// the proposal arrays keep the configured [K,C] domain.
 struct MtpDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> anchors{};
     std::array<std::int32_t, kMaximumConcurrency> base_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
     std::array<std::int32_t, kMaximumConcurrency> current_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> current_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency * kMtpDecodeMaximumWidth> target_rope_positions{};
+    std::array<TokenId, kMaximumConcurrency * kMtpVerifyMaximumDrafts> current_drafts{};
+    std::array<std::int32_t, kMaximumConcurrency * kMtpVerifyMaximumWidth> target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
@@ -61,7 +69,7 @@ struct MtpDecodeIngress {
 };
 
 struct MtpDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumWidth> licensed_tokens{};
+    std::array<TokenId, kMaximumConcurrency * kMtpVerifyMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
@@ -249,9 +257,14 @@ struct MtpDecodeState {
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
 
+    // Verify tensors are sized for the widest verify window V+1; a round of width W binds
+    // contiguous exact-[W,B] views over the start of the same storage.
+    std::uint32_t verify_window = 0;
+
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
-                   std::uint32_t batch_capacity, std::uint32_t draft_window);
+                   std::uint32_t batch_capacity, std::uint32_t draft_window,
+                   std::uint32_t verify_window);
 };
 
 struct DFlashDecodeState {

@@ -136,11 +136,14 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
+    // MTP rounds can verify up to V drafts, so acceptance is counted over the verify window.
+    const std::uint32_t verified_positions =
+        speculative_backend == SpeculativeBackend::Mtp ? verify_window : draft_window;
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
-        .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .accepted_per_position = std::vector<std::uint64_t>(verified_positions, 0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -409,8 +412,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("MTP batch membership is invalid");
     }
 
-    const std::uint32_t width      = draft_window + 1;
-    std::uint32_t maximum_frontier = 0;
+    // Drafts this round verifies (W-1). MTP proposes at most K=draft_window of them.
+    const std::uint32_t verify_drafts = draft_window;
+    const std::uint32_t width         = verify_drafts + 1;
+    std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -443,14 +448,14 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
-            mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
+            mtp_causal_attention_envelopes(maximum_frontier, verify_drafts, draft_window, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
             executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
-                                                       capacity);
+            envelopes  = mtp_causal_attention_envelopes(profile.max_execution_frontier,
+                                                        verify_drafts, draft_window, capacity);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -461,7 +466,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
             const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
+                std::min({sequence.mtp_draft_count, verify_drafts, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
@@ -469,8 +474,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
-            for (std::uint32_t j = 0; j < draft_window; ++j) {
-                mtp_host_ingress->current_drafts[row * draft_window + j] =
+            for (std::uint32_t j = 0; j < verify_drafts; ++j) {
+                mtp_host_ingress->current_drafts[row * verify_drafts + j] =
                     j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
@@ -487,6 +492,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            // Text KV covers the verified columns; MTP KV also covers the K-1 AR steps that
+            // follow the accepted prefix, so its end depends on the depth K, not on W.
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
@@ -502,7 +509,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.mtp_round);
-        execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+        mtp_round_width = width;
+        execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), width,
                                     draft_window, envelopes, executable);
         submit_range.reset();
         timing.begin_wait();

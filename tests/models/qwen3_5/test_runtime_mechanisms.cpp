@@ -136,10 +136,11 @@ void test_decoder_layout() {
 void test_round_layout() {
     ninfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
-        builder, q36::RoundStateSpec{.hidden       = 32,
-                                     .output_rows  = 128,
-                                     .draft_window = 5,
-                                     .backend      = ninfer::SpeculativeBackend::Mtp});
+        builder, q36::RoundStateSpec{.hidden        = 32,
+                                     .output_rows   = 128,
+                                     .draft_window  = 5,
+                                     .verify_window = 5,
+                                     .backend       = ninfer::SpeculativeBackend::Mtp});
     const ninfer::TensorRegion exact_prefill =
         builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
@@ -157,6 +158,38 @@ void test_round_layout() {
     expect(round.mtp_decode.has_value() && round.mtp_decode->alignment_ids.shape[0] == 6 &&
                round.mtp_decode->alignment_ids.shape[1] == 1,
            "MTP decode frame is explicit");
+
+    // A verify window wider than the MTP depth sizes the verify frame for V+1 columns while the
+    // prefill proposal and the autoregressive steps keep K.
+    ninfer::LayoutBuilder wide_builder;
+    q36::RoundStateLayout wide = q36::begin_round_state_layout(
+        wide_builder, q36::RoundStateSpec{.hidden         = 32,
+                                          .output_rows    = 128,
+                                          .batch_capacity = 2,
+                                          .draft_window   = 3,
+                                          .verify_window  = 15,
+                                          .backend        = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(wide_builder, wide);
+    (void)wide_builder.finish(256);
+    expect(wide.mtp_decode.has_value() && wide.mtp_decode->verify_ids.shape[0] == 16 &&
+               wide.mtp_decode->alignment_ids.shape[0] == 16 &&
+               wide.mtp_decode->target_logits.shape[1] == 16 &&
+               wide.mtp_decode->verify_ids.shape[1] == 2,
+           "MTP verify frame spans the verify window");
+    expect(wide.mtp.has_value() && wide.mtp->draft_tokens.shape[0] == 3 &&
+               wide.mtp_decode->ar_positions.shape[1] == 2,
+           "MTP proposal and AR steps keep the MTP depth");
+    bool narrow_rejected = false;
+    try {
+        ninfer::LayoutBuilder invalid_builder;
+        (void)q36::begin_round_state_layout(
+            invalid_builder, q36::RoundStateSpec{.hidden        = 32,
+                                                 .output_rows   = 128,
+                                                 .draft_window  = 3,
+                                                 .verify_window = 2,
+                                                 .backend = ninfer::SpeculativeBackend::Mtp});
+    } catch (const std::invalid_argument&) { narrow_rejected = true; }
+    expect(narrow_rejected, "MTP verify window narrower than the MTP depth is rejected");
 
     ninfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(
