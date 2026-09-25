@@ -1856,9 +1856,19 @@ Next steps, in order:
         --kv-dtype int8 --batch 1 --tokens 1024 --context 8192,32768,65536,131072 --mapping
         fragmented --execution eager --cache cold --warmup 5 --repeat 21`, median us per
         1024-token chunk, old -> new: 8K 1449 -> 1132 (-21.9 %), 32K 5722 -> 4557 (-20.4 %),
-        64K 11671 -> 9224 (-21.0 %), 128K 22068 -> 17838 (-19.2 %). The bench does not accept
-        `--kv-dtype rk4v4-e8` in either binary (bf16, int8, fp8, nvfp4 and k8v4 only), so
-        rk4v4-e8 is covered end to end only.
+        64K 11671 -> 9224 (-21.0 %), 128K 22068 -> 17838 (-19.2 %). Neither binary's bench
+        accepted `--kv-dtype rk4v4-e8`, so rk4v4-e8 has no old -> new kernel comparison; its
+        end-to-end check is the NIAH below. The bench now takes rk8v4, rk4v4, rk4v4-e8 and
+        rk2v4-e8. The same command on the new kernel, median us per chunk:
+
+        | Context | int8 | rk4v4-e8 |
+        |---|---|---|
+        | 8K | 1126 | 1388 |
+        | 32K | 4776 | 4907 |
+        | 64K | 9060 | 10761 |
+        | 128K | 17782 | 21180 (+19 %) |
+
+        rk8v4, rk4v4 and rk2v4-e8 run at 1208, 1385 and 2074 us at 8K.
       - NIAH, `--max-context 262144 --prefill-chunk 1024 --no-thinking --greedy --max-new 128`,
         MTP 2, old and new back to back. All eight answers are exactly
         `ORCHID=493817; COLOR=COBALT`. Prefill:
