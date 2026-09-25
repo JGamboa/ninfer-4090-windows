@@ -843,8 +843,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
-    Tensor h              = projection.hidden;
-    ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -858,7 +856,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    if (attention_projection_fuses_rmsnorm(p)) {
+        attention_projection(x, {w.input_norm, config_.rms_norm_eps, true}, p, q_flat, gate_flat,
+                             k_flat, v_flat, work_, s);
+    } else {
+        Tensor h = projection.hidden;
+        ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+        attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =
@@ -1066,6 +1071,11 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
                            const ops::SparseMoeHints& hints) {
+    if (ffn_fuses_rmsnorm(weights.ffn)) {
+        normalized_ffn({weights.post_attention_norm, config_.rms_norm_eps, true}, weights.ffn, x,
+                       work_, ctx_.stream);
+        return;
+    }
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream);

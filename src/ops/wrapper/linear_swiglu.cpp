@@ -7,8 +7,6 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
-#include "ninfer/ops/silu_mul.h"
-#include "ops/linear/t5/t5_project.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -56,11 +54,6 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
-    }
-    if (qtype == QType::T5_G128_FP16 && input_rows % 1024 == 0) {
-        // v1: BF16 gate and up rows in workspace, then the standalone SwiGLU.
-        return static_cast<std::size_t>(gate_up_rows) * max_tokens * 2 + 512 +
-               detail::t5_workspace_capacity_bytes(policy, input_rows, max_tokens);
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
@@ -110,16 +103,6 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
-    if (large_shape && gate_up_weight.qtype == QType::T5_G128_FP16) {
-        // t5_project rotates x. Gate and up are rounded to BF16 before SwiGLU (M4 fuses them).
-        auto scope   = ws.scope();
-        Tensor gate  = ws.alloc(DType::BF16, {out.ne[0], t});
-        Tensor up    = ws.alloc(DType::BF16, {out.ne[0], t});
-        Tensor* rows[] = {&gate, &up};
-        detail::t5_project(x, gate_up_weight, rows, /*accumulate=*/false, policy, &ws, stream);
-        silu_mul(gate, up, out, stream);
-        return;
-    }
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
     if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");

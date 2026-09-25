@@ -85,6 +85,24 @@ void validate_policy(LinearPolicy policy) {
     throw std::invalid_argument("attn_input_proj: invalid compute policy");
 }
 
+void require_t5_parent(const Tensor& x, const Weight& weight, const Tensor& q, const Tensor& gate,
+                       const Tensor& k, const Tensor& v) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    constexpr std::int32_t kRows   = 14336;
+    const std::int32_t cols        = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    if (weight.n != kRows || weight.k != kHidden) {
+        throw std::invalid_argument("t5 attn_input_proj: unsupported weight shape");
+    }
+}
+
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
@@ -127,20 +145,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::T5_G128_FP16) {
-        constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
-        const std::int32_t cols        = x.ne[1];
-        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-        require_matrix(x, kHidden, cols, "x");
-        require_matrix(q, kQRows, cols, "q");
-        require_matrix(gate, kQRows, cols, "gate");
-        require_matrix(k, kKvRows, cols, "k");
-        require_matrix(v, kKvRows, cols, "v");
-        if (weight.n != kRows || weight.k != kHidden) {
-            throw std::invalid_argument("t5 attn_input_proj: unsupported weight shape");
-        }
+        require_t5_parent(x, weight, q, gate, k, v);
         // Parent rows are query, key, gate, value (t5_project rotates x).
         Tensor* outputs[] = {&q, &k, &gate, &v};
         detail::t5_project(x, weight, outputs, /*accumulate=*/false, policy, workspace, stream);
@@ -259,6 +264,26 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      WorkspaceArena& workspace, cudaStream_t stream) {
     dispatch_single_parent(x, query_key_gate_value_weight, q, gate, k, v, policy, &workspace,
                            stream);
+}
+
+bool attn_input_proj_accepts_rmsnorm(QType parent_qtype, LinearPolicy policy) {
+    validate_policy(policy);
+    return parent_qtype == QType::T5_G128_FP16 && allows_a8(policy);
+}
+
+void attn_input_proj(const Tensor& x, const RmsNormPrologue& norm,
+                     const Weight& query_key_gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                     Tensor& v, LinearPolicy policy, WorkspaceArena& workspace,
+                     cudaStream_t stream) {
+    const Weight& weight = query_key_gate_value_weight;
+    if (!attn_input_proj_accepts_rmsnorm(weight.qtype, policy)) {
+        throw std::invalid_argument("attn_input_proj: the RMSNorm input form requires a T5 parent "
+                                    "under AllowA8");
+    }
+    require_t5_parent(x, weight, q, gate, k, v);
+    Tensor* outputs[] = {&q, &k, &gate, &v};
+    detail::t5_project_rmsnorm(x, norm.weight, norm.eps, norm.unit_offset, weight, outputs,
+                               /*accumulate=*/false, policy, &workspace, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

@@ -1212,8 +1212,53 @@ Next steps, in order:
    shapes match the `794c216` table (in_proj 113-115, qkvg 107-119, gate+up 281-292 us at
    T = 128; o_proj 187-217 us at T = 512, unchanged within run-to-run noise).
 5. Fuse the A8 quantization into its producers (rmsnorm -> rotate/quantize, SwiGLU -> down
-   quantization): ~0.2-0.3 ms of the 0.75 ms of `rotate_quantize` per round, but it crosses
-   Op contracts (`rmsnorm` with the projection wrappers, `linear_swiglu` with `linear_add`).
+   quantization). Implemented on branch `feat/t5-fused-prologue`; compiled for sm_89 (CUDA 13,
+   Linux, no GPU), not yet run on the RTX 4090.
+   - Kernel: the t5 quantization is one template, `t5_a8::quantize_kernel<Input, Rotate>`, a
+     256-thread CTA per (1024 columns, token) in which thread i evaluates columns 4 i .. 4 i + 3
+     through an input prologue, applies the signs and the FP32 shared-memory butterfly when
+     rotated, and warp w quantizes group w from registers. Prologues: `PlainInput` (x; replaces
+     the former `quantize_kernel` and `rotate_quantize_kernel`), `RmsNormInput` (raw residual
+     rows with `ops::rmsnorm` semantics, gain `1 + w` with the unit offset; every CTA of a token
+     reduces the whole row's FP32 sum of squares itself, in the same order, so a 5120-column row
+     is read five times from L2 instead of materializing `h`) and `SwiGluInput` (exact
+     `silu(gate) * up` of the BF16 gate and up rows). ptxas, sm_89 with `-rdc`: 28-36
+     registers, no stack and no spills for all six instances; shared memory 4 KB rotated, plus
+     32 B for the RMSNorm row sum. The GEMV and GEMM consume the same int8 layout, so the fusion
+     applies at every T (decode, MTP verify and prefill).
+   - Ops: `attn_input_proj(x, RmsNormPrologue, parent, q, gate, k, v, ...)`, the RMSNorm-input
+     form registered for the T5 parent `[14336,5120]` under AllowA8
+     (`attn_input_proj_accepts_rmsnorm`), and `rmsnorm_swiglu_mlp`
+     (`include/ninfer/ops/rmsnorm_swiglu_mlp.h`): residual += down(SwiGLU(gate_up(
+     rmsnorm(residual)))), with gate and up staged in BF16 workspace and the down projection
+     quantizing their SwiGLU directly. The normalized hidden state and the SwiGLU activation
+     are no longer rounded to BF16; both Op contracts declare them private arithmetic (not
+     semantic boundaries). The v1 `linear_swiglu` t5 branch (BF16 gate/up, `silu_mul`, then
+     `linear_add` re-quantizing) is removed.
+   - Model: `attn_mix` and `mlp_tail` call the fused forms when the weights accept them (all 16
+     full-attention layers and 64 dense FFNs of Bonsai); other formats keep `rmsnorm` and the
+     unfused Ops. GDN (norm already in `gdn_norm_gating_proj`) and the Q8 MTP layer are
+     unchanged. Expected per T = 3 round: 144 fewer launches (16 + 64 `rmsnorm`, 64
+     `silu_and_mul`; ~1007 -> ~863), the quantization launches stay 257.
+   - Qualification added to `tests/ops/linear/test_t5.cpp` (FP64 oracle: RMSNorm with the exact
+     offset semantics and SwiGLU in FP64 from the represented inputs, then the Sylvester
+     rotation and the projection, A8 reduction criterion): `t5 attn_input_proj rmsnorm` at
+     T = 1, 3, 8, 72 (rotated, 1 + w) and T = 3 (unrotated, w); `t5 rmsnorm_swiglu_mlp` on
+     `[2048,1024] x [1024,1024]` at T = 3 (unrotated, w) and 1, 3, 65 (rotated), and on the
+     Bonsai `[34816,5120] x [5120,17408]` at T = 1, 3, 8, 16 (rotated); registration refusals.
+
+   Validation the RTX 4090 session must run before relying on it:
+   1. `ninfer_linear_t5_test`: every case, including the pre-existing ones, since the plain
+      quantization kernel was rewritten too.
+   2. Quick perplexity (`ninfer-perplexity --corpus eval/corpora/perplexity-1m/manifest.json
+      --quick --kv-dtype bf16` on `E:\LLM\bonsai2_27b_vl.ninfer`): overall 5.8556 before; it
+      must stay within the A8 tolerance (a change in the fourth digit at most is expected from
+      the removed BF16 roundings).
+   3. MTP decode on the six prompts (draft 2, `--lm-head-draft`, greedy): the text stays
+      coherent and acceptance stays within the run-to-run spread (greedy trajectories may
+      diverge late), with tok/s against 146.4 / 187.0 / 179.4 / 144.7 / 164.8 / 176.4.
+   4. The nsys round profile of 6A: `quantize_kernel` + `rmsnorm` + `silu_and_mul` time
+      against 0.70 + 0.35 ms, and launches per round against ~1007.
 6. Decode at short and long context (measured 2026-09-24, RTX 4090, display 60 Hz, server off,
    `E:\LLM\bonsai2_27b_vl.ninfer` at `577bbfb`, MTP draft 2, `--lm-head-draft`, greedy). The
    per-round figures are over the NVTX `decode` ranges of `nsys profile --trace=cuda,nvtx

@@ -12,8 +12,10 @@
 // Activation layout: int8 in natural column order with one FP32 scale per 128 columns, and the
 // sums of q per 32-column slice and per 128-column group, so `(code - 1) . q = code . q - sum(q)`.
 // With a rotated weight (Weight::input_signs) the Prism rotation (1/32) H (signs * x) per
-// 1024-column block is fused into the quantization.
+// 1024-column block is fused into the quantization, and so is the producer of x when the caller
+// passes it as an input prologue (RMSNorm of raw rows, SwiGLU of gate and up).
 
+#include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 
@@ -96,63 +98,138 @@ __device__ __forceinline__ void quantize_group(const float (&value)[4], int lane
 constexpr int kUnitColumns = 64;
 constexpr int kUnitBytes   = 13;
 
-// Unrotated input: four warps, one 128-column group each; lane l holds columns 4 l .. 4 l + 3.
-__global__ void __launch_bounds__(128)
-    quantize_kernel(const __nv_bfloat16* __restrict__ x, int k, std::uint32_t* __restrict__ qx,
-                    float* __restrict__ group_scale, int* __restrict__ group_sum,
-                    int* __restrict__ slice_sum) {
-    const int warp  = static_cast<int>(threadIdx.x) >> 5;
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int group = static_cast<int>(blockIdx.x) * 4 + warp;
-    const int token = static_cast<int>(blockIdx.y);
-    const __nv_bfloat16* source = x + std::int64_t(token) * k + group * 128;
-    float value[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) value[i] = __bfloat162float(source[4 * lane + i]);
-    quantize_group(value, lane, token, group, k, qx, group_scale, group_sum, slice_sum);
+// Quantization: one CTA of 256 threads per (1024-column block, token). Thread i evaluates the
+// weight-input columns 4 i .. 4 i + 3 of its block through an input prologue, so warp w owns
+// 128-column group w. With a rotated weight the block first goes through (1/32) H (signs * x)
+// in FP32 shared memory (the butterfly of ops/hadamard). Neither the prologue's result nor its
+// rotation is rounded to BF16.
+constexpr int kQuantizeBlock   = 1024;
+constexpr int kQuantizeThreads = 256;
+
+__device__ __forceinline__ void unpack_bf16x4(uint2 word, float (&value)[4]) {
+    const float2 low  = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&word.x));
+    const float2 high = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&word.y));
+    value[0]          = low.x;
+    value[1]          = low.y;
+    value[2]          = high.x;
+    value[3]          = high.y;
 }
 
-// Rotated input: one CTA per (1024-column block, token) applies (1/32) H (signs * x) in FP32
-// shared memory (the butterfly of ops/hadamard) and quantizes the rotated block directly; the
-// rotated activation is never rounded to BF16.
-constexpr int kRotateThreads = 256;
+// The input x [K,T] itself.
+struct PlainInput {
+    const __nv_bfloat16* x;
 
-__global__ void __launch_bounds__(kRotateThreads)
-    rotate_quantize_kernel(const __nv_bfloat16* __restrict__ x,
-                           const __nv_bfloat16* __restrict__ signs, int k,
-                           std::uint32_t* __restrict__ qx, float* __restrict__ group_scale,
-                           int* __restrict__ group_sum, int* __restrict__ slice_sum) {
-    constexpr int kBlock = 1024;
-    __shared__ float values[kBlock];
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int token   = static_cast<int>(blockIdx.y);
-    const int column0 = static_cast<int>(blockIdx.x) * kBlock;
-    const __nv_bfloat16* source = x + std::int64_t(token) * k + column0;
-#pragma unroll
-    for (int i = 0; i < kBlock / kRotateThreads; ++i) {
-        const int index = tid + i * kRotateThreads;
-        values[index]   = __bfloat162float(source[index]) * __bfloat162float(signs[column0 + index]);
+    __device__ __forceinline__ void operator()(int k, int token, int column,
+                                               float (&value)[4]) const {
+        unpack_bf16x4(load_ldg<uint2>(x + std::int64_t(token) * k + column), value);
     }
-    __syncthreads();
+};
+
+// ops::rmsnorm of the raw rows x [K,T]: x rsqrt(mean(x^2) + eps) gain, gain = 1 + weight with
+// unit_offset, else weight. Every CTA of a token reduces the whole row in the same order.
+struct RmsNormInput {
+    const __nv_bfloat16* x;
+    const __nv_bfloat16* weight;
+    float eps;
+    bool unit_offset;
+
+    __device__ __forceinline__ void operator()(int k, int token, int column,
+                                               float (&value)[4]) const {
+        constexpr int kLoads = 4; // row words in flight per thread
+        __shared__ float warp_sums[kQuantizeThreads / 32];
+        const auto* row = reinterpret_cast<const uint2*>(x + std::int64_t(token) * k);
+        const int tid   = static_cast<int>(threadIdx.x);
+        const int words = k / 4;
+        float sum       = 0.0f;
+        uint2 own{};
+        for (int first = tid; first < words; first += kLoads * kQuantizeThreads) {
+            uint2 packed[kLoads];
 #pragma unroll
-    for (int stride = 1; stride < kBlock; stride <<= 1) {
+            for (int j = 0; j < kLoads; ++j) {
+                const int word = first + j * kQuantizeThreads;
+                packed[j]      = word < words ? __ldg(row + word) : make_uint2(0u, 0u);
+            }
 #pragma unroll
-        for (int pair = tid; pair < kBlock / 2; pair += kRotateThreads) {
-            const int low        = (pair / stride) * 2 * stride + pair % stride;
-            const float a        = values[low];
-            const float b        = values[low + stride];
-            values[low]          = a + b;
-            values[low + stride] = a - b;
+            for (int j = 0; j < kLoads; ++j) {
+                if (first + j * kQuantizeThreads == column / 4) own = packed[j];
+                float f[4];
+                unpack_bf16x4(packed[j], f);
+                sum += f[0] * f[0] + f[1] * f[1] + f[2] * f[2] + f[3] * f[3];
+            }
         }
-        __syncthreads();
-    }
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    float value[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) value[i] = values[warp * 128 + 4 * lane + i] * 0x1p-5f;
-    quantize_group(value, lane, token, column0 / 128 + warp, k, qx, group_scale, group_sum,
-                   slice_sum);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if ((tid & 31) == 0) warp_sums[tid >> 5] = sum;
+        __syncthreads();
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kQuantizeThreads / 32; ++w) total += warp_sums[w];
+        const float inverse = rsqrtf(total / static_cast<float>(k) + eps);
+        unpack_bf16x4(own, value);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float gain = __bfloat162float(weight[column + i]) + (unit_offset ? 1.0f : 0.0f);
+            value[i]         = value[i] * inverse * gain;
+        }
+    }
+};
+
+// SwiGLU of the gate and up rows [K,T]: silu(gate) * up (exact silu, as ops::silu_mul).
+struct SwiGluInput {
+    const __nv_bfloat16* gate;
+    const __nv_bfloat16* up;
+
+    __device__ __forceinline__ void operator()(int k, int token, int column,
+                                               float (&value)[4]) const {
+        const std::int64_t offset = std::int64_t(token) * k + column;
+        float g[4], u[4];
+        unpack_bf16x4(load_ldg<uint2>(gate + offset), g);
+        unpack_bf16x4(load_ldg<uint2>(up + offset), u);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) value[i] = silu(g[i]) * u[i];
+    }
+};
+
+template <class Input, bool Rotate>
+__global__ void __launch_bounds__(kQuantizeThreads)
+    quantize_kernel(Input input, const __nv_bfloat16* __restrict__ signs, int k,
+                    std::uint32_t* __restrict__ qx, float* __restrict__ group_scale,
+                    int* __restrict__ group_sum, int* __restrict__ slice_sum) {
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int token  = static_cast<int>(blockIdx.y);
+    const int column = static_cast<int>(blockIdx.x) * kQuantizeBlock + 4 * tid;
+    float value[4];
+    input(k, token, column, value);
+    if constexpr (Rotate) {
+        __shared__ __align__(16) float values[kQuantizeBlock];
+        float4 signed_value;
+        signed_value.x = value[0] * __bfloat162float(signs[column]);
+        signed_value.y = value[1] * __bfloat162float(signs[column + 1]);
+        signed_value.z = value[2] * __bfloat162float(signs[column + 2]);
+        signed_value.w = value[3] * __bfloat162float(signs[column + 3]);
+        *reinterpret_cast<float4*>(&values[4 * tid]) = signed_value;
+        __syncthreads();
+#pragma unroll
+        for (int stride = 1; stride < kQuantizeBlock; stride <<= 1) {
+#pragma unroll
+            for (int pair = tid; pair < kQuantizeBlock / 2; pair += kQuantizeThreads) {
+                const int low        = (pair / stride) * 2 * stride + pair % stride;
+                const float a        = values[low];
+                const float b        = values[low + stride];
+                values[low]          = a + b;
+                values[low + stride] = a - b;
+            }
+            __syncthreads();
+        }
+        const float4 rotated = *reinterpret_cast<const float4*>(&values[4 * tid]);
+        value[0]             = rotated.x * 0x1p-5f;
+        value[1]             = rotated.y * 0x1p-5f;
+        value[2]             = rotated.z * 0x1p-5f;
+        value[3]             = rotated.w * 0x1p-5f;
+    }
+    quantize_group(value, tid & 31, token, column / 128, k, qx, group_scale, group_sum, slice_sum);
 }
 
 // The 13 bytes of one unit as four little-endian words (bytes 0-3, 4-7, 8-11, 12), read with

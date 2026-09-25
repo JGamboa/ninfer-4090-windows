@@ -8,12 +8,14 @@
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/rmsnorm_swiglu_mlp.h"
 #include "ops/op_tester.h"
 
 #include <cuda_fp16.h>
 
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <cstdint>
 #include <iostream>
@@ -118,40 +120,73 @@ std::vector<float> activation(std::int32_t k, std::int32_t t, std::uint32_t seed
     return x;
 }
 
-// The weight's input: x, or its Prism rotation (1/32) H (signs * x) with the Sylvester
-// Walsh-Hadamard matrix H[r][c] = (-1)^popcount(r & c) of every 1024-column block, FP64.
-std::vector<double> weight_input(const Ternary& w, const std::vector<float>& x, std::int32_t t) {
-    std::vector<double> input(x.begin(), x.end());
+// The weight's input: the logical input itself, or its Prism rotation (1/32) H (signs * input)
+// with the Sylvester Walsh-Hadamard matrix H[r][c] = (-1)^popcount(r & c) of every 1024-column
+// block, FP64.
+std::vector<double> weight_input(const Ternary& w, std::vector<double> input, std::int32_t t) {
     if (w.signs.empty()) return input;
+    std::vector<double> rotated(input.size());
     for (std::int32_t token = 0; token < t; ++token) {
         for (std::int32_t block = 0; block < w.k; block += 1024) {
             const std::size_t base = std::size_t(token) * w.k + block;
             for (int r = 0; r < 1024; ++r) {
                 double sum = 0;
                 for (int c = 0; c < 1024; ++c) {
-                    const double term = double(x[base + c]) * w.signs[block + c];
+                    const double term = input[base + c] * w.signs[block + c];
                     sum += std::popcount(unsigned(r & c)) & 1 ? -term : term;
                 }
-                input[base + r] = sum / 32.0;
+                rotated[base + r] = sum / 32.0;
             }
         }
     }
-    return input;
+    return rotated;
 }
 
-// out[t][r] = sum_c W[first + r][c] input[t][c], FP64.
-std::vector<double> oracle(const Ternary& w, std::int32_t first, std::int32_t rows,
-                           const std::vector<float>& x, std::int32_t t) {
-    const std::vector<double> input = weight_input(w, x, t);
-    std::vector<double> out(std::size_t(rows) * t);
-    for (std::int32_t token = 0; token < t; ++token) {
-        for (std::int32_t r = 0; r < rows; ++r) {
-            double sum = 0;
-            for (std::int32_t c = 0; c < w.k; ++c) sum += w.weight(first + r, c) * input[std::size_t(token) * w.k + c];
+// out[t][r] = sum_c W[first + r][c] input[t][c] for the weight input [T][K], FP64.
+std::vector<double> project(const Ternary& w, std::int32_t first, std::int32_t rows,
+                            const std::vector<double>& input, std::int32_t t) {
+    std::vector<double> out(std::size_t(rows) * t), row(std::size_t(w.k));
+    for (std::int32_t r = 0; r < rows; ++r) {
+        for (std::int32_t c = 0; c < w.k; ++c) row[c] = w.weight(first + r, c);
+        for (std::int32_t token = 0; token < t; ++token) {
+            const double* x = &input[std::size_t(token) * w.k];
+            double sum      = 0;
+            for (std::int32_t c = 0; c < w.k; ++c) sum += row[c] * x[c];
             out[std::size_t(token) * rows + r] = sum;
         }
     }
     return out;
+}
+
+std::vector<double> oracle(const Ternary& w, std::int32_t first, std::int32_t rows,
+                           const std::vector<float>& x, std::int32_t t) {
+    return project(w, first, rows, weight_input(w, std::vector<double>(x.begin(), x.end()), t), t);
+}
+
+// ops::rmsnorm of the rows x [T][D] in FP64: x / sqrt(mean(x^2) + eps) * gain,
+// gain = 1 + weight with unit_offset.
+std::vector<double> rmsnorm_oracle(const std::vector<float>& x, const std::vector<float>& weight,
+                                   double eps, bool unit_offset, std::int32_t t) {
+    const std::size_t d = weight.size();
+    std::vector<double> out(x.size());
+    for (std::int32_t token = 0; token < t; ++token) {
+        const float* row = &x[std::size_t(token) * d];
+        double squares   = 0;
+        for (std::size_t i = 0; i < d; ++i) squares += double(row[i]) * row[i];
+        const double inverse = 1.0 / std::sqrt(squares / double(d) + eps);
+        for (std::size_t i = 0; i < d; ++i) {
+            const double gain               = unit_offset ? 1.0 + weight[i] : double(weight[i]);
+            out[std::size_t(token) * d + i] = row[i] * inverse * gain;
+        }
+    }
+    return out;
+}
+
+std::vector<float> norm_weight(std::int32_t d, std::uint32_t seed) {
+    std::vector<float> weight(static_cast<std::size_t>(d));
+    fill_uniform(weight, seed, -0.5f, 0.5f);
+    round_to_bf16(weight);
+    return weight;
 }
 
 int linear_case(const Ternary& w, std::int32_t first, std::int32_t rows, std::int32_t t,
@@ -243,6 +278,85 @@ int attention_case(const Ternary& w, std::int32_t t,
     return failures;
 }
 
+// RMSNorm-input form: the projections of rmsnorm(x) for the raw rows x, normalized, rotated and
+// quantized in one kernel. The FP64 oracle normalizes the represented x, then rotates and projects.
+int attention_rmsnorm_case(const Ternary& w, std::int32_t t, bool unit_offset,
+                           ops::LinearPolicy policy = ops::LinearPolicy::AllowA8) {
+    constexpr float kEps = 1e-6f;
+    const auto x         = activation(w.k, t, 81u + t);
+    const auto gain      = norm_weight(w.k, 82u + t);
+    auto device_x        = to_device_bf16(x);
+    auto device_gain     = to_device_bf16(gain);
+    const auto input     = weight_input(w, rmsnorm_oracle(x, gain, kEps, unit_offset, t), t);
+    const std::array<std::int32_t, 4> rows{6144, 1024, 6144, 1024};
+    std::vector<GuardedDeviceBuffer> outputs;
+    outputs.reserve(4);
+    std::array<Tensor, 4> tensors;
+    for (int i = 0; i < 4; ++i) {
+        outputs.emplace_back(std::size_t(rows[i]) * t * 2);
+        tensors[i] = Tensor(outputs[i].data(), DType::BF16, {rows[i], t});
+    }
+    Tensor tx(device_x.p, DType::BF16, {w.k, t});
+    const ops::RmsNormPrologue norm{Tensor(device_gain.p, DType::BF16, {w.k}), kEps, unit_offset};
+    DeviceArena workspace(
+        ops::attn_input_proj_workspace_capacity_bytes(QType::T5_G128_FP16, w.n, w.k, policy, 1, t) +
+        256);
+    ops::attn_input_proj(tx, norm, w.rows(0, w.n), tensors[0], tensors[2], tensors[1], tensors[3],
+                         policy, workspace, nullptr);
+    cuda_synchronize();
+    int failures = 0, first = 0;
+    const std::array<const char*, 4> names{"query", "key", "gate", "value"};
+    for (int i = 0; i < 4; ++i) {
+        const std::string label = std::string("t5 attn_input_proj rmsnorm") +
+                                  (w.signs.empty() ? "" : " rotated") +
+                                  (unit_offset ? " 1+w " : " w ") + names[i] +
+                                  " T=" + std::to_string(t) + policy_name(policy);
+        failures +=
+            verify_reduction(label, from_device_bf16(outputs[i].data(), std::size_t(rows[i]) * t),
+                             project(w, first, rows[i], input, t), criterion(policy)) +
+            outputs[i].verify_guards(label.c_str());
+        first += rows[i];
+    }
+    return failures;
+}
+
+// residual += down(silu(g) * u), [g; u] = gate_up(rmsnorm(residual)): the down projection
+// quantizes the SwiGLU of the BF16-staged gate and up rows directly. FP64 oracle throughout.
+int mlp_case(const Ternary& gate_up, const Ternary& down, std::int32_t t, bool unit_offset,
+             ops::LinearPolicy policy = ops::LinearPolicy::AllowA8) {
+    constexpr float kEps = 1e-6f;
+    const std::int32_t d = gate_up.k, m = down.k;
+    const auto residual = activation(d, t, 101u + t);
+    const auto gain     = norm_weight(d, 102u + t);
+    const auto input =
+        weight_input(gate_up, rmsnorm_oracle(residual, gain, kEps, unit_offset, t), t);
+    const auto g = project(gate_up, 0, m, input, t);
+    const auto u = project(gate_up, m, m, input, t);
+    std::vector<double> activated(g.size());
+    for (std::size_t i = 0; i < g.size(); ++i) {
+        activated[i] = g[i] / (1.0 + std::exp(-g[i])) * u[i];
+    }
+    auto expected = project(down, 0, d, weight_input(down, activated, t), t);
+    for (std::size_t i = 0; i < expected.size(); ++i) expected[i] += residual[i];
+
+    auto device_residual = to_device_bf16(residual);
+    auto device_gain     = to_device_bf16(gain);
+    Tensor tr(device_residual.p, DType::BF16, {d, t});
+    const ops::RmsNormPrologue norm{Tensor(device_gain.p, DType::BF16, {d}), kEps, unit_offset};
+    DeviceArena workspace(ops::rmsnorm_swiglu_mlp_workspace_capacity_bytes(
+                              QType::T5_G128_FP16, gate_up.n, d, policy, policy, 1, t) +
+                          256);
+    ops::rmsnorm_swiglu_mlp(norm, gate_up.rows(0, gate_up.n), policy, down.rows(0, d), policy, tr,
+                            workspace, nullptr);
+    cuda_synchronize();
+    return verify_reduction(
+        "t5 rmsnorm_swiglu_mlp [" + std::to_string(gate_up.n) + "," + std::to_string(d) + "]x[" +
+            std::to_string(d) + "," + std::to_string(m) + "]" +
+            (gate_up.signs.empty() ? "" : " rotated") + (unit_offset ? " 1+w" : " w") +
+            " T=" + std::to_string(t) + policy_name(policy),
+        from_device_bf16(device_residual.p, expected.size()), expected, criterion(policy));
+}
+
 // Embedding gather: the logical row ids[t] of the table, i.e. the decoded stored row or, for a
 // rotated table, signs * H(z') / 32 per 1024-column block (FP64 Sylvester oracle).
 int embedding_case(const Ternary& w, const std::vector<std::int32_t>& ids) {
@@ -317,6 +431,48 @@ int main() {
         failures += attention_case(attention, 3);
         failures += attention_case(attention, 6);
         failures += attention_case(attention, 72); // four outputs from the 128-token GEMM
+    }
+    {
+        // RMSNorm-input attention parent (all 16 Bonsai full-attention layers): GEMV at decode
+        // and MTP-verify widths, the 128-token GEMM, and an unrotated parent without the unit
+        // offset.
+        Ternary attention(14336, 5120, 79u);
+        failures += attention_rmsnorm_case(attention, 3, false);
+        attention.rotate(80u);
+        for (std::int32_t t : {1, 3, 8, 72}) failures += attention_rmsnorm_case(attention, t, true);
+    }
+    {
+        // Normalized SwiGLU MLP: both fused prologues (RMSNorm into gate/up, SwiGLU into down),
+        // unrotated and rotated, GEMV and 64-token GEMM widths.
+        Ternary gate_up(2048, 1024, 111u), down(1024, 1024, 112u);
+        failures += mlp_case(gate_up, down, 3, false);
+        gate_up.rotate(113u);
+        down.rotate(114u);
+        for (std::int32_t t : {1, 3, 65}) failures += mlp_case(gate_up, down, t, true);
+    }
+    {
+        // Bonsai MLP: gate/up [34816,5120], down [5120,17408], rotated.
+        Ternary gate_up(34816, 5120, 121u), down(5120, 17408, 122u);
+        gate_up.rotate(123u);
+        down.rotate(124u);
+        for (std::int32_t t : {1, 3, 8, 16}) failures += mlp_case(gate_up, down, t, true);
+    }
+    {
+        // The fused forms are registered only for t5 under AllowA8.
+        const bool registered =
+            ops::attn_input_proj_accepts_rmsnorm(QType::T5_G128_FP16, ops::LinearPolicy::AllowA8) &&
+            ops::rmsnorm_swiglu_mlp_accepts(QType::T5_G128_FP16, ops::LinearPolicy::AllowA8,
+                                            QType::T5_G128_FP16, ops::LinearPolicy::AllowA4);
+        const bool refused =
+            !ops::attn_input_proj_accepts_rmsnorm(QType::T5_G128_FP16,
+                                                  ops::LinearPolicy::A16Only) &&
+            !ops::attn_input_proj_accepts_rmsnorm(QType::Q8_G32_FP16, ops::LinearPolicy::AllowA8) &&
+            !ops::rmsnorm_swiglu_mlp_accepts(QType::T5_G128_FP16, ops::LinearPolicy::AllowA8,
+                                             QType::Q8_G32_FP16, ops::LinearPolicy::AllowA8);
+        if (!registered || !refused) {
+            std::cerr << "t5 fused prologue registration mismatch\n";
+            ++failures;
+        }
     }
     {
         // Rotated weights: the projection rotates its primal input inside the quantization.

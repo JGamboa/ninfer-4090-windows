@@ -29,6 +29,19 @@ void t5_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
                 bool accumulate, LinearPolicy policy, WorkspaceArena* workspace,
                 cudaStream_t stream);
 
+// Input prologues: t5_project of the producer's result, evaluated inside the quantization kernel
+// instead of a materialized BF16 x (the result is never rounded to BF16).
+//
+// RMSNorm of the raw rows x [K,T] with the semantics of ops::rmsnorm (norm_weight BF16 [K]).
+void t5_project_rmsnorm(const Tensor& x, const Tensor& norm_weight, float eps, bool unit_offset,
+                        const Weight& w, std::span<Tensor* const> outputs, bool accumulate,
+                        LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
+
+// SwiGLU silu(gate) * up of the BF16 gate and up [K,T], with the semantics of ops::silu_mul.
+void t5_project_swiglu(const Tensor& gate, const Tensor& up, const Weight& w,
+                       std::span<Tensor* const> outputs, bool accumulate, LinearPolicy policy,
+                       WorkspaceArena* workspace, cudaStream_t stream);
+
 // Transient bytes of t5_project for any T <= max_tokens: the int8 activation, its group scales
 // and group and slice sums. Requires a policy that allows A8.
 std::size_t t5_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,

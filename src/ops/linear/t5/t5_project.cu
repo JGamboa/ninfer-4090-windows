@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -23,10 +24,11 @@ struct QuantizedX {
     Tensor q, scale, group_sum, slice_sum;
 };
 
-// Quantizes x, or its Prism rotation when the weight carries input signs (one fused kernel).
-QuantizedX quantize(const Tensor& x, const void* signs, WorkspaceArena& workspace,
-                    cudaStream_t stream) {
-    const int k = x.ne[0], tokens = x.ne[1];
+// Quantizes the weight input of `input` (a t5_a8 prologue), rotated when the weight carries
+// input signs, in one kernel.
+template <class Input>
+QuantizedX quantize(const Input& input, int k, int tokens, const void* signs,
+                    WorkspaceArena& workspace, cudaStream_t stream) {
     QuantizedX result{workspace.alloc(DType::I8, {k, tokens}),
                       workspace.alloc(DType::FP32, {k / 128, tokens}),
                       workspace.alloc(DType::I32, {k / 128, tokens}),
@@ -35,14 +37,15 @@ QuantizedX quantize(const Tensor& x, const void* signs, WorkspaceArena& workspac
     auto* scale = static_cast<float*>(result.scale.data);
     auto* gsum  = static_cast<int*>(result.group_sum.data);
     auto* ssum  = static_cast<int*>(result.slice_sum.data);
-    const auto* input = static_cast<const __nv_bfloat16*>(x.data);
-    if (signs != nullptr) {
-        const dim3 grid(static_cast<unsigned>(k / 1024), static_cast<unsigned>(tokens));
-        t5_a8::rotate_quantize_kernel<<<grid, t5_a8::kRotateThreads, 0, stream>>>(
-            input, static_cast<const __nv_bfloat16*>(signs), k, q, scale, gsum, ssum);
+    const auto* sign = static_cast<const __nv_bfloat16*>(signs);
+    const dim3 grid(static_cast<unsigned>(k / t5_a8::kQuantizeBlock),
+                    static_cast<unsigned>(tokens));
+    if (sign != nullptr) {
+        t5_a8::quantize_kernel<Input, true>
+            <<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(input, sign, k, q, scale, gsum, ssum);
     } else {
-        const dim3 grid(static_cast<unsigned>(k / 512), static_cast<unsigned>(tokens));
-        t5_a8::quantize_kernel<<<grid, 128, 0, stream>>>(input, k, q, scale, gsum, ssum);
+        t5_a8::quantize_kernel<Input, false>
+            <<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(input, sign, k, q, scale, gsum, ssum);
     }
     CUDA_CHECK(cudaGetLastError());
     return result;
@@ -88,40 +91,19 @@ bool use_small_gemm_tile(const Weight& w, int tokens) {
     return large_ctas < device_sm_count() && w.k < kLongK;
 }
 
-} // namespace
-
-void validate_t5_weight(const Weight& w, const char* op) {
-    if (w.qtype != QType::T5_G128_FP16 || w.layout != QuantLayout::TernaryRowK128 ||
-        w.scale_dtype != DType::FP16 || w.group_size != 128 || w.n <= 0 || w.k % 1024 ||
-        w.qdata == nullptr || w.qhigh != nullptr || w.scales == nullptr ||
-        (reinterpret_cast<std::uintptr_t>(w.qdata) & 15) ||
-        (reinterpret_cast<std::uintptr_t>(w.scales) & 15) || w.scale_nb[1] != w.k / 64 ||
-        (reinterpret_cast<std::uintptr_t>(w.input_signs) & 1)) {
-        throw std::invalid_argument(std::string(op) +
-                                    ": weight must be T5_G128_FP16 ternary rows with K%1024=0");
+void require_input(const Tensor& x, const Weight& w, const char* what) {
+    if (x.dtype != DType::BF16 || x.ne[0] != w.k || x.ne[1] <= 0 || x.ne[2] != 1 || x.ne[3] != 1 ||
+        !x.is_contiguous() || !aligned16(x.data)) {
+        throw std::invalid_argument(std::string("t5_project: ") + what +
+                                    " must be contiguous aligned BF16 [K,T]");
     }
 }
 
-std::size_t t5_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
-                                        std::int32_t max_tokens) {
-    if (input_rows <= 0 || input_rows % 1024 || max_tokens <= 0) {
-        throw std::invalid_argument("t5 workspace: requires K % 1024 == 0 and positive T");
-    }
-    if (!allows_a8(policy)) { throw std::invalid_argument("t5 workspace: requires AllowA8"); }
-    const std::size_t k = static_cast<std::size_t>(input_rows);
-    const std::size_t t = static_cast<std::size_t>(max_tokens);
-    return round_up_256(k * t) + 2 * round_up_256(k / 128 * t * 4) + round_up_256(k / 32 * t * 4);
-}
-
-void t5_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outputs,
-                bool accumulate, LinearPolicy policy, WorkspaceArena* workspace,
-                cudaStream_t stream) {
-    validate_t5_weight(w, "t5_project");
-    const int tokens = x.ne[1];
-    if (x.dtype != DType::BF16 || x.ne[0] != w.k || tokens <= 0 || x.ne[2] != 1 ||
-        x.ne[3] != 1 || !x.is_contiguous() || !aligned16(x.data)) {
-        throw std::invalid_argument("t5_project: x must be contiguous aligned BF16 [K,T]");
-    }
+// Validates the weight, policy and outputs, then quantizes the input and multiplies:
+// dp4a GEMV through T = 8, int8 MMA GEMM beyond.
+template <class Input>
+void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* const> outputs,
+             bool accumulate, LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     if (!allows_a8(policy) || workspace == nullptr) {
         throw std::invalid_argument("t5_project: a T5 weight requires AllowA8 and a workspace");
     }
@@ -149,7 +131,7 @@ void t5_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     }
 
     auto scope         = workspace->scope();
-    const QuantizedX q = quantize(x, w.input_signs, *workspace, stream);
+    const QuantizedX q = quantize(input, w.k, tokens, w.input_signs, *workspace, stream);
     if (tokens > kMaxTile && w.n % t5_a8::kGemmRows == 0) {
         if (use_small_gemm_tile(w, tokens)) {
             launch_gemm<2>(q, w, tokens, packed, accumulate, stream);
@@ -165,6 +147,72 @@ void t5_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outpu
     case 4: launch_gemv<4>(q, w, tokens, packed, accumulate, stream); break;
     default: launch_gemv<kMaxTile>(q, w, tokens, packed, accumulate, stream); break;
     }
+}
+
+} // namespace
+
+void validate_t5_weight(const Weight& w, const char* op) {
+    if (w.qtype != QType::T5_G128_FP16 || w.layout != QuantLayout::TernaryRowK128 ||
+        w.scale_dtype != DType::FP16 || w.group_size != 128 || w.n <= 0 || w.k % 1024 ||
+        w.qdata == nullptr || w.qhigh != nullptr || w.scales == nullptr ||
+        (reinterpret_cast<std::uintptr_t>(w.qdata) & 15) ||
+        (reinterpret_cast<std::uintptr_t>(w.scales) & 15) || w.scale_nb[1] != w.k / 64 ||
+        (reinterpret_cast<std::uintptr_t>(w.input_signs) & 1)) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": weight must be T5_G128_FP16 ternary rows with K%1024=0");
+    }
+}
+
+std::size_t t5_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
+                                        std::int32_t max_tokens) {
+    if (input_rows <= 0 || input_rows % 1024 || max_tokens <= 0) {
+        throw std::invalid_argument("t5 workspace: requires K % 1024 == 0 and positive T");
+    }
+    if (!allows_a8(policy)) { throw std::invalid_argument("t5 workspace: requires AllowA8"); }
+    const std::size_t k = static_cast<std::size_t>(input_rows);
+    const std::size_t t = static_cast<std::size_t>(max_tokens);
+    return round_up_256(k * t) + 2 * round_up_256(k / 128 * t * 4) + round_up_256(k / 32 * t * 4);
+}
+
+void t5_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outputs, bool accumulate,
+                LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_t5_weight(w, "t5_project");
+    require_input(x, w, "x");
+    project(t5_a8::PlainInput{static_cast<const __nv_bfloat16*>(x.data)}, x.ne[1], w, outputs,
+            accumulate, policy, workspace, stream);
+}
+
+void t5_project_rmsnorm(const Tensor& x, const Tensor& norm_weight, float eps, bool unit_offset,
+                        const Weight& w, std::span<Tensor* const> outputs, bool accumulate,
+                        LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_t5_weight(w, "t5_project_rmsnorm");
+    require_input(x, w, "x");
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != w.k || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        norm_weight.data == nullptr) {
+        throw std::invalid_argument("t5_project_rmsnorm: norm weight must be contiguous BF16 [K]");
+    }
+    if (!(eps > 0.0f) || !std::isfinite(eps)) {
+        throw std::invalid_argument("t5_project_rmsnorm: eps must be positive and finite");
+    }
+    project(t5_a8::RmsNormInput{static_cast<const __nv_bfloat16*>(x.data),
+                                static_cast<const __nv_bfloat16*>(norm_weight.data), eps,
+                                unit_offset},
+            x.ne[1], w, outputs, accumulate, policy, workspace, stream);
+}
+
+void t5_project_swiglu(const Tensor& gate, const Tensor& up, const Weight& w,
+                       std::span<Tensor* const> outputs, bool accumulate, LinearPolicy policy,
+                       WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_t5_weight(w, "t5_project_swiglu");
+    require_input(gate, w, "gate");
+    require_input(up, w, "up");
+    if (up.ne[1] != gate.ne[1]) {
+        throw std::invalid_argument("t5_project_swiglu: gate and up must have the same T");
+    }
+    project(t5_a8::SwiGluInput{static_cast<const __nv_bfloat16*>(gate.data),
+                               static_cast<const __nv_bfloat16*>(up.data)},
+            gate.ne[1], w, outputs, accumulate, policy, workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

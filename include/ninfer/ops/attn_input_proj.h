@@ -3,6 +3,7 @@
 #include "core/weight.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/rmsnorm.h"
 
 #include <cuda_runtime.h>
 
@@ -77,6 +78,29 @@ attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
                      WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * RMSNorm-input form of the single-parent projection. For the raw BF16 rows x [5120,T]:
+ *
+ *   n[:,t] = rmsnorm(x, norm)[:,t]            (RmsNormPrologue, rmsnorm() semantics)
+ *   q/k/gate/v[:,t] = linear(n[:,t], parent rows) as in the single-parent form.
+ *
+ * Registered for the T5_G128_FP16 TernaryRowK128 parent `[14336,5120]` (rows query 6144, key
+ * 1024, gate 6144, value 1024) under AllowA8/AllowA4, as reported by
+ * attn_input_proj_accepts_rmsnorm(); other parents use rmsnorm() followed by the single-parent
+ * form. n is private arithmetic, not a semantic rounding boundary: the route normalizes,
+ * rotates and quantizes each row to int8 in one kernel without rounding n to BF16. The oracle
+ * evaluates n naively in FP64 from the represented x and norm weight, then every projection in
+ * FP64; the four BF16 outputs are compared under the A8 criterion. Tensor shapes, output order,
+ * non-overlap and the workspace (attn_input_proj_workspace_capacity_bytes() of the parent)
+ * match the single-parent form; x is only read.
+ */
+[[nodiscard]] bool attn_input_proj_accepts_rmsnorm(QType parent_qtype, LinearPolicy policy);
+
+void attn_input_proj(const Tensor& x, const RmsNormPrologue& norm,
+                     const Weight& query_key_gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                     Tensor& v, LinearPolicy policy, WorkspaceArena& workspace,
+                     cudaStream_t stream);
 
 /**
  * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.

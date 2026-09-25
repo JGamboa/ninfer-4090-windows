@@ -23,4 +23,16 @@ namespace ninfer::ops {
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream);
 
+/**
+ * An RMSNorm that a consuming Op applies to its own input rows x with the semantics of rmsnorm():
+ * the consumer's input is ideal[d,r] above, evaluated from the raw x. weight is contiguous BF16
+ * [D] and eps is positive and finite. Whether the normalized rows are materialized, and at which
+ * precision, is stated by the consuming Op.
+ */
+struct RmsNormPrologue {
+    Tensor weight;
+    float eps        = 0.0f;
+    bool unit_offset = false;
+};
+
 } // namespace ninfer::ops

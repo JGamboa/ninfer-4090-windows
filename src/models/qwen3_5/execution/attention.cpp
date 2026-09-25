@@ -44,6 +44,21 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
     }
 }
 
+bool attention_projection_fuses_rmsnorm(const AttentionParameters& parameters) {
+    const auto* single = std::get_if<LinearParameters>(&parameters.projection);
+    return single != nullptr &&
+           ops::attn_input_proj_accepts_rmsnorm(single->weight.qtype, single->policy);
+}
+
+void attention_projection(const Tensor& x, const ops::RmsNormPrologue& norm,
+                          const AttentionParameters& parameters, Tensor& query, Tensor& gate,
+                          Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                          cudaStream_t stream) {
+    const auto& single = std::get<LinearParameters>(parameters.projection);
+    ops::attn_input_proj(x, norm, single.weight, query, gate, key, value, single.policy, workspace,
+                         stream);
+}
+
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
                cudaStream_t stream) {
     require_rope_axes(positions, config);

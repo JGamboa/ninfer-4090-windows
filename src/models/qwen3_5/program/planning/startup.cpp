@@ -356,7 +356,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 }
             }
             auto stage = layout.scope();
-            (void)workspace::post_mixer_hidden(layout, config, last);
+            if (!execution::ffn_fuses_rmsnorm(block.ffn)) {
+                (void)workspace::post_mixer_hidden(layout, config, last);
+            }
             scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last));
         }
         if (!plan.causal_scoring) {
