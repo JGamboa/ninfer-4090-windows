@@ -254,3 +254,64 @@ KV):
 | Energy tips | 107.2 | 60.3 % | 2.81 |
 | Train problem | 127.2 | 78.4 % | 3.35 |
 | Mean | 106.6 | 59.8 % | 2.79 |
+
+### DFlash2 round profile, draft 12 (2026-09-24)
+
+This profile uses the "fast" configuration from the table above on a harder prompt, to see
+where a round's time goes. Command: `nsys profile --trace=cuda,nvtx --cuda-graph-trace=node
+build\apps\ninfer.exe E:\LLM\qwen3_8_27b.ninfer --messages
+examples\cli\messages\scenario_code_python.json --max-context 8192 --max-new 512 --greedy
+--no-thinking --spec dflash2 --draft-tokens 12 [--lm-head-draft]` (`profiles/nsys/
+qwen38_dflash2_d12`, `_d12_fullhead`). Same build, desktop at 60 Hz, server off.
+
+The prompt asks for a whole Python package with tests: 122 prompt tokens, 512 generated. It
+is much less predictable than the quicksort request behind the 210.9 tok/s figure.
+
+| Run | tok/s | Acceptance | Tokens per round | Rounds | ms per round (plain run / nsys) |
+|---|---:|---:|---:|---:|---:|
+| d12, `--lm-head-draft` | 77.7 / 78.7 (two runs) | 24.8 % | 3.96 | 129 | 51.2 / 51.4 |
+| d12, full proposal head | 79.6 | 26.2 % | 4.12 | 124 | 51.6 / 52.1 |
+| d6, `--lm-head-draft` (reference) | 101.9 | 35.6 % | 3.13 | 163 | 30.7 / - |
+
+With d12 and the proposal head, accepted tokens by draft position are 100, 76, 59, 40, 31,
+23, 15, 13, 10, 6, 6, 3 over 129 rounds. Positions 7 to 12 add 53 of the 382 accepted tokens
+but almost double the verification width (T = 7 to T = 13). On this prompt d6 is 30 % faster.
+
+**Where a d12 round goes** (`--lm-head-draft`; per round, 50.6 ms of kernels in 51.4 ms wall,
+735 launches, all graphed). Phases are separated by `speculative_prepare_verify_inputs`
+(drafter -> verify) and `speculative_select_accepted_hidden` (verify -> commit):
+
+| Phase / kernel (route) | ms per round | % | Per call |
+|---|---:|---:|---:|
+| **Drafter** (DFlash2 draft model, 5 layers at T = 13, proposal head, top-k, lattice selector) | **3.51** | **6.9** | |
+| of which Q8 draft-layer MLP and projections (`q8_ksplit_mma`, grids 2176 / 320 / 384) | 2.47 | | |
+| of which proposal head, 32768 rows (`q4_ksplit_mma`, grid 8192) + top-k merge | 0.64 | | 511 us |
+| of which conv prepare, context KV, sliding-window attention, norms | 0.40 | | |
+| **Target verification, T = 13** | **46.78** | **92.4** | |
+| mlp down 5120 x 17408, Q5 (`q5_rowsplit_gemm_simt_split2`) | 12.87 | 25.4 | 169 us x 64 |
+| mlp gate+up 34816 x 5120, Q4 (`q4_ksplit_mma`) | 11.53 | 22.8 | 155 us x 64 |
+| GDN in_proj 16384 x 5120, mixed Q4/Q5 (`rowsplit_grouped_mma`) | 11.17 | 22.1 | 201 us x 48 |
+| attention o_proj and GDN out_proj 5120 x 6144, Q5 (`q5_rowsplit_gemm_simt_split2`) | 3.99 | 7.9 | 64 us x 64 |
+| attention qkvg 14336 x 5120, mixed Q4/Q5 (`rowsplit_grouped_mma`) | 3.21 | 6.3 | 180 us x 16 |
+| verify head 248320 x 5120, Q8 (`q8_ksplit_mma`) | 1.69 | 3.3 | 1.43 ms |
+| GDN gating, conv, recurrence record | 1.42 | 2.8 | |
+| attention (bf16 KV prompt kernel, rope, KV append, output gate) | 0.60 | 1.2 | 27 us x 16 |
+| rmsnorm and elementwise | 0.24 | 0.5 | |
+| sampling (argmax, top-k, finalize) | 0.04 | 0.1 | |
+| **Commit tail** (`recurrent_fold` 0.33 ms, select, counters) | **0.34** | **0.7** | |
+
+Without `--lm-head-draft`, the drafter takes 4.58 ms (`q8_grouped_ksplit_topk` over the full
+vocabulary: 1.67 ms instead of 0.64). Verification is unchanged at 46.54 ms. The short
+proposal head saves 1.07 ms per round (2 %). Here that is within the acceptance difference
+between the two runs (3.96 against 4.12 tokens per round).
+
+The drafter is cheap; the round is set by the T = 13 verification. That pass takes 46.8 ms,
+2.2x a single-token decode (21.3 ms at tg128's 47 tok/s), while reading the same ~17 GB of
+weights. That is ~365 GB/s, against ~800 GB/s at T = 1. At T = 13 the Q4/Q5 "few tokens"
+routes are below the bandwidth roof. Estimates at ~4.5 bits per Q4 weight and ~5.5 per Q5:
+- gate+up (`q4_ksplit_mma`) reads ~100 MB in 155 us, ~650 GB/s.
+- The Q5 SIMT routes read down (~61 MB) and o_proj/out_proj (~22 MB) at ~340-360 GB/s.
+- The grouped mixed Q4/Q5 mma for in_proj and qkvg reads at ~230-290 GB/s.
+
+These three families, 4.3 G weight reads per round, are where a wider tensor-core small-T
+route would pay back. The GEMMs make up 88 % of the round.
