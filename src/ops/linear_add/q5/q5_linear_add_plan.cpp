@@ -37,12 +37,13 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-// T = 7..16 is the DFlash2 verification band (six to fifteen drafts); the SIMT split2 route
-// read the weights at ~350 GB/s there (WINDOWS_PORT.md, Qwen3.8 DFlash2 profile).
+// T = 7..16 is the DFlash2 verification band (six to fifteen drafts); the SIMT split2 route read
+// the weights at ~350 GB/s there, and the 16-column MMA tile at k = 6144 measured ~96 us at
+// T = 14..16 against ~46 us for this route at 13 (WINDOWS_PORT.md, Qwen3.8 DFlash2 profile).
 constexpr std::array<RouteSpec, 7> kK6144Routes{{
     {{1, 6}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{7, 13}, Q5LinearAddScheduleId::KSplitMmaResidual},
-    {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{7, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
+    {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
     {{193, 512}, Q5LinearAddScheduleId::MmaResidualR64C128},
