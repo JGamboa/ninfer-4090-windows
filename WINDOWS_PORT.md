@@ -674,6 +674,6 @@ paths (another near-tie), so its tok/s moves by the per-round saving and an acce
 difference together.
 
 The gain is under 10 %, so the two-lane capacity search with graphs was not run. With graphs
-on, the reservation is 480 MiB per lane for DFlash2 and 86 MiB for MTP 3. For the three-lane
+on, one lane reserves 480 MiB for DFlash2 (1152 MiB with three lanes, see above) and 86 MiB for MTP 3. For the three-lane
 DFlash2 launcher, that makes `--no-cuda-graph` a cheap way to keep 100000 tokens of KV:
 about 4 % of decode speed.
