@@ -21,7 +21,9 @@ namespace ninfer::ops::detail {
 //
 // A8 only: the policy must allow A8 and a workspace of t5_workspace_capacity_bytes is required.
 // x is quantized to int8 with one FP32 scale per token and 128-column group (t5_a8.cuh), then
-// multiplied in integer arithmetic: dp4a GEMV through T = 8, int8 MMA GEMM beyond. With
+// multiplied in integer arithmetic: dp4a GEMV through T = 4, a small-T int8 MMA route through
+// T = 32 (weights read once per 32 tokens, K split over the warps of a 16-row CTA), the int8 MMA
+// prefill GEMM beyond (or 32-token small-T tiles when N % 64 != 0). With
 // w.input_signs (a Prism weight stored in the rotated basis) x is the primal input and the
 // rotation is fused into the quantization. Graph-capturable: static grid per (N, T), no host
 // sync.

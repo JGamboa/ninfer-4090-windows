@@ -274,27 +274,28 @@ __device__ __forceinline__ void decode_unit(const std::uint32_t (&a)[4], std::ui
 }
 
 // ---------------------------------------------------------------------------------------------
-// dp4a GEMV for decode and MTP verification. A CTA of two warps owns eight rows: each half-warp
-// two rows, its 16 lanes striding the units (K / 64 is a multiple of 16, so no lane idles).
-// Per unit and row: four streaming loads, the arithmetic decode, and one dp4a per code word and
-// token; the activation words of a unit are shared by both rows.
+// dp4a GEMV for decode and single-lane MTP verification (T <= 4). A CTA of two warps owns eight
+// rows: each half-warp two rows, its 16 lanes striding the units (K / 64 is a multiple of 16, so
+// no lane idles). Per unit and row: four streaming loads, the arithmetic decode, and one dp4a
+// per code word and token; the activation words of a unit are shared by both rows. The dp4a work
+// grows with T while the decode does not, so wider T takes the tensor-core small-T route below.
 
 constexpr int kGemvThreads     = 64;
 constexpr int kGemvRowsPerHalf = 2;
 constexpr int kGemvRowsPerCta  = kGemvThreads / 16 * kGemvRowsPerHalf;
+constexpr int kGemvMaxTokens   = 4;
 
 template <int Tile>
 __global__ void __launch_bounds__(kGemvThreads)
     gemv_kernel(const uint4* __restrict__ qx, const float* __restrict__ group_scale,
                 const int* __restrict__ slice_sum, const std::uint8_t* __restrict__ codes,
                 const __half* __restrict__ scales, std::int64_t scale_row_halves, int n, int k,
-                int tokens, Outputs outputs, bool accumulate) {
-    constexpr int R  = kGemvRowsPerHalf;
-    const int warp   = static_cast<int>(threadIdx.x) / 32;
-    const int lane   = static_cast<int>(threadIdx.x) % 32;
-    const int hl     = lane & 15;
-    const int token0 = static_cast<int>(blockIdx.y) * Tile;
-    const int live   = min(Tile, tokens - token0);
+                Outputs outputs, bool accumulate) {
+    static_assert(Tile >= 1 && Tile <= kGemvMaxTokens);
+    constexpr int R = kGemvRowsPerHalf;
+    const int warp  = static_cast<int>(threadIdx.x) / 32;
+    const int lane  = static_cast<int>(threadIdx.x) % 32;
+    const int hl    = lane & 15;
     const int row0 =
         ((static_cast<int>(blockIdx.x) * (kGemvThreads / 32) + warp) * 2 + (lane >> 4)) * R;
     const int units              = k / kUnitColumns;
@@ -315,9 +316,6 @@ __global__ void __launch_bounds__(kGemvThreads)
 #pragma unroll
         for (int t = 0; t < Tile; ++t) acc[r][t] = 0.0f;
     }
-    // The code words of both rows are decoded once per unit; the tokens then run in chunks of
-    // at most four, so an eight-token tile holds the activation of four tokens at a time.
-    constexpr int kChunk = Tile < 4 ? Tile : 4;
     for (int u = hl; u < units; u += 16) {
         std::uint32_t words[R][16];
         float scale[R];
@@ -328,48 +326,35 @@ __global__ void __launch_bounds__(kGemvThreads)
             decode_unit(a, words[r]);
             scale[r] = __half2float(__ldcs(row_scales[r] + (u >> 1)));
         }
+        uint4 xs[Tile][4];
+        int offset[Tile];
+        float step[Tile];
 #pragma unroll
-        for (int c0 = 0; c0 < Tile; c0 += kChunk) {
-            uint4 xs[kChunk][4];
-            int offset[kChunk];
-            float step[kChunk];
+        for (int t = 0; t < Tile; ++t) {
+            const uint4* row = qx + std::int64_t(t) * (k / 16) + std::int64_t(u) * 4;
 #pragma unroll
-            for (int c = 0; c < kChunk; ++c) {
-                const int t = c0 + c;
-                if (t < live) {
-                    const std::int64_t token = token0 + t;
-                    const uint4* row         = qx + token * (k / 16) + std::int64_t(u) * 4;
+            for (int w = 0; w < 4; ++w) xs[t][w] = __ldg(row + w);
+            offset[t] = __ldg(slice_sum + std::int64_t(t) * slices + 2 * u) +
+                        __ldg(slice_sum + std::int64_t(t) * slices + 2 * u + 1);
+            step[t] = __ldg(group_scale + std::int64_t(t) * groups + (u >> 1));
+        }
 #pragma unroll
-                    for (int w = 0; w < 4; ++w) xs[c][w] = __ldg(row + w);
-                    offset[c] = __ldg(slice_sum + token * slices + 2 * u) +
-                                __ldg(slice_sum + token * slices + 2 * u + 1);
-                    step[c] = __ldg(group_scale + token * groups + (u >> 1));
-                } else {
+        for (int r = 0; r < R; ++r) {
+            int dot[Tile];
 #pragma unroll
-                    for (int w = 0; w < 4; ++w) xs[c][w] = make_uint4(0, 0, 0, 0);
-                    offset[c] = 0;
-                    step[c]   = 0.0f;
+            for (int t = 0; t < Tile; ++t) dot[t] = 0;
+#pragma unroll
+            for (int w = 0; w < 16; ++w) {
+#pragma unroll
+                for (int t = 0; t < Tile; ++t) {
+                    const std::uint32_t lanes[4] = {xs[t][w >> 2].x, xs[t][w >> 2].y,
+                                                    xs[t][w >> 2].z, xs[t][w >> 2].w};
+                    dot[t] = __dp4a(static_cast<int>(words[r][w]), static_cast<int>(lanes[w & 3]), dot[t]);
                 }
             }
 #pragma unroll
-            for (int r = 0; r < R; ++r) {
-                int dot[kChunk];
-#pragma unroll
-                for (int c = 0; c < kChunk; ++c) dot[c] = 0;
-#pragma unroll
-                for (int w = 0; w < 16; ++w) {
-#pragma unroll
-                    for (int c = 0; c < kChunk; ++c) {
-                        const std::uint32_t lanes[4] = {xs[c][w >> 2].x, xs[c][w >> 2].y,
-                                                        xs[c][w >> 2].z, xs[c][w >> 2].w};
-                        dot[c] = __dp4a(static_cast<int>(words[r][w]), static_cast<int>(lanes[w & 3]), dot[c]);
-                    }
-                }
-#pragma unroll
-                for (int c = 0; c < kChunk; ++c) {
-                    acc[r][c0 + c] = fmaf(scale[r] * step[c], static_cast<float>(dot[c] - offset[c]),
-                                          acc[r][c0 + c]);
-                }
+            for (int t = 0; t < Tile; ++t) {
+                acc[r][t] = fmaf(scale[r] * step[t], static_cast<float>(dot[t] - offset[t]), acc[r][t]);
             }
         }
     }
@@ -389,7 +374,7 @@ __global__ void __launch_bounds__(kGemvThreads)
         if (row >= n) continue;
 #pragma unroll
         for (int t = 0; t < Tile; ++t) {
-            if (t < live && hl == t) store_row(output_row(outputs, row), token0 + t, acc[r][t], accumulate);
+            if (hl == t) store_row(output_row(outputs, row), t, acc[r][t], accumulate);
         }
     }
 }
@@ -646,6 +631,168 @@ __global__ void __launch_bounds__(GemmConfig<WarpsN>::kThreads, GemmConfig<Warps
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Small-T tensor-core GEMV for the verification of concurrent MTP lanes (T = 5..32; also any T
+// of a weight whose rows are not a multiple of the GEMM's 64). The dp4a GEMV's work grows with T
+// and the prefill GEMM gives each 64-row CTA the whole K (80 CTAs for a 5120-row weight), so
+// neither fits here. A CTA of four warps owns 16 rows and 8 NTiles tokens; warp w takes the
+// 128-column groups w, w + 4, ... of the row block (K % 1024 == 0: every warp has K / 512 >= 2
+// groups), and the four FP32 partial sums are added in shared memory in warp order, so the
+// weights are read once per token tile with one CTA per 16 rows.
+//
+// Per group each lane decodes one (row, unit) = (lane / 2, lane % 2) as the GEMV does (the next
+// two groups' bytes are in flight meanwhile) into the warp's shared code words, and the warp
+// multiplies 16 rows x 128 columns x 8 NTiles tokens with m16n8k32 s8 MMAs, A by `ldmatrix`.
+// The k order inside the MMAs is permuted so that lane `lid` reads the activation words
+// 8 lid .. 8 lid + 7 of its token with two 16-byte loads: MMA step ks, fragment half h (a0/a1
+// and b0 for h = 0, a2/a3 and b1 for h = 1) holds group word 8 lid + 2 ks + h, i.e. code word
+// w of unit u (group word 16 u + w) is stored at chunk w % 8, word 2 u + w / 8 of its row (the
+// chunk XORed with the row as in the GEMM). The group sums correct the code offset as there.
+
+constexpr int kSmallWarps    = 4;
+constexpr int kSmallThreads  = 32 * kSmallWarps;
+constexpr int kSmallRows     = 16;
+constexpr int kSmallMaxTiles = 4; // 32 tokens per CTA
+
+template <int NTiles>
+__global__ void __launch_bounds__(kSmallThreads, NTiles <= 2 ? 4 : 3)
+    small_t_kernel(const std::uint8_t* __restrict__ qx, const float* __restrict__ group_scale,
+                   const int* __restrict__ group_sum, const std::uint8_t* __restrict__ codes,
+                   const __half* __restrict__ scales, std::int64_t scale_row_halves, int n, int k,
+                   int tokens, Outputs outputs, bool accumulate) {
+    static_assert(NTiles >= 1 && NTiles <= kSmallMaxTiles);
+    constexpr int kTokens = 8 * NTiles;
+    // Per warp: 16 rows x 32 code words per group; after the loop, the partial sums [token][row].
+    __shared__ __align__(128) std::uint32_t warp_words[kSmallWarps][kSmallRows * 32];
+    static_assert(kTokens * kSmallRows <= kSmallRows * 32);
+    const int tid    = static_cast<int>(threadIdx.x);
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int gid    = lane >> 2;
+    const int lid    = lane & 3;
+    const int row0   = static_cast<int>(blockIdx.x) * kSmallRows;
+    const int token0 = static_cast<int>(blockIdx.y) * kTokens;
+    const int live   = min(kTokens, tokens - token0);
+    const int groups = k / kStageK;
+    const std::int64_t row_bytes = std::int64_t(k / kUnitColumns) * kUnitBytes;
+    std::uint32_t* code_words    = warp_words[warp];
+
+    // Rows past n alias the last row and tokens past `live` the last live token; their results
+    // are never stored.
+    const int my_row             = lane >> 1;
+    const int my_unit            = lane & 1;
+    const std::uint8_t* my_codes = codes + std::int64_t(min(row0 + my_row, n - 1)) * row_bytes;
+    const __half* top_scales     = scales + std::int64_t(min(row0 + gid, n - 1)) * scale_row_halves;
+    const __half* bottom_scales =
+        scales + std::int64_t(min(row0 + gid + 8, n - 1)) * scale_row_halves;
+    // B operand: token nt * 8 + gid, bytes 32 lid .. 32 lid + 31 of each group; C fragment
+    // tokens nt * 8 + 2 lid + j for the group scales and sums.
+    int x_offset[NTiles], token_offset[NTiles][2];
+#pragma unroll
+    for (int nt = 0; nt < NTiles; ++nt) {
+        x_offset[nt] = (token0 + min(nt * 8 + gid, live - 1)) * k + 32 * lid;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            token_offset[nt][j] = (token0 + min(nt * 8 + 2 * lid + j, live - 1)) * groups;
+        }
+    }
+    // ldmatrix row addresses of the A fragments (as in the GEMM).
+    const int a_row   = (lane & 7) + ((lane >> 3) & 1) * 8;
+    const int a_chunk = lane >> 4;
+
+    float acc[NTiles][4];
+#pragma unroll
+    for (int nt = 0; nt < NTiles; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[nt][e] = 0.0f;
+    }
+    std::uint32_t raw[4], next[4];
+    load_unit(my_codes, 2 * warp + my_unit, raw);
+    load_unit(my_codes, 2 * (warp + kSmallWarps) + my_unit, next);
+#pragma unroll 1
+    for (int group = warp; group < groups; group += kSmallWarps) {
+        uint4 x[NTiles][2];
+#pragma unroll
+        for (int nt = 0; nt < NTiles; ++nt) {
+            const auto* source = reinterpret_cast<const uint4*>(qx + x_offset[nt] + group * kStageK);
+            x[nt][0]           = __ldg(source);
+            x[nt][1]           = __ldg(source + 1);
+        }
+        {
+            std::uint32_t words[16];
+            decode_unit(raw, words);
+            std::uint32_t* row_words = code_words + my_row * 32 + 2 * my_unit;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                *reinterpret_cast<uint2*>(row_words + ((c ^ (my_row & 7)) << 2)) =
+                    make_uint2(words[c], words[c + 8]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) raw[i] = next[i];
+        if (group + 2 * kSmallWarps < groups) {
+            load_unit(my_codes, 2 * (group + 2 * kSmallWarps) + my_unit, next);
+        }
+        __syncwarp();
+        int dot[NTiles][4];
+#pragma unroll
+        for (int nt = 0; nt < NTiles; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) dot[nt][e] = 0;
+        }
+#pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            unsigned a0, a1, a2, a3;
+            ldmatrix_x4(a0, a1, a2, a3,
+                        smem_addr(&code_words[gemm_word(a_row, 4 * (2 * ks + a_chunk))]));
+#pragma unroll
+            for (int nt = 0; nt < NTiles; ++nt) {
+                // b0, b1 = group words 8 lid + 2 ks and 8 lid + 2 ks + 1 of the lane's token.
+                const uint4& xs = x[nt][ks >> 1];
+                mma_s8(dot[nt][0], dot[nt][1], dot[nt][2], dot[nt][3], a0, a1, a2, a3,
+                       ks & 1 ? xs.z : xs.x, ks & 1 ? xs.w : xs.y);
+            }
+        }
+        // Every lane has its fragments before the next group's code words are stored.
+        __syncwarp();
+        const float top    = __half2float(__ldg(top_scales + group));
+        const float bottom = __half2float(__ldg(bottom_scales + group));
+        // Fragment C: [0], [1] are row gid, tokens 2 lid and 2 lid + 1; [2], [3] row gid + 8.
+#pragma unroll
+        for (int nt = 0; nt < NTiles; ++nt) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const float step = __ldg(group_scale + token_offset[nt][j] + group);
+                const int sum    = __ldg(group_sum + token_offset[nt][j] + group);
+                acc[nt][j] = fmaf(top * step, static_cast<float>(dot[nt][j] - sum), acc[nt][j]);
+                acc[nt][2 + j] =
+                    fmaf(bottom * step, static_cast<float>(dot[nt][2 + j] - sum), acc[nt][2 + j]);
+            }
+        }
+    }
+
+    // The warp's partial sums replace its code words as [token][row]; then every thread adds
+    // the four warps' sums of (row, token) items in warp order, rows fastest (coalesced stores).
+    auto* partial = reinterpret_cast<float*>(code_words);
+#pragma unroll
+    for (int nt = 0; nt < NTiles; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            partial[(nt * 8 + 2 * lid + (e & 1)) * kSmallRows + gid + (e >> 1) * 8] = acc[nt][e];
+        }
+    }
+    __syncthreads();
+    for (int item = tid; item < kTokens * kSmallRows; item += kSmallThreads) {
+        const int row   = item % kSmallRows;
+        const int token = item / kSmallRows;
+        if (token >= live || row0 + row >= n) continue;
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kSmallWarps; ++w) sum += reinterpret_cast<const float*>(warp_words[w])[item];
+        store_row(output_row(outputs, row0 + row), token0 + token, sum, accumulate);
     }
 }
 

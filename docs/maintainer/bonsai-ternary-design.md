@@ -1147,8 +1147,7 @@ Next steps, in order:
 3. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit with the
    cheaper t5 T = 4 round (0.86 of t2), or with an adaptive window.
 4. Prefill: recover the accepted t5 regression (pp512 -13 %) with a 64 x 128-token GEMM tile
-   (half the weight reads and decode per token), and an eight-token tensor-core route for
-   T = 5..8 (1.2-1.7x t2 today) if short prefills matter.
+   (half the weight reads and decode per token). The tensor-core route for T = 5..8 is item 11.
 
    Profile, 2026-09-24, display 60 Hz: `nsys profile --trace=cuda,nvtx` of `ninfer_bench
    -p 512` on the t5 `bonsai2_27b_vl.ninfer` (`profiles/nsys/bonsai_t5_pp512`), four prefills:
@@ -1621,6 +1620,96 @@ Next steps, in order:
        --cuda-graph-trace=node` short-context run (item 6A setup) of the best variant for the
        MTP layer's ms per round against 1.32.
     4. Quick perplexity is unaffected (the MTP layer is draft-only); no need to rerun.
+
+11. Concurrent-lane MTP decode: small-T tensor-core route (implemented; compiled for sm_89 on
+    Linux with CUDA 13, no GPU; not yet run on the RTX 4090).
+
+    Diagnosis. A batched MTP round packs every lane's verify window into one column block:
+    `target_verify_batch` runs the text stack on `T = (draft + 1) x B` columns, so every t5
+    projection (256 per round plus the 248320-row head) and its quantization see that T, while
+    attention (`causal_softmax_attention` over `[D, H, width, B]`), the GDN record and fold,
+    and the rotate/quantize prologues are single batched launches. The MTP layer (Q8) sees
+    `(draft + 1) x B` columns once, then B per autoregressive step, and the Q4 proposal head B
+    per step. Routes before this change, by B, for draft 2 / draft 3:
+
+    | B | T (d2 / d3) | t5 route before | t5 route now | Q8 MTP layer (T / AR T) | Q4 proposal head (T) |
+    |---|---|---|---|---|---|
+    | 1 | 3 / 4 | dp4a GEMV tile 3 / 4 | unchanged | ksplit C4 / C4 | GEMV (1) |
+    | 2 | 6 / 8 | dp4a GEMV tile 8 | small-T, 1 tile | C8 / C4 | ksplit 4 (2) |
+    | 3 | 9 / 12 | 64-token GEMM | small-T, 2 tiles | C16 / C4 | ksplit 4 (3) |
+    | 4 | 12 / 16 | 64-token GEMM | small-T, 2 tiles | C16 / C4 | ksplit 4 (4) |
+    | 5 | 15 / 20 | 64-token GEMM | small-T, 2 / 3 tiles | C16 or C24 / C8 | ksplit 8 (5) |
+    | 6 | 18 / 24 | 64-token GEMM | small-T, 3 tiles | C24 / C8 | ksplit 8 (6) |
+    | 7 | 21 / 28 | 64-token GEMM | small-T, 3 / 4 tiles | C24 or C32 / C8 | ksplit 8 (7) |
+    | 8 | 24 / 32 | 64-token GEMM | small-T, 3 / 4 tiles | C24 or C32 / C8 | ksplit 8 (8) |
+
+    Every route reads each weight once per call; the scaling fault is the kernel cost at these
+    T. The prefill GEMM gives each 64-row CTA the whole K and computes 64 token columns however
+    few are live: o_proj/GDN out (5120 x 6144) and down (5120 x 17408) run 80 CTAs on 128 SMs
+    with 48 and 136 serial 128-column stages, and gate+up 544 CTAs in 1.4 waves. From the
+    prefill measurements (item 4: o_proj about 60 us, down 240 us and gate+up about 190 us per
+    64-token column), the 256 projections of a T = 9 round take roughly 29 ms against 7.7 ms
+    for the T = 3 GEMV, which accounts for the measured 14.49 -> 37.09 ms per round at three
+    lanes. The dp4a GEMV at T = 5..8 is compute-bound (section 9, t5 production kernels:
+    1.2-1.7x t2 at T = 8), so two lanes pay about twice the T = 3 projection time too (an
+    estimate; B = 2 was not profiled). The other per-round ops grow with
+    their useful work: the GDN record/fold read and write each lane's recurrent state (about
+    0.6 ms per lane per round), attention reads each lane's KV, and the Q8/Q4 draft routes read
+    their weights once per call. None re-reads weights per lane, and no op launches per lane.
+
+    Route (`t5_a8::small_t_kernel<NTiles>`, `t5_project.cu`): T = 1..4 keep the dp4a GEMV (tiles
+    1-4; the 8-token GEMV tile is removed), T = 5..32 take the small-T route with
+    `NTiles = ceil(T / 8)` 8-token MMA tiles, T > 32 the prefill GEMM (or 32-token small-T
+    tiles when N % 64 != 0, replacing the GEMV's 8-token tiles there). A CTA of four warps owns
+    16 rows; warp w takes the 128-column groups w, w + 4, ... (K % 1024 == 0 gives every warp
+    K / 512 groups), so a 5120-row weight runs 320 CTAs, one wave at three or four CTAs per SM,
+    with K split four ways; the four FP32 partial sums are added in shared memory in warp
+    order. Per group each lane decodes one (row, unit) with the GEMV's arithmetic decode (the
+    next two groups' bytes in flight), stores the 16 code words to the warp's 2 KB buffer, and
+    the warp runs 4 x NTiles m16n8k32 s8 MMAs with `ldmatrix` A fragments. The k order inside
+    the MMAs is permuted (fragment half h of step ks holds group word 8 lid + 2 ks + h) so that
+    each lane loads its token's activation words 8 lid .. 8 lid + 7 with two 16-byte loads; the
+    quantized activation layout is unchanged (natural order, the GEMV's and GEMM's). The group
+    sums correct the code offset as in the GEMM.
+
+    Cost per 16 rows x 128 columns and warp: 16 x 26 code bytes read once, ~75 decode
+    instructions, 8 `STS.64` and 4 `ldmatrix`, 4 NTiles MMAs, 2 NTiles 16-byte activation loads
+    and a 16 NTiles-instruction epilogue. The decode is paid once per weight as in the T = 3
+    GEMV, and the dp4a work (16 per code word and token) moves to the tensor pipe, so the
+    kernel should stay near the weight-read time up to T = 32 (T = 3 GEMV: gate+up 42-51 us
+    for 36 MB). The tile of 16 dp4a tokens was rejected: 256 dp4a per unit and row pair per
+    token tile doubles the compute-bound T = 8 cost. The activation is re-read from L1/L2 by
+    every 16-row CTA (T x K bytes; 123 KB for gate+up at T = 24, largely shared in L1 by the CTAs
+    of an SM sweeping K together). ptxas (sm_89, `-rdc`): 95 / 120 / 153 / 161 registers for
+    1-4 tiles, no spills, 8 KB static shared memory; `__launch_bounds__` asks four CTAs per SM
+    through 2 tiles and three beyond.
+
+    Expected: the t5 projections of a three-lane T = 9 round from about 29 ms to 1.1-1.3x the
+    T = 3 GEMV time (8.5-10 ms), the round from 37 ms to roughly 16-17 ms (GDN about 2.4 ms,
+    the Q8 MTP layer, head, attention and prologues growing with their work), i.e. about 2x the
+    three-lane aggregate. Two lanes (T = 6) lose the compute-bound 8-token dp4a tile. Single-lane
+    decode (T = 3, draft 3 T = 4) is unchanged.
+
+    Qualification (`ninfer_linear_t5_test`, FP64 oracle, A8 criterion): the partial-row weight
+    [301, 3072] at T = 5, 8, 9, 16, 17, 24, 25, 32 and in 32-token tiles at T = 40 and 72 (graph
+    replay at T = 9), a fused-parent row view at T = 6 and 12, [448, 2048] at T = 9, 17, 32 and
+    the GEMM boundary 33; every Bonsai shape at T = 8, 9 and 24, the 5120-row shapes also at
+    6, 12, 16, 32 and the residual epilogue at T = 9; the four-output attention parent at T = 9,
+    the RMSNorm prologue at T = 8 and 12, the rotated [448, 2048] at T = 8, 12, 32 with the
+    residual at T = 18, and the fused MLP at T = 9 (down K = 1024: two groups per warp) and
+    8, 16 at the Bonsai shapes.
+
+    Validation the RTX 4090 session must run:
+    1. `ninfer_linear_t5_test` (all cases) and `ninfer_attn_input_proj_test`.
+    2. `ninfer_t5_bench` (defaults now include T = 6, 9, 12, 24, 32): small-T against the
+       previous binary's GEMV tile 8 (T = 6, 8) and 64-token GEMM (T = 9..32) per shape.
+    3. Quick perplexity (single-token scoring is unaffected; the check guards the shared
+       quantization path).
+    4. Bonsai single-lane MTP decode on the six prompts (unchanged route, a no-regression check).
+    5. `ninfer-serve` concurrency, 1, 2 and 3 lanes, MTP draft 2, `--lm-head-draft`, greedy: the
+       three-lane aggregate against 166.9 tok/s and 37.09 ms per round, the one-request rate
+       against 143.6 tok/s and 14.49 ms; plus an nsys round profile at three lanes (t5 kernel
+       time per round against the ~29 ms estimate).
 
 ## Appendix: sources
 

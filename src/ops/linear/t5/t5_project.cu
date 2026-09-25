@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -14,7 +15,9 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kMaxTile = 8; // tokens per GEMV launch column; larger T uses the GEMM
+// Routes by T (design 9.1): the dp4a GEMV through T = 4, the small-T tensor-core route through
+// T = 32 (MTP verification of up to eight lanes at draft 3), the prefill GEMM beyond.
+constexpr int kSmallTMaxTokens = 8 * t5_a8::kSmallMaxTiles;
 
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15) == 0; }
 
@@ -52,13 +55,26 @@ QuantizedX quantize(const Input& input, int k, int tokens, const void* signs,
 }
 
 template <int Tile>
-void launch_gemv(const QuantizedX& q, const Weight& w, int tokens, const t5_a8::Outputs& outputs,
+void launch_gemv(const QuantizedX& q, const Weight& w, const t5_a8::Outputs& outputs,
                  bool accumulate, cudaStream_t stream) {
-    const dim3 grid(static_cast<unsigned>((w.n + t5_a8::kGemvRowsPerCta - 1) / t5_a8::kGemvRowsPerCta),
-                    static_cast<unsigned>((tokens + Tile - 1) / Tile));
+    const unsigned grid =
+        static_cast<unsigned>((w.n + t5_a8::kGemvRowsPerCta - 1) / t5_a8::kGemvRowsPerCta);
     t5_a8::gemv_kernel<Tile><<<grid, t5_a8::kGemvThreads, 0, stream>>>(
         static_cast<const uint4*>(q.q.data), static_cast<const float*>(q.scale.data),
         static_cast<const int*>(q.slice_sum.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.n, w.k, outputs, accumulate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int NTiles>
+void launch_small_t(const QuantizedX& q, const Weight& w, int tokens,
+                    const t5_a8::Outputs& outputs, bool accumulate, cudaStream_t stream) {
+    constexpr int kTokens = 8 * NTiles;
+    const dim3 grid(static_cast<unsigned>((w.n + t5_a8::kSmallRows - 1) / t5_a8::kSmallRows),
+                    static_cast<unsigned>((tokens + kTokens - 1) / kTokens));
+    t5_a8::small_t_kernel<NTiles><<<grid, t5_a8::kSmallThreads, 0, stream>>>(
+        static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
+        static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.n, w.k, tokens, outputs,
         accumulate);
     CUDA_CHECK(cudaGetLastError());
@@ -99,8 +115,9 @@ void require_input(const Tensor& x, const Weight& w, const char* what) {
     }
 }
 
-// Validates the weight, policy and outputs, then quantizes the input and multiplies:
-// dp4a GEMV through T = 8, int8 MMA GEMM beyond.
+// Validates the weight, policy and outputs, then quantizes the input and multiplies: dp4a GEMV
+// through T = 4, the small-T MMA route through T = 32 (and at any T when N % 64 != 0, in 32-token
+// tiles), the int8 MMA GEMM beyond.
 template <class Input>
 void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* const> outputs,
              bool accumulate, LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
@@ -132,20 +149,24 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
 
     auto scope         = workspace->scope();
     const QuantizedX q = quantize(input, w.k, tokens, w.input_signs, *workspace, stream);
-    if (tokens > kMaxTile && w.n % t5_a8::kGemmRows == 0) {
-        if (use_small_gemm_tile(w, tokens)) {
-            launch_gemm<2>(q, w, tokens, packed, accumulate, stream);
-        } else {
-            launch_gemm<4>(q, w, tokens, packed, accumulate, stream);
-        }
-        return;
-    }
     switch (tokens) {
-    case 1: launch_gemv<1>(q, w, tokens, packed, accumulate, stream); break;
-    case 2: launch_gemv<2>(q, w, tokens, packed, accumulate, stream); break;
-    case 3: launch_gemv<3>(q, w, tokens, packed, accumulate, stream); break;
-    case 4: launch_gemv<4>(q, w, tokens, packed, accumulate, stream); break;
-    default: launch_gemv<kMaxTile>(q, w, tokens, packed, accumulate, stream); break;
+    case 1: launch_gemv<1>(q, w, packed, accumulate, stream); return;
+    case 2: launch_gemv<2>(q, w, packed, accumulate, stream); return;
+    case 3: launch_gemv<3>(q, w, packed, accumulate, stream); return;
+    case 4: launch_gemv<4>(q, w, packed, accumulate, stream); return;
+    default: break;
+    }
+    if (tokens <= kSmallTMaxTokens || w.n % t5_a8::kGemmRows != 0) {
+        switch ((std::min(tokens, kSmallTMaxTokens) + 7) / 8) {
+        case 1: launch_small_t<1>(q, w, tokens, packed, accumulate, stream); break;
+        case 2: launch_small_t<2>(q, w, tokens, packed, accumulate, stream); break;
+        case 3: launch_small_t<3>(q, w, tokens, packed, accumulate, stream); break;
+        default: launch_small_t<4>(q, w, tokens, packed, accumulate, stream); break;
+        }
+    } else if (use_small_gemm_tile(w, tokens)) {
+        launch_gemm<2>(q, w, tokens, packed, accumulate, stream);
+    } else {
+        launch_gemm<4>(q, w, tokens, packed, accumulate, stream);
     }
 }
 

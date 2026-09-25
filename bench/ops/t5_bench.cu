@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
         std::puts("SKIP: no CUDA device");
         return 77;
     }
-    std::vector<int> tokens{1, 2, 3, 4, 8, 16, 64, 512};
+    std::vector<int> tokens{1, 2, 3, 4, 6, 8, 9, 12, 16, 24, 32, 64, 512};
     if (argc > 1) {
         tokens.clear();
         for (int i = 1; i < argc; ++i) tokens.push_back(std::atoi(argv[i]));

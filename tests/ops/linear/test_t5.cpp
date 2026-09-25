@@ -401,24 +401,41 @@ int main() {
     }
     int failures = 0;
     {
-        // GEMV templates T = 1..4 and the T = 5..8 route, a partial row block (odd N), a row
-        // view of a fused parent, graph replay, and the 64-token prefill GEMM with partial
-        // tiles (this short-K, few-row weight keeps 64-token CTAs beyond T = 64 as well).
+        // GEMV templates T = 1..4; the small-T MMA route from T = 5 through its 32-token
+        // bound, with one to four 8-token tiles and partial tiles, on a partial 16-row block
+        // (odd N) and a row view of a fused parent; beyond T = 32 a weight whose rows are not a
+        // multiple of 64 stays on the small-T route in 32-token tiles (T = 40, 72). Graph replay,
+        // and the 64-token prefill GEMM with partial tiles (this short-K, few-row weight keeps
+        // 64-token CTAs beyond T = 64 as well).
         const Ternary small(301, 3072, 15u);
-        for (std::int32_t t : {1, 2, 3, 4, 5, 8, 9}) failures += linear_case(small, 0, 301, t, t == 3);
+        for (std::int32_t t : {1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 25, 32, 40, 72}) {
+            failures += linear_case(small, 0, 301, t, t == 3 || t == 9);
+        }
         failures += linear_case(small, 44, 200, 6, false);
+        failures += linear_case(small, 44, 200, 12, false);
         const Ternary gemm(448, 2048, 18u);
-        for (std::int32_t t : {9, 17, 64, 65, 130}) failures += linear_case(gemm, 0, 448, t, t == 65);
+        for (std::int32_t t : {9, 17, 32, 33, 64, 65, 130}) {
+            failures += linear_case(gemm, 0, 448, t, t == 65);
+        }
         failures += linear_case(gemm, 64, 320, 40, false, ops::LinearPolicy::AllowA4);
         failures += linear_add_case(gemm, 70);
         failures += linear_add_case(gemm, 3);
     }
-    // Bonsai shapes (N, K) at decode, MTP-verify and short-prefill widths.
+    // Bonsai shapes (N, K) at decode and MTP-verify widths: one lane (T = 1, 3, 4), and B
+    // concurrent lanes packed as B x (draft + 1) columns (draft 2: 6, 9, 12, ..., 24; draft 3:
+    // 8, 12, 16, ..., 32) on the small-T route. The 5120-row shapes (the longest K per warp)
+    // take every tile count and the residual epilogue.
     for (const auto [n, k] : std::array<std::pair<int, int>, 4>{
              {{5120, 6144}, {5120, 17408}, {16384, 5120}, {34816, 5120}}}) {
         const Ternary w(n, k, 3000u + n + k);
         for (std::int32_t t : {1, 3, 4, 8}) failures += linear_case(w, 0, n, t, t == 3);
-        if (n == 5120) failures += linear_add_case(w, 3);
+        failures += linear_case(w, 0, n, 9, true);
+        failures += linear_case(w, 0, n, 24, false);
+        if (n == 5120) {
+            for (std::int32_t t : {6, 12, 16, 32}) failures += linear_case(w, 0, n, t, false);
+            failures += linear_add_case(w, 3);
+            failures += linear_add_case(w, 9);
+        }
     }
     {
         // 128-token prefill GEMM at the longest K (mlp down, 80 CTAs), accumulating into a
@@ -430,28 +447,33 @@ int main() {
         const Ternary attention(14336, 5120, 78u);
         failures += attention_case(attention, 3);
         failures += attention_case(attention, 6);
+        failures += attention_case(attention, 9);  // four outputs from the small-T route
         failures += attention_case(attention, 72); // four outputs from the 128-token GEMM
     }
     {
-        // RMSNorm-input attention parent (all 16 Bonsai full-attention layers): GEMV at decode
-        // and MTP-verify widths, the 128-token GEMM, and an unrotated parent without the unit
-        // offset.
+        // RMSNorm-input attention parent (all 16 Bonsai full-attention layers): GEMV and small-T
+        // route at decode and MTP-verify widths, the 128-token GEMM, and an unrotated parent
+        // without the unit offset.
         Ternary attention(14336, 5120, 79u);
         failures += attention_rmsnorm_case(attention, 3, false);
         attention.rotate(80u);
-        for (std::int32_t t : {1, 3, 8, 72}) failures += attention_rmsnorm_case(attention, t, true);
+        for (std::int32_t t : {1, 3, 8, 12, 72}) {
+            failures += attention_rmsnorm_case(attention, t, true);
+        }
     }
     {
         // Normalized SwiGLU MLP: both fused prologues (RMSNorm into gate/up, SwiGLU into down),
-        // unrotated and rotated, GEMV and 64-token GEMM widths.
+        // unrotated and rotated, GEMV, small-T (down K = 1024: two groups per warp) and 64-token
+        // GEMM widths.
         Ternary gate_up(2048, 1024, 111u), down(1024, 1024, 112u);
         failures += mlp_case(gate_up, down, 3, false);
         gate_up.rotate(113u);
         down.rotate(114u);
-        for (std::int32_t t : {1, 3, 65}) failures += mlp_case(gate_up, down, t, true);
+        for (std::int32_t t : {1, 3, 9, 65}) failures += mlp_case(gate_up, down, t, true);
     }
     {
-        // Bonsai MLP: gate/up [34816,5120], down [5120,17408], rotated.
+        // Bonsai MLP: gate/up [34816,5120], down [5120,17408], rotated; GEMV (T = 1, 3) and
+        // small-T route (T = 8, 16).
         Ternary gate_up(34816, 5120, 121u), down(5120, 17408, 122u);
         gate_up.rotate(123u);
         down.rotate(124u);
@@ -478,8 +500,11 @@ int main() {
         // Rotated weights: the projection rotates its primal input inside the quantization.
         Ternary rotated(448, 2048, 23u);
         rotated.rotate(24u);
-        for (std::int32_t t : {1, 3, 8, 65}) failures += linear_case(rotated, 0, 448, t, t == 3);
+        for (std::int32_t t : {1, 3, 8, 12, 32, 65}) {
+            failures += linear_case(rotated, 0, 448, t, t == 3);
+        }
         failures += linear_add_case(rotated, 3);
+        failures += linear_add_case(rotated, 18);
     }
     {
         // Embedding tables: first, last and repeated ids; plain and rotated.
