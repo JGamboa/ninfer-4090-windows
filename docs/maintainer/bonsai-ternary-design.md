@@ -1147,7 +1147,7 @@ Next steps, in order:
 3. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit with the
    cheaper t5 T = 4 round (0.86 of t2), or with an adaptive window.
 4. Prefill: recover the accepted t5 regression (pp512 -13 %) with a 64 x 128-token GEMM tile
-   (half the weight reads and decode per token). The tensor-core route for T = 5..8 is item 11.
+   (half the weight reads and decode per token). The tensor-core route for T = 5..8 is item 12.
 
    Profile, 2026-09-24, display 60 Hz: `nsys profile --trace=cuda,nvtx` of `ninfer_bench
    -p 512` on the t5 `bonsai2_27b_vl.ninfer` (`profiles/nsys/bonsai_t5_pp512`), four prefills:
@@ -1621,7 +1621,7 @@ Next steps, in order:
        MTP layer's ms per round against 1.32.
     4. Quick perplexity is unaffected (the MTP layer is draft-only); no need to rerun.
 
-11. Concurrent-lane MTP decode: small-T tensor-core route (implemented; compiled for sm_89 on
+12. Concurrent-lane MTP decode: small-T tensor-core route (implemented; compiled for sm_89 on
     Linux with CUDA 13, no GPU; not yet run on the RTX 4090).
 
     Diagnosis. A batched MTP round packs every lane's verify window into one column block:
