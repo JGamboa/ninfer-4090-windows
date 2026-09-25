@@ -285,7 +285,7 @@ but almost double the verification width (T = 7 to T = 13). On this prompt d6 is
 |---|---:|---:|---:|
 | **Drafter** (DFlash2 draft model, 5 layers at T = 13, proposal head, top-k, lattice selector) | **3.51** | **6.9** | |
 | of which Q8 draft-layer MLP and projections (`q8_ksplit_mma`, grids 2176 / 320 / 384) | 2.47 | | |
-| of which proposal head, 32768 rows (`q4_ksplit_mma`, grid 8192) + top-k merge | 0.64 | | 511 us |
+| of which proposal head (`q4_ksplit_mma`, grid 8192) + top-k merge | 0.64 | | 511 us |
 | of which conv prepare, context KV, sliding-window attention, norms | 0.40 | | |
 | **Target verification, T = 13** | **46.78** | **92.4** | |
 | mlp down 5120 x 17408, Q5 (`q5_rowsplit_gemm_simt_split2`) | 12.87 | 25.4 | 169 us x 64 |
@@ -313,5 +313,5 @@ routes are below the bandwidth roof. Estimates at ~4.5 bits per Q4 weight and ~5
 - The Q5 SIMT routes read down (~61 MB) and o_proj/out_proj (~22 MB) at ~340-360 GB/s.
 - The grouped mixed Q4/Q5 mma for in_proj and qkvg reads at ~230-290 GB/s.
 
-These three families, 4.3 G weight reads per round, are where a wider tensor-core small-T
-route would pay back. The GEMMs make up 88 % of the round.
+These three families are where a wider tensor-core small-T route would pay back. The GEMMs
+make up 88 % of the round.
