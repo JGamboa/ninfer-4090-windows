@@ -1984,6 +1984,23 @@ Next steps, in order:
         SM (registers and shared memory each allow one), nothing hides the barrier waits.
       - The spills cost little time (<= 1.8 % of samples) despite ~100 M executed spill
         instructions. In rk4v4-e8 only 25 % of their local loads hit L1.
+15. Configuration choices approved from HANDOFF.md section 8 (2026-09-25, build `1515b53`
+    code, RTX 4090 at 60 Hz).
+    - Bonsai MTP layer, Q4/Q5 mix against Q8. Q8 and the mix alternated twice (Q8, mix, Q8,
+      mix) on the six prompts: MTP 2, `--lm-head-draft`, greedy, 512 new tokens.
+
+      | Round | Q8 | Q4/Q5 mix |
+      |---|---|---|
+      | 1 | 180.0 tok/s, 11.90 ms per round, 2.145 tokens per round | 188.6 tok/s (+4.8 %), 11.44 ms, 2.175 |
+      | 2 | 180.2 tok/s, 11.93 ms, 2.145 | 186.5 tok/s (+3.5 %), 11.69 ms, 2.175 |
+
+      The mix wins both rounds with equal or better acceptance. Five of the six texts are
+      identical; the sixth is a greedy tie. It is adopted: `start-bonsai-server - ninfer.bat`
+      now serves `E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer` (backup
+      `.bak-20260925-mtpq4q5`). With the launcher's flags (rk4v4-e8, KV auto, 3 lanes,
+      Vision) it starts with 6.39 GiB of weights and 786432 KV tokens, and answers.
+    - Qwen3.8 launcher (MTP 3 with CUDA graphs against DFlash2 d6 without graphs): a tie at
+      steady state (108.9 against 108.7 tok/s), so it is not adopted; details in WINDOWS_PORT.md.
 
 ## Appendix: sources
 

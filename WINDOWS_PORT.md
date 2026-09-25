@@ -677,3 +677,36 @@ The gain is under 10 %, so the two-lane capacity search with graphs was not run.
 on, one lane reserves 480 MiB for DFlash2 (1152 MiB with three lanes, see above) and 86 MiB for MTP 3. For the three-lane
 DFlash2 launcher, that makes `--no-cuda-graph` a cheap way to keep 100000 tokens of KV:
 about 4 % of decode speed.
+
+### Launcher choice: MTP 3 with CUDA graphs against DFlash2 d6 without graphs (2026-09-25)
+
+Both configurations use the `start-ninfer-server.bat` flags: 3 lanes, 3 device state slots,
+`--max-context 100000 --kv-capacity 100000`, rk4v4-e8 KV and `--prefill-chunk 1408`.
+- **VRAM:** MTP 3 with graphs does not load the DFlash2 drafter (16.7 GiB of weights against
+  18.3). Its three-lane graph allowance is 258 MiB. It starts with 2227 MiB free, where the
+  current launcher leaves 435 MiB.
+- **Method:** the two configurations ran alternated twice. Each got seven single requests:
+  `scenario_code_python.json` plus the six prompts, thinking off, temperature 0, 512 tokens.
+  The aggregate is total tokens / total decode time from the response `timings`.
+
+| Round | DFlash2 d6, `--no-cuda-graph` (current .bat) | MTP 3, `--lm-head-draft`, graphs |
+|---|---|---|
+| 1 | 86.9 tok/s (first two requests 49.0 and 66.2: post-start warm-up) | 108.6 tok/s, 25.26 ms per round, 2.74 tokens per round |
+| 2 | 108.7 tok/s, 30.44 ms per round, 3.31 tokens per round | 108.9 tok/s, 25.19 ms, 2.74 |
+
+Per request in round 2, d6 against MTP 3 (tok/s):
+
+| Request | d6 | MTP 3 |
+|---|---|---|
+| code package | 112.6 | 126.8 |
+| lighthouse | 81.5 | 87.3 |
+| Python merge | 166.6 | 130.9 |
+| transformer | 116.9 | 112.6 |
+| Chile (es) | 79.8 | 89.6 |
+| energy tips | 94.8 | 100.6 |
+| train problem | 166.6 | 133.9 |
+
+The steady-state aggregate is a tie: d6 wins the two most predictable prompts by ~25 %, and
+MTP 3 wins the long code prompt and the prose by 5-12 %. Without graphs, d6's first requests
+after a start are slower. MTP 3 does not win both rounds, so the launcher keeps DFlash2 d6. MTP 3
+with graphs remains the option that frees ~1.8 GB of VRAM at equal steady speed.
