@@ -619,7 +619,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     pair_s[producer_half * Br + row0] = bm0;
                     pair_s[producer_half * Br + row1] = bm1;
                 }
-                asm volatile("bar.sync %0, %1;\n" : : "r"(1 + producer_tile), "r"(64) : "memory");
+                // Immediate barrier ids: a register id makes ptxas reserve all 16 hardware
+                // barriers for the CTA, which cut residency to one CTA per SM (measured).
+                if (producer_tile == 0) {
+                    asm volatile("bar.sync 1, 64;\n" : : : "memory");
+                } else if (producer_tile == 1) {
+                    asm volatile("bar.sync 2, 64;\n" : : : "memory");
+                } else {
+                    asm volatile("bar.sync 3, 64;\n" : : : "memory");
+                }
                 bm0 = fmaxf(bm0, pair_s[(producer_half ^ 1) * Br + row0]);
                 bm1 = fmaxf(bm1, pair_s[(producer_half ^ 1) * Br + row1]);
             }
