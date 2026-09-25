@@ -2285,6 +2285,15 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, storage, test_case, MappingPattern::Identity);
         }
 
+        if (geometry.q_heads == 24) {
+            // Deep windows past one resident wave of splits: whole-wave rounding and the
+            // two-wave cap (an MTP verification width at ~96K), and the 262144-key limit, where
+            // the cap must keep every split within its page-staging bound.
+            failures +=
+                run_a1_case(geometry, storage, {3, 98301, 98304, 405u}, MappingPattern::Fragmented);
+            failures += run_a1_case(geometry, storage, {1, 262143, 262144, 406u},
+                                    MappingPattern::Fragmented);
+        }
         if (geometry.q_heads == 16) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.

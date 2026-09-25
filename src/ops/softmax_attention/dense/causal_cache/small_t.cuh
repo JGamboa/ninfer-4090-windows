@@ -91,7 +91,7 @@ __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     constexpr int kMinSplits = 4 * Geometry::SmallTSplitScale;
     int splits               = div_up(window, target_keys_per_split);
     splits                   = splits > kMinSplits ? splits : kMinSplits;
-    return splits < Geometry::SmallTMaximumSplits ? splits : Geometry::SmallTMaximumSplits;
+    return causal_small_t_wave_splits<Geometry>(splits);
 }
 
 template <typename Geometry, bool Int8>
