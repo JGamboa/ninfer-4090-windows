@@ -523,6 +523,10 @@ int exercise_host_restore(const char* artifact) {
         ninfer::PromptInput input;
         input.messages.push_back(std::move(message));
         input.options.enable_thinking   = false;
+        // Pin the rewritten-history form: templates whose default preserves thinking (Qwen3.8)
+        // re-render the retained turn exactly, so the Device-resident endpoint would be selected
+        // instead of the Host-demoted TurnClosure this scenario restores.
+        input.options.preserve_thinking = false;
         input.context_cache.session_key = "host-restore-real";
         input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
         return input;
@@ -2731,6 +2735,8 @@ int main() {
         result = exercise_anthropic_prefix_regression(artifact);
     } else if (scenario == "shared-rewrite-materialization") {
         result = exercise_shared_rewrite_materialization(artifact);
+    } else if (scenario == "host-restore") {
+        result = exercise_host_restore(artifact);
     } else if (scenario == "pressure-resume") {
         result = exercise_pressure_partial_spill_and_resume(artifact);
     } else if (scenario == "private-checkpoint-pressure") {
