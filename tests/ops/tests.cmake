@@ -56,9 +56,13 @@ add_test(NAME ninfer_softmax_attention_nvfp4_test
 add_test(NAME ninfer_softmax_attention_k8v4_test
   COMMAND ninfer_softmax_attention_test --k8v4-only)
 
+add_test(NAME ninfer_softmax_attention_rk4v4_e8_test
+  COMMAND ninfer_softmax_attention_test --rk4v4-e8-only)
+
 set_tests_properties(
   ninfer_softmax_attention_nvfp4_test
   ninfer_softmax_attention_k8v4_test
+  ninfer_softmax_attention_rk4v4_e8_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_sliding_window_attention_test
