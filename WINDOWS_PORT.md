@@ -173,3 +173,84 @@ rises, and past a point the extra verification cost outweighs the extra accepted
 (dflash2 peaks at 12, then drops back down by 15). Requires the artifact to actually ship
 DFlash2 weights (adds ~1.6 GiB to the load); the server auto-detects and requires them
 when `--spec dflash2` is passed.
+
+## Qwen3.8 baseline on the Bonsai branch (2026-09-24)
+
+Measured on `feat/bonsai-ternary` at `15df903` with `E:\LLM\qwen3_8_27b.ninfer` (15.92 GiB of
+Q4/Q5 weights). The RTX 4090 also drives the desktop, set to 60 Hz; `ninfer-serve` was off.
+The desktop compositor still preempts the GPU: a few kernels run 2-30x long, so profiled
+averages sit slightly above the medians. These numbers are the baseline for prefill and
+decode work on this model.
+
+**Throughput** (`ninfer_bench --weights E:\LLM\qwen3_8_27b.ninfer -p 512,2048 -n 128 -r 3
+--kv-dtype int8`, no speculation):
+
+| Test | Result |
+|---|---:|
+| pp512 | 1821 tok/s |
+| pp2048 | 2035 tok/s |
+| tg128 | 47.0 tok/s (46.9 with the default bf16 KV) |
+
+tg128 reads ~16 GiB of weights per token, about 800 GB/s, which is ~80 % of the 4090's
+1008 GB/s.
+
+**Prefill profile** (`nsys profile --trace=cuda,nvtx` of `ninfer_bench -p 2048 -r 3
+--kv-dtype int8`, saved as `profiles/nsys/qwen38_pp2048`). pp2048 runs as two 1024-token
+chunks; each chunk takes 512 ms wall and 510 ms of kernels. Share of GPU time:
+
+| Kernel (route) | Shape (N x K) | Grid | Per call | Calls per chunk | Share |
+|---|---|---|---:|---:|---:|
+| `q4_linear_swiglu_mma_split_half_pair_kernel` (Q4 gate+up with SwiGLU) | 34816 x 5120 | 544 x 8 | 3.59 ms | 64 | 45.1 % |
+| `q5_rowsplit_gemm_mma_kernel` (Q5 `linear_add`: mlp down, attention o_proj and GDN out_proj) | 5120 x 17408 / 6144 | 80 x 8 | 1.50 / 0.55 ms (medians) | 64 + 64 | 30.3 % |
+| `rowsplit_grouped_mma_kernel` (mixed Q4/Q5 GDN in_proj) | 16384 x 5120 | 256 x 8 | 1.72 ms | 48 | 16.2 % |
+| `rowsplit_grouped_mma_kernel` (mixed Q4/Q5 attention qkvg) | 14336 x 5120 | 224 x 8 | 1.32 ms | 16 | 4.1 % |
+| GDN (`state_passing` 1.1 %, `prepare_wy_wu` 0.7 %, `output` 0.4 %, conv 0.4 %, gating GEMM 0.1 %, l2norm 0.1 %) | | | | | 2.2 % |
+| Attention (`causal_attention_prompt_i8_kernel`) | | | 0.28 ms | 16 | 0.9 % |
+| rmsnorm, sigmoid gate and other elementwise kernels | | | | | 0.6 % |
+| Last-token head (`q8_ksplit_mma`, once per prefill) and bookkeeping | | | | | 0.4 % |
+
+The GEMMs take 95.9 % of prefill time, all on bf16 `mma` with dequantization in shared
+memory. Their rates are 50-60 T MAC/s: gate+up 182.5 G MAC per chunk in 3.59 ms, down 91.3 G
+in 1.50 ms. For comparison, Bonsai's int8 t5 gate+up does 2048 tokens in 3.76 ms, about half
+the time per token.
+
+**Nsight Compute of one gate+up launch** (`ncu --set full` on the 21st
+`q4_linear_swiglu_mma_split_half_pair_kernel` launch of `ninfer_bench -p 2048 -r 1 --warmup 0
+--kv-dtype int8`, saved as `profiles/ncu/qwen38_q4_gateup_pp2048`). pp2048 launches this kernel
+with T = 1024, grid 544 x 8, 128 threads, `GemmCfg<64, 128, 64, 64, 32, 2, 1, 0, 1, 1>`.
+
+- Duration 3.31 ms at a locked 2.60 GHz SM clock.
+- Memory: DRAM throughput 24 %; L2 throughput 38 % with an 88.6 % hit rate; 747 MB read from
+  DRAM. The ~100 MB of Q4 weights are re-read once per 128-token tile, because they exceed
+  the 72 MB L2.
+- Compute: SM 32 %, tensor pipe (HMMA) active 32.5 % of cycles, LSU 30.9 %, ALU 20.1 %,
+  issue slots 22.9 % busy, 0.92 IPC.
+- Stalls: 8.67 warp cycles per issued instruction, made up of math-pipe throttle 4.43 (51 %),
+  wait 1.86, selected 1.00, short scoreboard 0.56, not selected 0.24, barrier 0.23, branch
+  0.12, MIO 0.11 and long scoreboard 0.03.
+- Occupancy: 16.7 % theoretical and achieved, i.e. 8 warps per SM from 2 CTAs of 4 warps.
+  **Shared memory limits it** (45.6 KB static plus 1 KB reserved per CTA, 2 CTAs per SM);
+  the 157 registers per thread would allow 3 CTAs.
+- No register spills and no local memory.
+- ncu also estimates smaller gains: global stores use 16 of 32 bytes per sector (up to
+  15 %), 9 % of global sectors and 8 % of shared wavefronts are excess (uncoalesced), and
+  there are 8.0 M shared bank conflicts, mostly on stores.
+
+The math-pipe throttle does not mean the kernel is compute-bound: the tensor pipe is busy
+only a third of the time. With two warps per scheduler, back-to-back HMMAs from the same warp
+wait on the pipe and no other warp can fill the gap. The levers, in order, are occupancy
+(less shared memory per CTA, or a third CTA), then the coalescing of the epilogue stores.
+
+**MTP decode, six prompts** (`ninfer.exe --prompt <p> --max-context 4096 --max-new 512
+--greedy --spec mtp --draft-tokens 3 --lm-head-draft`, thinking on by default, default bf16
+KV):
+
+| Prompt | tok/s | Acceptance | Tokens per round |
+|---|---:|---:|---:|
+| Lighthouse story | 81.0 | 37.3 % | 2.12 |
+| Python merge | 119.1 | 70.8 % | 3.12 |
+| Transformer explanation | 109.3 | 61.8 % | 2.85 |
+| Historia de Chile (Spanish) | 95.5 | 49.9 % | 2.49 |
+| Energy tips | 107.2 | 60.3 % | 2.81 |
+| Train problem | 127.2 | 78.4 % | 3.35 |
+| Mean | 106.6 | 59.8 % | 2.79 |
