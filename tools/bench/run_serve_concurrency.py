@@ -537,6 +537,31 @@ def load_server_events(path: Path, server_instance_id: str) -> list[dict[str, An
     return events
 
 
+def wait_for_throughput_flush(path: Path, server_instance_id: str, expected_requests: int) -> None:
+    """Wait until the periodic throughput events cover every completed request.
+
+    The stats reporter records the last partial interval on its next tick, or as a tail on a
+    graceful stop. `Popen.terminate()` is SIGTERM on POSIX but TerminateProcess on Windows, which
+    skips that tail, so the server is stopped only once the log already accounts for all tokens.
+    """
+    deadline = time.monotonic() + 3.0 * STATS_INTERVAL_MS / 1000.0 + 2.0
+    while True:
+        events = load_server_events(path, server_instance_id)
+        done = [event for event in events if event.get("event") == "request_done"]
+        throughput = [event for event in events if event.get("event") == "throughput"]
+        if len(done) >= expected_requests:
+            done_totals = sum_request_done(done)
+            runtime_totals = sum_throughput(throughput)
+            if (
+                runtime_totals["committed_decode_tokens"] >= done_totals["decode_tokens"]
+                and runtime_totals["computed_prefill_tokens"] >= done_totals["computed_prefill_tokens"]
+            ):
+                return
+        if time.monotonic() >= deadline:
+            return  # analyze_point reports the mismatch
+        time.sleep(0.1)
+
+
 def sum_request_done(events: Sequence[dict[str, Any]]) -> dict[str, int | float | None]:
     prompt_tokens = 0
     completion_tokens = 0
@@ -833,6 +858,7 @@ def run_point(
             corpus.write_summaries(rows, detail_dir)
         else:
             results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
+        wait_for_throughput_flush(server_log, server_instance_id, len(results))
 
     events = load_server_events(server_log, server_instance_id)
     report = analyze_point(
