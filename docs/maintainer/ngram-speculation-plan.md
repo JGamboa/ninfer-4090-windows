@@ -1,154 +1,27 @@
-# N-gram speculation: integration plan (temporary)
+# N-gram speculation: remaining phases (temporary)
 
-Status: active plan. Delete this file when the work is done or abandoned; stable contracts then move
-to [Engine architecture](engine-architecture.md), [Qwen3.5 model](qwen3_5-model.md),
-[ReplaySSM GDN](replayssm-gdn.md), `docs/cli.md` and `docs/serving.md`.
+Status: phase 1 is complete and its contracts live in their references. This file keeps only the
+optional phases and their decision gate; delete it when they are built or abandoned.
 
-Goal: draft-free n-gram drafts in the style of llama.cpp `ngram-mod` for coding-agent workloads
-(file rewrites, tool-call JSON, paths), chained with MTP, and a data-driven decision on verifying
-more than 16 tokens per round.
+## Phase 1 (done, 2026-09-25)
 
-## What exists (groundwork)
+`--ngram chain` extends each MTP round with host drafts in the style of llama.cpp `ngram-mod`, up
+to a verify window of 15. Where it is documented:
 
-- `tools/spec_sim/`: offline greedy replay of recorded sequences under `mtp`, `ngram-simple`,
-  `ngram-mod`, `select:*` and `chain:*` policies, with caps 15/32/64 and a stated round-cost
-  model. It is the decision tool for every phase below; see its README.
-- `src/models/qwen3_5/program/speculative/ngram_pool.h`: `NgramDraftPool`, a host-only,
-  allocation-bounded hash pool (one table allocated at construction, 4 bytes per entry; `observe`
-  and `propose` never allocate). Test: `tests/models/qwen3_5/test_ngram_pool.cpp`
-  (`ninfer_qwen3_5_ngram_pool_test`). It is not wired into the runtime.
-
-The pool maps `h(last n tokens)` to the latest continuation. Entries carry a 14-bit tag from the
-mixed hash (token ids use 18 bits, which covers the 248,077-id Qwen domain), so a slot collision is
-usually a miss instead of a wrong draft. The simulator implements the identical hash, slot, tag and
-encoding, and both tests pin the same vector, so simulated collisions are runtime collisions.
-
-## Which verify round takes an external draft
-
-| Backend | Draft source | Can take host drafts |
-|---|---|---|
-| MTP | host: `MtpDecodeIngress::current_drafts[C*V]` and `current_extents[C]` are filled from `SequenceState::mtp_drafts` by `ProgramImpl::decode_mtp_batch` (`program/decode.cpp`); the previous round's `MtpDecodeEgress::next_drafts` land there in `ProgramImpl::resolve_pending_raw` (`program/prefill.cpp`) | yes, unchanged data path |
-| DFlash, DFlash2 | device: the drafter writes `draft_tokens` inside the same graph (`execution/draft.cpp`); `DFlashDecodeIngress` has no draft field | no |
-
-The MTP round therefore already verifies externally supplied drafts. Its device body
-(`mtp_decode_batch_body` in `program/speculative/mtp.cpp`) is:
-
-1. `speculative_prepare_verify_inputs` builds `[W,B]` ids (round width `W <= V+1`) and positions from anchors,
-   `current_drafts` and `current_extents`;
-2. `target_verify_accept` (`program/speculative/target_verification.cpp`) runs
-   `TextContext::target_verify_batch` with GDN `RecordForReplay`, then
-   `speculative_accept_greedy_drafts` and selects the continuation hidden;
-3. `mtp_prepare_next_round` + `mtp_forward_decode_batch` align the MTP head on the accepted
-   columns and `mtp_propose_batch` produces the next round's k drafts into egress.
-
-Nothing in steps 1-3 depends on where the drafts came from. Step 3 conditions on the verified
-prefix, so MTP keeps proposing correctly after an n-gram round. Acceptance is lossless for any
-deterministic proposal: greedy rows accept the longest prefix equal to the target argmax, and
-stochastic rows accept draft `i` with probability `p_i(draft_i)`, which is exact rejection sampling
-for a one-hot proposal. N-gram drafts are one-hot.
-
-Before Phase 1 stage 1, one startup `draft_window` K set both the verify width `K+1` and the MTP
-autoregressive depth. Stage 1 (below) split them; the MTP depth limit stays 5.
-
-## Phase 1: pool drafts through the MTP round, verify window up to 15
-
-Progress, recorded in [Bonsai ternary design](bonsai-ternary-design.md) section 9.1:
-stage 1 (split `V` from `k`) is item 16; stage 2 (pool, `chain` policy, width policy, second graph
-width) is item 19; stage 3 (flags, logs, lossless test, CLI measurements) is item 20. Remaining for
-phase 1: measurement through `ninfer-serve` at the launchers' settings (three lanes, thinking, long
-contexts) before changing either launcher. Only `chain` is implemented; `select`
-below stays unbuilt unless measurement asks for it. A round widens to `V+1` only when some row's
-draft reaches `k + 3`.
-
-### Model/Program changes
-
-- Split the MTP window into verify window `V` (drafts per round, `1..15`) and MTP depth `k`
-  (`1..5`, the existing `--draft-tokens`). `RoundStateSpec::verify_window`, the MTP decode layout,
-  `MtpDecodeIngress::current_drafts`/`target_rope_positions` and
-  `MtpDecodeEgress::licensed_tokens` use `V`; `next_drafts` and the MTP prefill tensors keep `k`.
-  A round of width `W <= V+1` uses exact `[W,B]` views over the `V`-sized buffers. (Done.)
-- `mtp_prepare_next_round` takes the verify width `T = V+1` and the proposal depth `k`
-  (`1 <= k <= 5`, `k+1 <= T <= 16`) for `next_extents` and the AR position rows. Its oracle test
-  covers every `(V,k)`. (Done.)
-- `mtp_forward_decode_batch` admits alignment width up to 16. It uses the same attention/FFN Ops
-  as target verify, which already support `T<=16`, `B<=8`. (Done.)
-- ReplaySSM records (`planning/startup.cpp`, `GdnReplayRecordSpec::width`) are sized for `V+1`:
-  27.3 MiB per lane at `T=16` for the 27B geometry ([ReplaySSM GDN](replayssm-gdn.md) section 6),
-  218 MiB at eight lanes. (Done.)
-- Target KV for a round is mapped through `frontier + extent + 1`, which covers any `extent <= V`.
-  The MTP KV end (`frontier + extent + k`) and its page slack depend on `k`, not `V`, because the MTP
-  head covers the verified columns plus its `k-1` autoregressive steps.
-- `SpeculativeStats::accepted_per_position` has `V` positions; add drafted/accepted counters per
-  source (MTP, pool) so the product can report where accepted tokens came from.
-
-### Host policy, per lane and shared pool
-
-- `ProgramImpl` owns one `NgramDraftPool` (default 16 MiB) shared by all lanes of the Program.
-  Only the Engine worker mutates a Program, so the pool needs no synchronization. Programs share no
-  mutable state, so separate model instances would have separate pools.
-- Per-lane state is one cursor, `SequenceState::ngram_observed`: the ledger size already reported
-  to the pool. It resets to 0 where the lane resets (`storage/context.cpp`, session restore).
-  Before building ingress, `decode_mtp_batch` catches up with
-  `pool.observe(sequence.ledger, sequence.ngram_observed)`. One catch-up point covers every ledger
-  append path: prompt, forced tokens (`transactions/commit.cpp`), speculative commits and session
-  restore. The first call of a request hashes the whole prompt (about 1 ms for 100k tokens on the
-  host). If that shows up in TTFT, move the prompt observation between prefill submit and
-  synchronize, where the host is idle.
-- Draft choice per row (a pure host function with its own unit test), with `M` =
-  `sequence.mtp_drafts[0..mtp_draft_count)`:
-  - `chain`: `M`, then `pool.propose(ledger + M)` for up to `V - |M|` more tokens;
-  - `select`: `pool.propose(ledger)` when it is longer than `M` and at least `--ngram-min`,
-    otherwise `M`.
-  An extension shorter than `--ngram-min` is dropped. The extent is bounded by the budget and
-  context rules the round already applies (`max_by_budget`, `capacity - frontier - 1`).
-  `NgramDraftPool::propose` takes one contiguous context, so `chain` proposes from a small
-  per-Program scratch holding the last `n` ledger tokens followed by `M`. The same holds for any
-  prefix: only the last `n` tokens enter the hash.
-- Proposing runs after the previous round's synchronize and commit, where the host already
-  builds ingress, so it adds no synchronization. Cost is `O(n + V)` per row.
-
-### CUDA Graphs and ingress
-
-- Ingress needs no new transfer: `current_drafts` and `current_extents` already travel in the
-  single fixed-size `MtpDecodeIngress` copy at the top of the round body.
-- The graph width is fixed per captured executable. A round's width is the largest row extent
-  plus one, rounded up to a captured width. Capture two widths, `k+1` for MTP-only rounds and
-  `V+1` for rounds that carry a pool draft, so ordinary rounds keep today's cost. This doubles the
-  MTP graph set (`mtp_graph_profiles` in `planning/graph_profiles.cpp`, keyed by batch size and
-  frontier range) and the graph reservation (86 MiB for one-lane MTP 3 on the RTX 4090). The
-  simulator's width buckets measure whether more widths pay for their memory.
-- Causal-attention envelopes (`mtp_causal_attention_envelopes`) and the workspace plan
-  (`workspace_plan.mtp_round`) are computed for `V`.
-
-### Product, CLI and serving
-
-- `SpeculativeOptions` (`include/ninfer/types.h`) gains
-  `NgramOptions {mode: off|chain|select, max_drafts V, match_tokens n, min_drafts, pool_bytes}`.
-- CLI and `ninfer-serve` flags, validated in `product::validate_speculative_cli_options`
-  (`src/product/speculative_options.h`), parsed in `apps/cli/options.cpp` and
-  `src/serve/serve_options.cpp`:
-  `--ngram chain|select --ngram-max V --ngram-n N --ngram-min N --ngram-pool-mib M`.
-  Phase 1 requires `--spec mtp`, `V` in `[draft_tokens, 15]`.
-- Request log `server_start` (`src/serve/request_log.cpp`, schema version bump) records the
-  options; request records and `/metrics` add pool drafted/accepted totals. Update `docs/cli.md`,
-  `docs/serving.md` and the serve-options tests together.
-
-### Verification
-
-- Host: policy unit test; the existing pool test.
-- Ops: `mtp_prepare_next_round` oracle test at the new `(V,k)` domain.
-- Engine (real artifact, GPU box): greedy text with `--ngram chain` equals the text without it
-  (lossless check); stochastic runs keep their accept statistics; accepted-per-source counters add
-  up to the round totals.
-- Performance: MTP 3 single-lane `ms per round` for MTP-only rounds is unchanged; end-to-end
-  tok/s on recorded agent sessions against `--spec mtp --draft-tokens 3`.
-
-Effort: 4-6 days.
+- Behaviour and flags: [CLI](../cli.md#speculative-decoding), [HTTP serving](../serving.md) (flags,
+  request-log schema 22, `/metrics`).
+- Program ownership, round widths and graph families: [Engine architecture](engine-architecture.md)
+  section 8.
+- Record views per round width: [ReplaySSM GDN](replayssm-gdn.md) section 3.2.
+- Pool: `src/models/qwen3_5/program/speculative/ngram_pool.h`; chain and width policy:
+  `ngram_policy.h` next to it; simulator: `tools/spec_sim/`.
+- Validation and measurements: [Bonsai ternary design](bonsai-ternary-design.md) section 9.1,
+  items 16-20, and `WINDOWS_PORT.md` (Qwen3.8).
 
 ## Phase 1b (optional): `--spec ngram` without MTP
 
-A backend whose round is steps 1 and 2 only, for artifacts without MTP weights. It reuses the
-Phase 1 ingress and host policy with `M` empty. Effort: about 2 days after Phase 1.
+A backend whose round is target verify and accept only, for artifacts without MTP weights. It
+reuses the Phase 1 ingress and chain policy with an empty MTP proposal. Effort: about 2 days.
 
 ## Phase 2: verification wider than 16
 
@@ -234,7 +107,8 @@ sessions show a gain.
 1. Collect sessions (see `tools/spec_sim/README.md`; `--request-log-jsonl` has no token ids or
    text) and run the simulator with `--ngram-n 8,12,24 --caps 15,32,64` for `mtp`,
    `chain:ngram-mod` and `select:ngram-mod`, both `--wide-verify` models.
-2. Phase 1 goes ahead if `chain`/`select` at cap 15 beat `mtp` clearly.
+2. Phase 1 went ahead on the simulator's +28 % projection and is built; its measured gains are
+   in the design notes.
 3. Phase 2 goes ahead if cap 32/64 beat cap 15 for the same policy clearly, with a substantial
    `>15 tok` share.
 4. Rerun the simulator with measured Phase 1 round costs (`--cost-points`) before starting

@@ -5,11 +5,26 @@ natively on **Windows** (MSVC + CUDA, no WSL, no Docker) and on Linux. It runs t
 of the same architecture:
 
 - **[Prism ML Ternary Bonsai 2 27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)**
-  — Qwen3.8-27B compressed to ternary weights {−1, 0, +1}. This branch adds it: **~145–187
-  tok/s decode** (prompt-dependent) from a 6.6 GB artifact with image input. That is 1.9–2.4x the
-  decode speed of Prism's own llama.cpp fork on the same card, at the same perplexity.
-- **Qwen3.8-27B** (the official NInfer groupwise artifact), inherited from the upstream 4090
-  port: 148.6 tok/s code decode, 262K context. See [Qwen3.8-27B on the RTX 4090](#qwen38-27b-on-the-rtx-4090).
+  — Qwen3.8-27B compressed to ternary weights {−1, 0, +1}. This branch adds it: **~188 tok/s
+  decode** on six mixed prompts with MTP, from a 6.5 GB artifact with image input and the full
+  262K context. That is 1.9–2.4x the decode speed of Prism's own llama.cpp fork on the same card,
+  at the same perplexity. With the new [n-gram drafts](#n-gram-drafts-on-top-of-mtp) it decodes
+  **~530 tok/s** on edit-style agent prompts. Three concurrent requests reach **360 tok/s**
+  aggregate.
+- **Qwen3.8-27B** (the official NInfer groupwise artifact): 148.6 tok/s code decode with MTP,
+  up to 210.9 tok/s with DFlash2, and with MTP 3 + n-gram **289 tok/s** on edit-style prompts.
+  Contexts reach 262K. See [Qwen3.8-27B on the RTX 4090](#qwen38-27b-on-the-rtx-4090).
+
+What is new on this branch, in short:
+
+| Change | Effect (RTX 4090, measured) |
+|---|---|
+| Host **n-gram drafts** chained after MTP (`--ngram chain`) | Bonsai 250 → 532 tok/s, Qwen3.8 152 → 289 tok/s on edit-style prompts; prose unchanged |
+| **Concurrent-lane** tensor-core route for ternary weights | 3 lanes: 185 → 360 tok/s aggregate (1.95x) |
+| MTP layer in **Q4/Q5** instead of Q8 | +3.5–4.8 % decode, same acceptance |
+| **Long-context attention**: whole-wave splits, pipelined prompt kernel, packed-KV fixes | 128K prefill −6.5 to −8.1 %; exact needle retrieval to 128K on both KV modes |
+| Qwen3.8 **DFlash2 verification** routes (K-split tensor-core GEMMs) | MLP gate+up at 13 columns: 72 → 95 % of the card's measured read ceiling |
+| Context cache: publication-order and test fixes | every `prefix_real` scenario passes on both models |
 
 | | |
 |---|---|
@@ -30,19 +45,26 @@ Same machine for every row: RTX 4090 at stock clocks, Core i9-13900K, Windows 11
 
 | Measurement | NInfer (this branch) | Prism llama.cpp fork |
 |---|---:|---:|
-| Decode, short story (MTP) | **146 tok/s** | — |
-| Decode, Python code (MTP) | **187 tok/s** | — |
-| Decode, mean of six prompts (MTP) | **167 tok/s** | — |
+| Decode, mean of six mixed prompts (MTP 2, Q4/Q5 MTP layer) | **188 tok/s** | — |
+| Decode, prose (MTP 2) | **167 tok/s** | — |
+| Decode, edit-style agent prompts (MTP 2) | **250 tok/s** | — |
+| Decode, edit-style agent prompts (MTP 2 + n-gram) | **532 tok/s** | — |
+| Decode, 3 concurrent requests, aggregate (MTP 2) | **360 tok/s** | — |
 | Decode, no speculation (`tg128`) | **101 tok/s** | 77 tok/s |
 | Prefill (`pp512`) | **3,061 tok/s** | 1,363 tok/s |
 | Prefill (`pp2048`) | **3,349 tok/s** | — |
 | Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
 | Weights in VRAM, text only | 5.52 GiB | 5.53 GiB |
-| Weights in VRAM with the MTP head | ~6.5 GiB | — |
+| Weights in VRAM with the Q4/Q5 MTP head | 6.11 GiB (6.39 GiB with Vision) | — |
 | Vision tower | 22 ms per image | via `--mmproj` |
 
-- The decode rows depend on the text: MTP drafts are accepted more often in predictable output
-  (code, math: 176–187 tok/s) than in free prose (145–146 tok/s).
+- The decode rows depend on the text: drafts are accepted more often in predictable output.
+  Edit-style prompts (return a file, a JSON list or a document with a small change) restate
+  their input, so MTP fills nearly every round and the n-gram pool copies whole spans. The
+  six-prompt mean is from the Q4/Q5 MTP-layer comparison; the prose, edit-style and n-gram rows
+  are from the n-gram measurement (`--no-thinking`, rk4v4-e8 KV). The concurrent row uses int8
+  KV and short prompts ([design notes](docs/maintainer/bonsai-ternary-design.md) section 9.1,
+  items 14, 15 and 20).
 - Perplexity: wikitext and code are the two corpora where both tools score comparable text.
   NInfer's quick run over four corpora gives an overall 5.8556 (Qwen3.8-27B Q4/Q5: 4.80).
 - The fork's prefill figure uses the PTQ1_0 packing; Prism's model card says its PQ2_0 packing
@@ -70,8 +92,45 @@ three reasons:
 3. **Prefill in large tiles.** The int8 tensor-core GEMM decodes each weight tile once per 128
    tokens and loads its operands with `ldmatrix`.
 
-The costs: about 1 GB of VRAM for the MTP head, and an MTP head that was trained for Qwen3.8, not
-for Bonsai, so acceptance varies with the content.
+The costs: about 0.6 GB of VRAM for the Q4/Q5 MTP head, and an MTP head that was trained for
+Qwen3.8, not for Bonsai, so acceptance varies with the content.
+
+### N-gram drafts on top of MTP
+
+`--ngram chain` (with `--spec mtp`) adds draft-free speculation in the style of llama.cpp's
+`ngram-mod`. A 16 MiB host pool maps the hash of the last 8 tokens to the token that last
+followed them. Each round, the MTP proposal is extended with the pool's continuation, up to 15
+drafts. The model verifies the whole chain in one pass, so a round can accept 10 or more tokens
+when the output repeats text already in the context: code being edited, JSON, tool calls, file
+paths, documents rewritten with small changes. Rounds with nothing to copy keep the MTP width
+and its cost.
+
+Measured on the RTX 4090 at 60 Hz, KV rk4v4-e8, decode tok/s:
+
+| Workload | Bonsai MTP 2 | Bonsai MTP 2 + n-gram | Qwen3.8 MTP 3 | Qwen3.8 MTP 3 + n-gram | Qwen3.8 DFlash2 d6 |
+|---|---:|---:|---:|---:|---:|
+| CLI, edit-style prompts, thinking off | 250 | **532** | 152 | **289** | 215 |
+| CLI, prose, thinking off | 167 | 167 | 97 | 97 | 96 |
+| Server, edit-style prompts, thinking on | 212 | **319** | — | 165 | 169 |
+| Server, edit of a 7K–11K-token file, thinking on | 215 | **378** | — | **258** | 139 |
+
+- CLI rows: one request, greedy, up to 1024 tokens. Server rows: `ninfer-serve` with each
+  launcher's flags (3 lanes, sampling and thinking defaults), one request at a time.
+- With thinking on, much of the output is free reasoning that the pool cannot draft, so short
+  agent prompts gain less. Long-context edits gain the most.
+- Greedy output is unchanged up to floating-point ties. With BF16 KV the n-gram rounds add no
+  divergence over MTP alone (`ninfer_qwen3_5_ngram_lossless_real_test`). Prefill is unchanged.
+- The wide round needs a second set of CUDA graphs. At the Bonsai launcher's settings it costs
+  about 20K of 786K auto-sized KV tokens (−2.5 %).
+
+```bat
+build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --spec mtp --draft-tokens 2 ^
+  --lm-head-draft --ngram chain --vision --max-context 262144 --kv-capacity auto --kv-dtype rk4v4-e8
+```
+
+[docs/cli.md](docs/cli.md#speculative-decoding) lists the `--ngram-*` options. The design,
+validation and every measurement are in the
+[design notes](docs/maintainer/bonsai-ternary-design.md), section 9.1, items 16–20.
 
 ### Quick start (Windows)
 
@@ -105,26 +164,33 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 python -m tools.convert.bonsai_base --gguf E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
   --reference E:\LLM\qwen3_8_27b.ninfer ^
   --mmproj E:\LLM\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf --out E:\LLM\bonsai2-27b-vl
-python -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe bonsai2_27b ^
+python -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe bonsai2_27b_mtp_q4q5 ^
   --components text,vision,mtp --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
   --source mmproj=E:\LLM\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf ^
   --source mtp=E:\LLM\qwen3_8_27b.ninfer --proposal --name bonsai2-27b ^
-  --out E:\LLM\bonsai2_27b_vl.ninfer --device cuda
+  --out E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --device cuda
 ```
 
-Leave out `--mmproj`, `vision` and `--source mmproj=...` for a text-only artifact. The
+`bonsai2_27b_mtp_q4q5` stores the MTP layer in Q4/Q5 (3.5–4.8 % faster decode than the Q8
+layer of `bonsai2_27b`, with the same acceptance). Leave out `--mmproj`, `vision` and
+`--source mmproj=...` for a text-only artifact. The
 [conversion guide](docs/maintainer/bonsai-ternary-conversion.md) lists every tensor mapping
 and a mapping check you can run before converting.
 
 **4. Run.**
 
 ```bat
-build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl.ninfer --prompt "Write a short story about a lighthouse keeper." ^
+build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --prompt "Write a short story about a lighthouse keeper." ^
   --max-context 4096 --max-new 512 --greedy --spec mtp --draft-tokens 2 --lm-head-draft
 
-build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl.ninfer --host 127.0.0.1 --port 8080 ^
-  --max-context 32768 --spec mtp --draft-tokens 2 --lm-head-draft --vision
+build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --host 127.0.0.1 --port 8080 ^
+  --max-context 262144 --kv-capacity auto --kv-dtype rk4v4-e8 --max-concurrency 3 ^
+  --spec mtp --draft-tokens 2 --lm-head-draft --ngram chain --vision
 ```
+
+The server line is the local launcher's configuration: the full 262K context per request, a
+shared KV pool sized automatically (about 767K tokens with n-gram drafts), three lanes and
+n-gram drafts.
 
 While the server runs, open `http://localhost:8080/monitor` in a browser for a live view of
 decode and prefill speed, MTP acceptance, prefix-cache reuse, KV occupancy, slots and recent
@@ -154,14 +220,25 @@ slower on prose (about −10 %); 2 is the better default. `ninfer.exe --help` an
 - **Runtime**: every ternary weight carries its Hadamard sign vector, so the model code passes
   ordinary activations. The loader checks that the artifact's rotation metadata matches the
   formats it binds.
+- **Concurrent lanes**: a small-T tensor-core route (`m16n8k32` int8 MMA on 8-token tiles)
+  replaces the 64-token prefill GEMM for 5–32 verify columns. Two lanes decode 1.51x and three
+  lanes 1.95x the old aggregate, with single-lane speed unchanged.
+- **MTP layer in Q4/Q5** (`bonsai2_27b_mtp_q4q5`): 11.44 against 11.95 ms per MTP round, same
+  acceptance.
+- **Long context**: decode attention splits sized for whole waves, a warp-pair QK split for
+  packed KV, and a pipelined int8 prompt-attention kernel (−19 to −22 % per chunk from 8K to
+  128K). Needle-in-a-haystack answers are exact at 8K, 64K and 128K with int8 and rk4v4-e8 KV.
+- **N-gram drafts**: the MTP verify window (up to 15 drafts) is split from the MTP depth, a host
+  pool and chain policy supply the extra drafts, and each round width has its own CUDA graphs
+  and ReplaySSM record view ([above](#n-gram-drafts-on-top-of-mtp)).
 
 The design, every measurement and the reasoning behind each decision are in the
 [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md) (section 9).
 
 ### Limits
 
-- Bonsai is measured at up to 4K context on this branch; longer contexts use the same
-  attention and KV code as Qwen3.8 but were not re-measured with Bonsai.
+- Long-context decode slows with depth, as for Qwen3.8: at 128K a round costs 18.5–20.8 ms
+  against 12.8 ms at short context, all of the difference in attention.
 - DFlash2 with the full ternary output head is not supported. Use MTP.
 - Converting requires the Qwen3.8-27B `.ninfer` artifact (tokenizer, configuration, MTP head).
 - The rest of the engine's limits apply: one process, one GPU, one resident model.
@@ -224,6 +301,23 @@ For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF 
 46 tok/s in a 144K-context configuration where the MTP buffers do not fit. The upstream engine
 on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400 W power cap
 (the upstream README quotes about 200), so this card lands within 14% of it under MTP.
+
+#### On this Windows build
+
+Measured on this branch with the same RTX 4090 (display at 60 Hz):
+
+| Configuration | Result |
+|---|---|
+| DFlash2, draft 12, code prompt, thinking off | **210.9 tok/s** decode (draft sweep in [WINDOWS_PORT.md](WINDOWS_PORT.md)) |
+| MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** (DFlash2 d6: 215, MTP 3: 152) |
+| MTP 3 + n-gram through `ninfer-serve`, 7K–11K-token file edits, thinking on | **258 tok/s** (DFlash2 d6: 139) |
+| Prose, thinking on, through `ninfer-serve` | DFlash2 d6 99 tok/s, MTP 3 + n-gram 85 |
+| Quality, 45 deterministic tasks (`tools/eval`) | Qwen3.8 44/45, Ternary Bonsai 43/45 |
+
+The local launchers now run MTP 3 + n-gram with CUDA graphs: it wins on code editing with long
+contexts, and without the DFlash2 drafter it loads 16.7 GiB of weights instead of 18.3 GiB. At
+131K context and three lanes it starts with 1.7 GB of VRAM free. DFlash2 remains the better
+choice for free-form prose.
 
 #### Depth sweep against llama.cpp
 
@@ -581,8 +675,9 @@ Python tools run independently of CMake; the standalone HBM probe has its own
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
   accurate at its onset (about 1e-5 relative).
-- `--max-concurrency 2` is measured on the 4090 (see Quick start); higher lane counts are
-  untested here, and the published cohort results in the
+- Up to three lanes are measured on the 4090: `--max-concurrency 2` for Qwen3.8 (see Quick
+  start), and three lanes for both models through the local launchers and the Bonsai lane
+  benchmark. Higher lane counts are untested here, and the published cohort results in the
   [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
 - Prefill is strictly serialized across lanes with no chunk-level interleaving, and decode
   starves while any prefill runs: a short request submitted behind a 31k-token cold prefill

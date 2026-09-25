@@ -528,6 +528,14 @@ ResourceManager 与完成所有 request response。内部不变量错误不能�
 - ordinary decode 不运行 catalog scan、pressure search 或后台 replica scan；
 - workspace 是 Program 启动时统一规划的 backing，Vision、Text 和 speculative schedule 按互斥 lifetime
   使用其内部区域。
+- MTP 的 verify window `V`（每轮最多 `V` 个 draft，`V <= 15`）与 MTP 提议深度 `K` 分离。没有 n-gram
+  draft 时 `V = K`；启用 `--ngram chain` 时 `V = max_drafts`，每轮在 `K+1` 与 `V+1` 两种宽度之间选择
+  （某行可用 draft 达到 `K+3` 才用 `V+1`）。每种宽度拥有独立的 CUDA Graph family 与 ReplaySSM record
+  视图，交替的轮次不会更新彼此的 executable；宽轮 profile 的 topology class 来自 attention Op 的
+  `causal_softmax_attention_topology_class`。
+- n-gram draft pool 属于 Program，由同一 Program 的所有 lane 共享，只在 Engine worker 中修改；每个
+  sequence 只保存已报告给 pool 的 ledger 前缀长度，并在请求重新绑定 ledger、retire 和 session restore
+  时归零。pool 只影响 draft 内容，不改变 verify、accept 或提交语义。
 
 容量查询消费与执行同源的逐层参数和 Use。Allocation scope 同时用于布局计算与实际执行；
 顺序互斥的 scratch 取峰值，跨阶段仍活跃的数据计入完整存活期。Vision handoff 保留至 Text

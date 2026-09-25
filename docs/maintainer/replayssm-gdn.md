@@ -251,6 +251,11 @@ for t = 1 .. T:
 这里的 \(S_{verify}\) 是生成当前 window outputs 所需的 transient trajectory。Verify 结束后，它不作为
 committed state 发布；持久 checkpoint \(S_0\) 保持不变。
 
+Record planes 按最宽的 verify 宽度分配。record Op 与 fold 要求 record 宽度等于本轮宽度，因此较窄的
+轮次（例如 MTP 与 n-gram draft 并用时的 `K+1` 轮）通过 `GdnReplayRecords::narrowed(width)` 在同一
+planes 上取得紧凑视图，并使用与该视图绑定的 fold plan。同一轮的 record 与 fold 始终使用同一宽度；
+planes 不跨轮保存状态。
+
 ### 3.3 Fold：只重放 accepted prefix
 
 最终 \(m\) 已知后，fold 从同一 \(S_0\) 出发：
