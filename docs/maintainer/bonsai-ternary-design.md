@@ -1813,6 +1813,44 @@ Next steps, in order:
       With immediate barrier IDs, two CTAs per SM are resident again. The warp-pair split
       now keeps its lower barrier stall, and the kernel is 4.6 % faster than `b14ed06`, the
       best measured until now. The split stays; no revert.
+    - Concurrent lanes (`ae421af`, item 13):
+      - `ninfer_t5_bench 1 2 3 4 6 8 9 12 16 24 32`, old and new binaries alternated twice
+        (old, new, old, new), mean of two runs, us per call, rotated route (production),
+        old -> new:
+
+        | Shape | T = 6 | T = 8 | T = 9 | T = 12 | T = 16 | T = 24 | T = 32 |
+        |---|---|---|---|---|---|---|---|
+        | gdn in_proj 16384 x 5120 | 48.5 -> 27.3 | 52.0 -> 27.4 | 52.5 -> 29.0 | 54.7 -> 29.6 | 56.5 -> 29.2 | 60.9 -> 37.2 | 62.0 -> 43.5 |
+        | attn qkvg 14336 x 5120 | 46.0 -> 25.5 | 48.8 -> 26.8 | 52.0 -> 27.2 | 52.4 -> 27.9 | 52.7 -> 27.8 | 57.2 -> 35.2 | 61.9 -> 41.1 |
+        | mlp gate+up 34816 x 5120 | 102.3 -> 49.5 | 113.0 -> 49.4 | 132.2 -> 53.4 | 121.3 -> 55.9 | 139.6 -> 58.2 | 140.5 -> 64.6 | 133.9 -> 81.2 |
+        | mlp down 5120 x 17408 | 67.0 -> 36.6 | 70.8 -> 37.0 | 138.6 -> 38.3 | 138.7 -> 39.5 | 136.4 -> 40.6 | 140.1 -> 45.5 | 141.4 -> 53.1 |
+        | o_proj/out 5120 x 6144 | 29.5 -> 16.4 | 31.6 -> 15.9 | 46.2 -> 16.9 | 46.5 -> 17.1 | 46.6 -> 17.8 | 47.5 -> 19.6 | 47.9 -> 22.1 |
+
+        That is -30 to -72 % for T = 6..32. T = 1..4 keep the GEMV route
+        (`t5_project.cu`, `launch_gemv<1..4>`):
+        - T = 1..3 are unchanged within noise. One new o_proj run read +18-30 % at
+          T = 1..3; the other new run matched the old binary (13-14 us).
+        - T = 4 is faster in both runs: mlp down 33.0 -> 29.2 us (-11 %), gate+up -3 %,
+          gdn in_proj -4 %, qkvg -5 %, and o_proj about -20 % (noisy).
+      - `tools/bench/run_serve_concurrency.py --mode mtp2 --sampling greedy --suite
+        decode-saturation --concurrency 1 2 3 --kv-capacity auto` (int8 KV, `--lm-head-draft`,
+        8192 output tokens per request). The first run failed with both binaries (`error:
+        throughput and request_done decode token totals differ`, 8083 against 8192 tokens).
+        `Popen.terminate()` is TerminateProcess on Windows, which stops `ninfer-serve` before
+        it writes its last partial throughput interval. `fad94bb` makes the script wait until
+        the log covers the completed requests. Old (`build_19d7567`) and new, back to back
+        (`profiles/bench/bonsai_lanes_{after2,before2_19d7567}`); ms per round is steady
+        seconds / steady decode rounds:
+
+        | Lanes | Old: aggregate tok/s, ms per round | New: aggregate tok/s, ms per round |
+        |---|---|---|
+        | 1 | 156.8, 12.13 | 157.8, 12.06 |
+        | 2 | 173.3, 22.06 | **261.5, 14.54** (1.51x) |
+        | 3 | 184.7, 30.99 | **359.8, 16.13** (1.95x) |
+
+        The three-lane aggregate doubles; the estimate was ~2x. One lane is unchanged. These
+        use int8 KV and short prompts, so they are not comparable with the 143.6 / 166.9 tok/s
+        of item 7 (rk4v4-e8, ~40K prompts).
 
 ## Appendix: sources
 
