@@ -1519,6 +1519,65 @@ Next steps, in order:
 
    The saving is smaller than the round's run-to-run noise, so no clean A/B against a
    pre-`c1eb910` build was run.
+10. rk4v4-e8 attention fix and `cp.async` staging (`787766f` + `b14ed06`, validated 2026-09-25
+    at HEAD `b14ed06`, RTX 4090 at 60 Hz, server off). The two commits:
+    - `787766f` undoes the rotated-V transform in FP32 before the only BF16 rounding, in the
+      small-T reduce and in the prompt i8 epilogue, and removes
+      `kv_cache_inverse_rotate_output_kernel`;
+    - `b14ed06` stages the packed KV codes with `cp.async` in `small_t_i8.cuh`.
+
+    Only `b14ed06` as a whole was built; `787766f` alone was not measured.
+    - Correctness:
+      - `ninfer_softmax_attention_test --rk4v4-e8-only` now passes (172 s,
+        `PASS causal_softmax_attention rk4v4-e8 independent correctness`). The 46
+        `reduction criterion` misses of item 8 are gone; the quality line is unchanged
+        (`mae=0.0060044 rmse=0.00758123 rel_rmse=0.102081 max_abs=0.0284158`).
+      - The full `ninfer_softmax_attention_test` passes (307 s; causal public contract,
+        packed and context, so BF16, int8, fp8 and the other modes on the shared reduce).
+      - `ninfer_kv_cache_append_test` passes.
+      - Bonsai with int8 KV (MTP 2, lighthouse prompt, greedy) keeps its text md5
+        (0D1A35CC).
+      - Qwen3.8 with rk4v4-e8 changes text at 128K (3BAB25A3 -> 52C2C61D), as expected with
+        one rounding fewer.
+    - Nsight Compute on the same launch as item 8 (Bonsai, `long_niah_128k`, rk4v4-e8, MTP 2,
+      `--launch-skip 200`, `profiles/ncu/attn_rk4v4_128k_cpasync`), item 8 -> now:
+
+      | Per launch | Item 8 | Now |
+      |---|---|---|
+      | Duration | 284.2 us | 260.4 us (-8.4 %) |
+      | DRAM | 142.4 MB at 500.9 GB/s, 61.6 % | 141.7 MB at 544.2 GB/s, 66.8 % |
+      | `cp.async` (LDGSTS) instructions | 32.5 K | 553.0 K |
+      | Issued instructions | 130.9 M | 124.9 M |
+      | Warp cycles per issued instruction | 10.52 | 10.44 |
+      | Barrier stall | 2.61 | 3.17 |
+      | Long-scoreboard stall | 2.06 | 1.34 |
+      | Wait stall | 1.55 | 1.51 |
+      | Occupancy | 2 blocks per SM (128 registers, 43.65 KB static shared memory), 15.1 warps active | unchanged, 15.2 warps active |
+
+      The codes now arrive with `cp.async`, and the long-scoreboard stall falls by a third.
+      The barrier is now 30 % of the cycles: warps wait at the tile's `__syncthreads` for the
+      staged codes and the decode. The kernel stays latency bound at 67 % of DRAM peak. The
+      ~180 us estimate of item 8 assumed the load would overlap with the previous tile's
+      decode and MMAs; a per-tile wait does not give that overlap.
+    - Qwen3.8 decode at 128K (`long_niah_128k`, 130084 prompt tokens, reasoning on, rk4v4-e8,
+      `--max-context 132096 --max-new 256 --greedy --lm-head-draft`; nsys,
+      `profiles/nsys/qwen38_rk4_128k_{mtp3,d12}_{before,after}`), per round:
+
+      | | MTP 3 before -> after | DFlash2 d12 before -> after |
+      |---|---|---|
+      | `causal_attention_small_t_i8_tiled_kernel` per call | 271.7 -> 248.4 us (-8.6 %) | 314.3 -> 287.9 us (-8.4 %) |
+      | Attention calls per round | 19 | 32 |
+      | Attention ms per round | 5.63 -> 5.24 | 10.69 -> 9.81 |
+      | `kv_cache_inverse_rotate_output_kernel` | 19 launches, 0.026 ms -> gone | 32 launches, 0.070 ms -> gone |
+      | Launches per round | 794 -> 775 | 856 -> 824 |
+      | Wall per round | 32.07 -> 32.24 ms | 43.56 -> 43.35 ms |
+      | Plain run | 114.3 -> 107.1 tok/s, 3.31 -> 3.39 tokens per round | 127.4 -> 123.7 tok/s, 5.43 -> 5.30 |
+
+      The attention saving (-0.42 ms per round for MTP 3, -0.95 ms for d12) does not show in
+      the round. Between the two runs the untouched Q4/Q5/Q8 GEMMs ran 2-5 % slower: MTP 3
+      +0.54 ms and d12 +1.08 ms per round (`q5_ksplit_mma` +0.69 ms at d12, for example).
+      That is clock and thermal drift between runs at 60 Hz, larger than the saving. The
+      plain-run tok/s differ in text as well as time and are not a speed comparison.
 
 ## Appendix: sources
 
