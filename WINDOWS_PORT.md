@@ -432,3 +432,63 @@ scripts, desktop at 60 Hz and server off.
 
 Across the three commits, the d12 round on this prompt went from 51.4 to 37.7 ms (-27 %),
 and d12 decode from 78.7 to 116.5 tok/s.
+
+### K-split qkvg (`cccaace`, 2026-09-25)
+
+`cccaace` moves the mixed Q4/Q5 attention input projection (qkvg, 14336 x 5120) to separate
+K-split MMA sides up to T = 16, as `58b5683` did for the GDN in_proj. The Q4 side is 7168
+rows (`q4_ksplit_mma`, grid 448); the Q5 side is 7168 rows (`q5_ksplit_mma`, grid 448). They
+replace `rowsplit_grouped_mma`, the last grouped route in the DFlash2 band. Validated against
+the `fa5dad0` build with the same method.
+
+- `ninfer_attn_input_proj_test` passes (`OK attn_input_proj`, 25 s). It covers T = 1..128
+  and graph replay at 12, 13, 16 and 17.
+- `ninfer_attn_input_proj_bench --format q4q5 --cache cold --execution graph --repeat 100`,
+  median us (bench-reported GB/s), `fa5dad0` -> `cccaace`:
+
+  | T | 1 | 6 | 7 | 12 | 13 | 16 | 17 |
+  |---|---|---|---|---|---|---|---|
+  | qkvg | 72.7 -> 72.7 | 114.7 -> 114.7 | 85.0 -> 86.0 | 123.9 -> 97.3 (356 -> 453) | 195.6 -> 90.1 (225 -> 489) | 195.6 -> 103.4 (226 -> 427) | 196.6 -> 197.6 |
+
+  A pre-existing cliff shows up next to the band: T = 6 (114.7 us) is slower than T = 7
+  (85.0 us). It matters for MTP 5 (T = 6) and for DFlash2 d5.
+- DFlash2 on the profile prompt, per-round time against `fa5dad0`:
+
+  | Draft | ms per round | tok/s | Acceptance | Text |
+  |---|---|---|---|---|
+  | d6 | 29.6 -> 29.6 | 129.3 -> 126.8 | 46.5 % | identical |
+  | d12 | 36.4 -> 35.5 | 116.5 -> 119.7 | 27.1 % | identical |
+  | d15 | 37.6 -> 37.1 | 108.7 -> 111.0 | 20.9 -> 21.1 % | changes (a tie; now `a29aed7`'s d12 text) |
+  | Qwen3.8 MTP 3 | 25.3 -> 25.9 | 128.5 -> 124.6 | 74.6 % | identical (md5) |
+  | Bonsai MTP 2 | 11.8 -> 12.2 | 154.6 -> 149.6 | 42.4 % | identical (md5) |
+
+  The MTP rows and d6 use none of the changed routes. Their ±0.5 ms is the run-to-run noise
+  of these 3-5 s decodes at 60 Hz.
+- d12 round (`profiles/nsys/qwen38_dflash2_d12_qkvg16`), per round:
+  - wall 37.7 -> 36.0 ms; verification 33.3 -> 31.4 ms.
+  - 798 launches (+16: the two qkvg sides).
+  - qkvg 3.23 -> 1.34 ms: 179 -> ~76 us per layer (Q4 side 33.8 + Q5 side 41.7 us),
+    ~577 GB/s.
+
+  Across the four commits the d12 round went from 51.4 to 36.0 ms (-30 %).
+
+K-split MMA instances in the d12 round. Medians over 121 rounds. Bytes are the stored
+weights: Q4_G64 34 bytes and Q5_G64 42 bytes per 64 weights. Activations and outputs are
+under 0.2 MB and are ignored.
+
+| Instance | Kernel, grid | Rows x K | MB | Calls per round | Median us | GB/s |
+|---|---|---|---:|---:|---:|---:|
+| mlp gate+up (verify) | `q4_ksplit_mma`, 2176 | 34816 x 5120 | 94.7 | 64 | 155.7 | 608 |
+| GDN in_proj Q4 side (verify) | `q4_ksplit_mma`, 256 | 4096 x 5120 | 11.1 | 48 | 20.9 | 532 |
+| attn qkvg Q4 side (verify) | `q4_ksplit_mma`, 448 | 7168 x 5120 | 19.5 | 16 | 33.8 | 576 |
+| DFlash2 proposal head (drafter) | `q4_ksplit_mma`, 8192 | 131072 x 5120 | 356.5 | 1 | 518.8 | 687 |
+| GDN in_proj Q5 side (verify) | `q5_ksplit_mma`, 768 | 12288 x 5120 | 41.3 | 48 | 60.9 | 678 |
+| attn qkvg Q5 side (verify) | `q5_ksplit_mma`, 448 | 7168 x 5120 | 24.1 | 16 | 41.7 | 577 |
+| mlp down (verify) | `q5_ksplit_mma`, 320 | 5120 x 17408 | 58.5 | 64 | 102.8 | 569 |
+| o_proj/out_proj (verify) | `q5_ksplit_mma`, 320 | 5120 x 6144 | 20.6 | 64 | 38.2 | 540 |
+
+With the exact byte counts, gate+up reaches 608 GB/s, not the ~650 estimated above at
+4.5 bits per weight. The largest instances reach ~680-690 GB/s (proposal head, GDN Q5 side),
+so gate+up (11.4 ms per round, a third of the verification) is ~12 % below what the same
+kernel family already reaches. The small sides (GDN Q4 at 21 us, o_proj at 38 us) pay a
+fixed launch-and-tail cost for their size.
