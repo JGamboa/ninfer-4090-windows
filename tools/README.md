@@ -22,6 +22,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
 | Compare task-level answer quality of served models | [`eval/`](eval/README.md) |
+| Simulate n-gram/MTP speculative decoding on recorded sequences | [`spec_sim/`](spec_sim/README.md) |
 
 ## Standalone HBM probe
 

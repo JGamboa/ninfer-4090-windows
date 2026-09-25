@@ -15,6 +15,10 @@ ninfer_add_test(ninfer_qwen3_5_frontend_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+# Host-only: the n-gram draft pool is header-only and links no library.
+ninfer_add_test(ninfer_qwen3_5_ngram_pool_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_pool.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
