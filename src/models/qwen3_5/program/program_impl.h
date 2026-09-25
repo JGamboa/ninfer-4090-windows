@@ -610,6 +610,13 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // MTP with n-gram drafts: the same record planes at the MTP width K+1, for rounds that do not
+    // widen to V+1. A round records and folds through the view of its own width.
+    std::optional<GdnReplayRecords> narrow_replay_records;
+    std::optional<ops::GdnReplayFoldPlan> narrow_replay_fold;
+
+    [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t width) const;
+    [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t width) const;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;

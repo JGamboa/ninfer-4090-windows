@@ -67,7 +67,16 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
     const auto install_and_upload = [&](DecodeGraphTopology& topology, std::size_t profile_index) {
         DecodeGraphProfile& profile = family.profiles[profile_index];
         if (topology.installed_profile != profile_index) {
-            topology.executable.update(profile.definition);
+            try {
+                topology.executable.update(profile.definition);
+            } catch (const std::exception& error) {
+                throw std::runtime_error(
+                    std::string(label) + " CUDA Graph profile B=" +
+                    std::to_string(profile.batch_size) + " E=[" +
+                    std::to_string(profile.min_execution_frontier) + "," +
+                    std::to_string(profile.max_execution_frontier) + "] does not share topology " +
+                    std::to_string(profile.topology_class) + ": " + error.what());
+            }
             topology.installed_profile = profile_index;
         }
         topology.executable.upload(device.stream);
@@ -348,6 +357,7 @@ void ProgramImpl::prepare_graphs() {
                                              *mtp_host_egress,
                                              state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = planned_profiles.front();
+        mtp_state.execution.replay_records = round_replay_records(draft_window + 1U);
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         execution::mtp_decode_batch(
@@ -359,9 +369,17 @@ void ProgramImpl::prepare_graphs() {
         // One family per round width: K+1 for MTP-only rounds and, with n-gram drafts, V+1. A
         // separate family keeps each width's executable installed across alternating rounds.
         const auto capture_family = [&](DecodeGraphFamily& family, std::uint32_t verify_drafts) {
+            mtp_state.execution.replay_records = round_replay_records(verify_drafts + 1U);
             family.profiles.reserve(planned_profiles.size() * max_concurrency);
             for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-                for (const GraphExecutionProfile planned : planned_profiles) {
+                const auto batch_profiles =
+                    verify_drafts == draft_window
+                        ? planned_profiles
+                        : mtp_wide_graph_profiles(capacity, draft_window, verify_drafts,
+                                                  batch_size, text_attention_geometry(parameters),
+                                                  kv_storage);
+                validate_graph_profiles(batch_profiles, capacity - 1, "MTP wide");
+                for (const GraphExecutionProfile planned : batch_profiles) {
                     family.profiles.emplace_back();
                     DecodeGraphProfile& profile    = family.profiles.back();
                     profile.batch_size             = batch_size;
@@ -381,6 +399,7 @@ void ProgramImpl::prepare_graphs() {
         capture_family(mtp_graphs, draft_window);
         if (verify_window > draft_window) {
             // Load the wide routes' modules before capturing them.
+            mtp_state.execution.replay_records = round_replay_records(verify_window + 1U);
             prepare_representative(code_warm.min, 1);
             device.synchronize();
             execution::mtp_decode_batch(

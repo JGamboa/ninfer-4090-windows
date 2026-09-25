@@ -169,6 +169,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
+        if (speculative_backend == SpeculativeBackend::Mtp && verify_window > draft_window) {
+            narrow_replay_records.emplace(
+                replay_records->narrowed(static_cast<std::int32_t>(draft_window + 1U)));
+            narrow_replay_fold.emplace(*narrow_replay_records,
+                                       state_images->linear().all_layers_view());
+        }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
         replay_fold.has_value() != replay_records.has_value()) {
@@ -595,5 +601,19 @@ void ProgramImpl::reset_memory_peaks() noexcept {
     }
 }
 
+const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t width) const {
+    if (!replay_records) { return nullptr; }
+    if (narrow_replay_records && width == draft_window + 1U) { return &*narrow_replay_records; }
+    if (width != static_cast<std::uint32_t>(replay_records->spec.width)) {
+        throw std::logic_error("round width has no ReplaySSM record view");
+    }
+    return &*replay_records;
+}
+
+const ops::GdnReplayFoldPlan& ProgramImpl::round_replay_fold(std::uint32_t width) const {
+    if (!replay_fold) { throw std::logic_error("speculative pending batch has no ReplaySSM records"); }
+    if (narrow_replay_fold && width == draft_window + 1U) { return *narrow_replay_fold; }
+    return *replay_fold;
+}
 
 } // namespace ninfer::models::qwen3_5::detail

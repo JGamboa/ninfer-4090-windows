@@ -534,7 +534,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
-                                                   replay_records ? &*replay_records : nullptr, io,
+                                                   round_replay_records(width), io,
                                                    prefill_hidden, prefill_chunk, proposal_head},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),

@@ -897,9 +897,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             // One graph set per round width: K+1, and V+1 when n-gram drafts widen the window.
-            const auto width_allowance = [&](std::uint32_t verify_drafts) {
+            const auto width_allowance = [&](std::uint32_t verify_drafts,
+                                             const std::vector<GraphExecutionProfile>& profiles) {
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {
@@ -921,14 +921,24 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     },
                     "MTP graph allowance");
             };
-            std::size_t per_batch_allowance = width_allowance(impl->draft_window);
+            impl->graph_allowance_bytes = checked_mul(
+                width_allowance(impl->draft_window,
+                                mtp_graph_profiles(impl->capacity, impl->draft_window)),
+                impl->max_concurrency, "MTP exact-b graph allowance");
             if (impl->verify_window > impl->draft_window) {
-                per_batch_allowance = checked_add(per_batch_allowance,
-                                                  width_allowance(impl->verify_window),
-                                                  "MTP wide graph allowance");
+                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
+                     ++batch_size) {
+                    impl->graph_allowance_bytes = checked_add(
+                        impl->graph_allowance_bytes,
+                        width_allowance(impl->verify_window,
+                                        mtp_wide_graph_profiles(
+                                            impl->capacity, impl->draft_window,
+                                            impl->verify_window, batch_size,
+                                            text_attention_geometry(*impl->parameters),
+                                            impl->kv_storage)),
+                        "MTP wide graph allowance");
+                }
             }
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles = dflash_graph_profiles(

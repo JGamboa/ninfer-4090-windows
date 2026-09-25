@@ -755,9 +755,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         return timing.finish();
     }
 
-    if (!replay_fold) {
-        throw std::logic_error("speculative pending batch has no ReplaySSM records");
-    }
+    // The fold reads the records through the view of the round's width.
+    const ops::GdnReplayFoldPlan& fold = round_replay_fold(
+        speculative_backend == SpeculativeBackend::Mtp ? mtp_round_width : draft_window + 1U);
 
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
@@ -803,8 +803,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
-        replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+        fold.execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                     device.stream);
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
