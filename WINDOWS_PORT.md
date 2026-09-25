@@ -315,3 +315,61 @@ routes are below the bandwidth roof. Estimates at ~4.5 bits per Q4 weight and ~5
 
 These three families are where a wider tensor-core small-T route would pay back. The GEMMs
 make up 88 % of the round.
+
+### Q5 tensor-core route for the DFlash2 verification band (`a29aed7`, 2026-09-24)
+
+`a29aed7` routes the Q5 `linear_add` shapes to a new `q5_ksplit_mma_kernel`, with the
+residual added in its epilogue:
+- mlp down, 5120 x 17408, at T = 7..16;
+- attention o_proj and GDN out_proj, 5120 x 6144, at T = 7..13.
+
+T <= 6 keeps the SIMT split2 route. Validated on the RTX 4090, desktop at 60 Hz, server off.
+Before and after were measured back to back with the same scripts.
+
+- `ninfer_linear_add_q5_a16_test` passes (`OK Q5_A16 LinearAdd`). It includes the new route
+  start at T = 7, the 13/14 and 16/17 route boundaries, and interior T = 11.
+- `ninfer_q5_linear_add_bench --execution graph --repeat 100` (median us, and GB/s as the
+  bench reports it):
+
+  | T | 5120 x 17408 before | after | 5120 x 6144 before | after |
+  |---:|---:|---:|---:|---:|
+  | 6 | 108.5 (542) | 110.6 (532) | 44.0 (473) | 45.1 (463) |
+  | 7 | 119.8 (491) | 104.4 (564) | 51.2 (408) | 42.0 (497) |
+  | 8 | 127.0 (464) | 104.4 (564) | 52.2 (400) | 42.0 (498) |
+  | 13 | 182.3 (325) | 111.6 (530) | 79.9 (264) | 46.3 (455) |
+  | 14 | 221.2 (268) | 114.7 (517) | 95.2 (222) | 96.3 (219) |
+  | 16 | 246.8 (241) | 117.8 (504) | 93.2 (227) | 94.2 (225) |
+  | 17 | 300.0 (198) | 312.3 (190) | 102.4 (207) | 102.5 (207) |
+
+  Two route cliffs remain next to the band:
+  - 5120 x 6144 at T = 14..16 (DFlash2 d13-d15): 96 us, against 46 us for the new route at
+    T = 13.
+  - 5120 x 17408 at T = 17 (`MmaResidualR64C16`, T = 17..32): 300 us, against 118 us at
+    T = 16.
+- DFlash2 on the profile prompt (`scenario_code_python`, `--no-thinking --greedy
+  --lm-head-draft`), with MTP as the regression check:
+
+  | Run | tok/s before -> after | Acceptance | Tokens per round | ms per round | Text |
+  |---|---|---|---|---|---|
+  | DFlash2 d6 | 102.0 -> 129.6 | 35.6 -> 46.5 % | 3.13 -> 3.79 | 30.7 -> 28.9 (-6 %) | differs from char 21 |
+  | DFlash2 d12 | 79.1 -> 99.5 | 24.8 -> 26.8 % | 3.96 -> 4.19 | 50.4 -> 41.8 (-17 %) | differs from char 220 |
+  | Qwen3.8 MTP 3 | 124.5 -> 126.6 | 74.6 % both | 3.23 both | 25.9 -> 25.3 | identical (md5) |
+  | Bonsai MTP 2 (lighthouse prompt) | 149.8 -> 153.9 | 42.4 % both | 1.85 both | 12.2 -> 11.8 | identical (md5) |
+
+  The DFlash2 texts change because the verification sums in a different order, and this
+  prompt has a near-tie at the fifth token ("complete, self-contained" against "complete,
+  runnable"). Every speculative run leaves plain greedy decoding (no speculation, T = 1)
+  there, including MTP 3, whose route did not change. After the change, d6 takes the
+  "runnable" branch that d12 and MTP 3 already took. d12 diverges at char 220
+  ("asyncio semaphore" against "asyncio lock"). Both texts are valid and of the same length
+  (1988 against 1953-1973 chars). Most of d6's tok/s gain therefore comes from a more
+  predictable text. The per-round time is the comparable figure: -6 % at d6 (T = 7) and
+  -17 % at d12 (T = 13).
+- d12 round (`profiles/nsys/qwen38_dflash2_d12_q5band`, same analysis as above), per round:
+  - wall 51.4 -> 43.9 ms; verification 46.8 -> 39.5 ms; drafter unchanged (3.5 ms).
+  - mlp down 12.87 -> 7.78 ms (169 -> 102 us per call; ~59 MB at ~350 -> ~580 GB/s).
+  - o_proj and out_proj 3.99 -> 2.41 ms (64 -> 38 us; ~21 MB at ~330 -> ~560 GB/s).
+
+  Byte counts are the bench's for the same shapes. The verification's largest costs are now
+  the two other small-T families: Q4 gate+up (11.5 ms, 155 us per call) and the grouped
+  mixed Q4/Q5 in_proj and qkvg (10.9 + 3.2 ms, ~180-200 us per call, ~230-290 GB/s).
