@@ -1663,6 +1663,19 @@ Next steps, in order:
       limits and the shared-memory carve-out are unchanged, so the cause is not a resource
       limit. The profile does not show which cause it is. The CTAs also read 8 % more DRAM
       bytes.
+
+      Repeated twice with no other CUDA process on the GPU (`nvidia-smi` showed only desktop
+      apps, 1532 MiB used; `profiles/ncu/rk4_19d_rep{1,2}`):
+      - 326.2 and 323.4 us;
+      - DRAM 54.9 and 57.0 %;
+      - 7.84 and 7.81 active warps per SM (16.3 %);
+      - 5197 and 5208 barrier samples.
+
+      The slowdown and the halved occupancy are reproducible, not contention.
+
+      A lead, not verified: the new warp-pair exchange uses a named barrier with a register
+      ID (`BAR.SYNC R13, 0x40`), which the `b14ed06` kernel does not have. No other launch
+      resource changed.
     - Qwen3.8 nsys at 128K was not run, because the kernel did not improve.
 
 13. Concurrent-lane MTP decode: small-T tensor-core route (implemented; compiled for sm_89 on
