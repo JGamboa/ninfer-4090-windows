@@ -562,3 +562,50 @@ method, desktop at 60 Hz and server off.
 
 Across the five commits the d12 round went from 51.4 to 33.5 ms (-35 %), and d12 decode from
 78.7 to 128.9 tok/s.
+
+## Quality: tools/eval, Ternary Bonsai 2 27B against Qwen3.8-27B (2026-09-25)
+
+`tools/eval` (45 deterministic tasks, see [tools/eval/README.md](tools/eval/README.md)), run
+at HEAD `3c2e263` on the RTX 4090. Commands:
+
+```powershell
+python -m tools.eval run --base-url http://127.0.0.1:8080/v1 --label bonsai --out E:\eval\results_bonsai.json --thinking off
+python -m tools.eval run --base-url http://127.0.0.1:8080/v1 --label qwen38 --out E:\eval\results_qwen38.json --thinking off
+python -m tools.eval compare E:\eval\results_bonsai.json E:\eval\results_qwen38.json --markdown E:\eval\compare.md
+```
+
+Settings: greedy (temperature 0, seed 1234), one sample per task. Each model ran on
+`ninfer-serve` with the flags of its local launcher, bound to 127.0.0.1:
+- **bonsai:** `bonsai2_27b_vl.ninfer` with `start-bonsai-server - ninfer.bat`: rk4v4-e8 KV,
+  262144 context, 3 lanes, MTP 2 with `--lm-head-draft`, Vision.
+- **qwen38:** `qwen3_8_27b.ninfer` with `start-ninfer-server.bat`: rk4v4-e8 KV, 100000
+  context, 3 lanes, DFlash2 d6 with `--lm-head-draft`, `--no-cuda-graph`.
+
+The tok/s and latency columns therefore reflect each launcher's speculation and graph
+settings, not the model alone.
+
+| Run | Passed | Pass rate | Mean latency s | Mean output tokens | Mean tok/s |
+|---|---|---|---|---|---|
+| bonsai | 43/45 | 95.6 % | 1.2 | 124 | 200.6 |
+| qwen38 | 44/45 | 97.8 % | 1.9 | 147 | 147.1 |
+
+| Category | bonsai | qwen38 |
+|---|---|---|
+| code_python | 7/7 | 7/7 |
+| instruction_following | 6/7 | 7/7 |
+| json_output | 4/5 | 4/5 |
+| long_context (4K/16K/32K needle) | 3/3 | 3/3 |
+| reasoning_math | 8/8 | 8/8 |
+| spanish | 6/6 | 6/6 |
+| tool_calling | 9/9 | 9/9 |
+
+Failures. All three are the model's; the tasks and checkers behaved as intended:
+- bonsai `if.answer_in_spanish`: answered in English although the system prompt says "Always
+  answer in Spanish".
+- bonsai `json.order_total`: `"total": 12.00`; the order is 3 x 1.50 + 2 x 4.25 = 13.
+- qwen38 `json.order_total`: `"total": 16.25`. With thinking off, both models write the total
+  without working it out.
+
+The only task that separates the two models is `if.answer_in_spanish`. With 5 to 9 tasks per
+category and one greedy sample, a one-task difference is noise (tools/eval README, Caveats):
+on this suite the ternary Bonsai matches Qwen3.8 within noise.
