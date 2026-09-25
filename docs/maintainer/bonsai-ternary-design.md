@@ -1441,6 +1441,74 @@ Next steps, in order:
    ~180 us instead of 284 us. The per-block shared-memory budget (43.65 KB, already one of the
    two occupancy limits) has to hold the staged codes.
 
+   Baseline oracle (`8b202c4`, run 2026-09-25 on the current kernel). `8b202c4` adds rk4v4-e8
+   cases to `ninfer_softmax_attention_test`, and the test now **fails**: 48 rk4v4-e8 cases
+   miss the reduction criterion (308 s; packed, context and the other KV modes pass). The
+   failing cases are:
+   - T = 1 with a single key, for both geometries (d256-h24-kv4 and d256-h16-kv2);
+   - batched windows W = 1..16 with B = 1..8.
+
+   Every miss is small and alike: |actual - reference| = 0.005-0.007 at |reference| ~ 0.5-1.2,
+   about 0.7-1.5 BF16 ULP, for example `actual=1 reference=0.994812` at one key. The test's
+   informational rk4v4-e8 quantized-vs-BF16 quality line is `mae=0.0060044 rmse=0.00758123
+   rel_rmse=0.102081 max_abs=0.0284158`.
+
+   The single-key case rules out the softmax and the split reduction as the cause. There the
+   output is exactly the decoded V. The oracle decodes the stored codes in FP64, applies the
+   per-group H64 inverse rotation in FP64 and models no intermediate materialization. The
+   kernel path rounds twice. The reduce writes the attention output in the rotated domain as
+   BF16, then `kv_cache_inverse_rotate_output_kernel` (18 launches per round in the rk4v4-e8
+   profiles) reads it, applies the H64 inverse and rounds to BF16 again. The first rounding's
+   error is mixed across 64 dimensions: about 0.3 ULP RMS per element and ~1-1.5 ULP at the
+   tail, which is what the misses show. This is the likely cause, not yet confirmed by an
+   experiment. Applying the inverse rotation in FP32 before the single BF16 store, in the
+   reduce epilogue or the partial kernel, would remove the intermediate rounding.
+9. Bonsai A8 fusions (`c1eb910`, validated 2026-09-25 at HEAD `8b202c4`, RTX 4090 at 60 Hz,
+   server off). One quantization kernel takes the plain activation, an rmsnorm computed from
+   the raw residual, or SwiGLU from gate and up, and applies the H128 rotation and the int8
+   quantization in the same launch. Bonsai attention and FFN use the fused forms; GDN and the
+   MTP layer do not change.
+   - `ninfer_linear_t5_test` passes (`OK t5 A8`, 21 s). It includes the new fused attention
+     rmsnorm (T = 1, 3, 8, 72) and full fused FFN (T = 1, 3, 8, 16) cases against the FP64
+     oracle. `ninfer_attn_input_proj_test` passes.
+   - Quick perplexity (`ninfer-perplexity --corpus eval/corpora/perplexity-1m/manifest.json
+     --quick --kv-dtype bf16`): overall 5.854904 against 5.855606. By domain: English
+     reference 8.0846 (was 8.0873), English long form 9.2858 (9.2868), Chinese 8.1828
+     (8.1833), code 1.8949 (1.8948).
+   - Qwen3.8 does not use t5; its MTP 3 and DFlash2 d12 text md5 are unchanged (CABBE132,
+     8B406E10).
+   - Bonsai MTP 2, six prompts, `--max-context 4096 --max-new 512 --greedy --lm-head-draft`,
+     before (build at `e7c86eb`) -> after, same session. ms per round is derived as tokens per
+     round / tok/s. All six texts change, as expected once the normalized and SwiGLU
+     activations no longer round to BF16:
+
+     | Prompt | tok/s | Acceptance | Tokens per round | ms per round |
+     |---|---|---|---|---|
+     | lighthouse | 147.1 -> 144.2 | 42.4 -> 39.0 % | 1.85 -> 1.78 | 12.58 -> 12.34 |
+     | python merge | 185.8 -> 196.1 | 65.8 -> 71.1 % | 2.32 -> 2.42 | 12.49 -> 12.34 |
+     | transformer | 178.8 -> 174.5 | 61.4 -> 57.6 % | 2.23 -> 2.15 | 12.47 -> 12.32 |
+     | Chile (es) | 150.4 -> 151.6 | 41.9 -> 43.4 % | 1.84 -> 1.87 | 12.23 -> 12.34 |
+     | energy tips | 192.0 -> 177.0 | 58.4 -> 58.5 % | 2.17 -> 2.17 | 11.30 -> 12.26 |
+     | train problem | 197.1 -> 194.4 | 64.6 -> 71.2 % | 2.29 -> 2.42 | 11.62 -> 12.45 |
+
+   - Short-context round (`scenario_story_en_mystery`, bf16 KV,
+     `profiles/nsys/bonsai_t5_mtp_short_fused` and `_fused2`, two runs), against the
+     `c4b6038` profile of item 7:
+     - launches per round 1007 -> 863;
+     - quantization + rmsnorm + SwiGLU + residual 1.03 -> 0.94 ms (`quantize_kernel` 0.79-0.80
+       ms at 3.06 us per call, where `rotate_quantize` was 0.67 ms at 2.60 us, and
+       rmsnorm/residual 0.15 ms, where rmsnorm, SwiGLU and residual were 0.36 ms);
+     - wall 12.44 -> 12.66 / 12.66 ms, kernels 11.95 -> 12.12 / 12.15 ms.
+
+     The rise is in kernels the commit does not touch: the t5 GEMV (29.6 -> 30.1-30.2 us
+     per call) and the Q4 proposal head (412 -> 446 us). The baseline is a day older and
+     on another build, so the round comparison is not like for like.
+
+   Verdict: the fusion removes 144 launches and ~0.09 ms of kernel time per round, but no
+   per-round gain is resolved within this session's run-to-run spread. The derived ms per
+   round of four prompts moves by <= 1 %, while two prompts vary by 8 %. A same-session
+   profile of a pre-`c1eb910` build would settle the ~0.1 ms; it was not run.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
