@@ -2018,7 +2018,7 @@ Next steps, in order:
       - `ninfer_qwen3_5_prefix_real_test` on `qwen3_8_27b.ninfer`: 10 of 11 scenarios pass.
         The default scenario (host restore) and `shared-replacement` fail identically on
         the pre-stage build (`cfbb128`, separate worktree), so they are not stage 1
-        regressions; their diagnosis is recorded separately.
+        regressions; items 17 and 18 diagnose and fix them.
     - Text: greedy, 512 new tokens, six prompts, `--max-context 4096`, old binary
       (`cfbb128`) against new. Bonsai mix (`bonsai2_27b_vl_mtp_q4q5.ninfer`, MTP 2,
       `--lm-head-draft`) and Qwen3.8 (MTP 3, `--lm-head-draft`, int8 KV, `--no-thinking`):
@@ -2036,6 +2036,73 @@ Next steps, in order:
       noise). Qwen3.8 round 2 drifts 1 ms between runs, as the clock drift seen before, so
       its -1.1 ms is also noise, not a gain. An earlier run was discarded because another
       session loaded the 27B model onto the GPU during it.
+17. `ninfer_qwen3_5_prefix_real_test` host-restore failure (diagnosed 2026-09-25, RTX 4090 at
+    60 Hz, `qwen3_8_27b.ninfer` and `bonsai2_27b_vl_mtp_q4q5.ninfer`, pre-existing at
+    `cfbb128`): `Complete MTP checkpoint was not materialized from Host: path=1 reused=316
+    outputs=2 state=0 main=3 backend=2 degraded=1 evicted=0`. The test fixture depended on
+    the chat template. It was not a cache bug, and not a Windows pinned-host or
+    `host_state_slots` sizing issue.
+    - Scenario: C = 1, one Device checkpoint slot, two Host state slots, 256 MiB Host KV.
+      - It retains a 312-token prompt plus 5 greedy tokens.
+      - An uncached continuation forces a demotion.
+      - The continuation is resubmitted with reuse. It must restore a Host-demoted
+        `TurnClosure`, with state, main-KV and backend-KV H2D all rising.
+    - Cause: the Qwen3.8 and Bonsai templates render historical reasoning by default
+      (`preserve_thinking` undefined or true). The Qwen3.6 template that the upstream
+      fixture was written against strips it.
+      - So the frontend's next-turn probe (`chat_template.cpp`, `retain_open_turn`)
+        records a `ResponseReplay`, not a `TurnClosure`.
+      - The continuation re-renders the turn as `<think>\n\n</think>\n\n` + content, so
+        the source endpoint (312 + 5 - 1 = 316 tokens) is an exact prefix.
+      - The restore picks `PrivateEndpoint`. Its StateImage stayed on Device (state move 1,
+        state H2D 0), and only its KV returns from Host (main 3, backend 2 pages). The
+        Host-demoted image was the `ResponseReplay`.
+    - With the template default, that Device-resident `PrivateEndpoint` restore is correct:
+      the longest exact checkpoint wins (resource-scheduling-and-context-cache.md 4.5).
+    - Fix, test only:
+      - `exercise_host_restore` pins `preserve_thinking = false`, as the file's other
+        scenarios already do, so it exercises the rewritten-history `TurnClosure` on every
+        template.
+      - The criterion is unchanged: path `PrivateTurnClosure`, with state, main and backend
+        H2D all rising.
+      - A `host-restore` scenario runs it alone.
+    - Result, identical counters on both artifacts:
+      - Restore: `PrivateTurnClosure`, reused 305 of 330 tokens.
+      - H2D: state 0 -> 1, main 0 -> 3 pages, backend 0 -> 2 pages.
+      - The resumed output equals the uncached output ("sent a" on Qwen3.8, "a long" on
+        Bonsai).
+18. `ninfer_qwen3_5_prefix_real_test` `shared-replacement`: "completed shared-prefix requests
+    leaked active references: 1/0/1" (diagnosed 2026-09-25, `qwen3_8_27b.ninfer`,
+    pre-existing at `cfbb128`). This was a publication-order race between the Engine worker
+    and the `generate()` caller, not a context-cache leak.
+    - `RuntimeStats::shared_active_references` counts the shared sources of occupied lanes,
+      and `Engine::runtime_stats()` returns the last snapshot the worker published.
+    - In `settle_terminal_requests`, the worker ran in this order:
+      1. `resources_.finish()`, which releases the lane and its edges;
+      2. `complete_success()`, which wakes the caller;
+      3. `publish_runtime_stats()`, only after the loop.
+    - A read right after `generate()` could therefore see the previous round's snapshot, in
+      which the lane still held its shared source: 1 after the replacement capture, 0 for
+      the filler, 1 after materializing from the shared prefix. `cancel_active_requests` had
+      the same order. The default scenario's C = 8 check (`running_requests == 0` right after
+      the last `wait()`) relies on the same ordering.
+    - Evidence:
+      - A copy of the test re-read the stats after each `generate()`. With the old Engine
+        the immediate read was 1, then 0 without any new request (1.8 ms for replacement,
+        12.6 ms for reuse). The reference was already released; only the snapshot was stale.
+      - With the fix, every immediate read is 0 and the scenario passes. The old binary
+        still gives 1/0/1.
+    - Fix, `engine_core.h`:
+      - Settlement and cancellation finish or abort each lane and remove its slot.
+      - They then publish the stats once, and only then wake the callers in publication
+        order (`complete_settled`).
+      - If a completion throws, the remaining callers get `complete_error`, because their
+        slots are already released.
+      - Invariant: a caller never receives a result before the stats snapshot that reflects
+        its settlement.
+      - Side effect: the `Boundary` and `CommitOutput` host time of that settlement now
+        appears in the next published snapshot, like the publication's own maintenance time
+        already did. No test or log depends on it.
 
 ## Appendix: sources
 
