@@ -68,7 +68,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    constexpr int ProducerThreads = RowTiles * 32;
+    // Ada (sm_89): with packed V the two QK warps of a two-tile launch were the critical path and
+    // the six V warps idled at the phase barrier (84 % of barrier stall at 128K). Split each
+    // 16-row score tile across a warp pair (column halves of Bc) there, as the prompt kernel does.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+    constexpr bool kSplitScoreColumns = PackedV;
+#else
+    constexpr bool kSplitScoreColumns = false;
+#endif
+    constexpr int ColSplit =
+        (kSplitScoreColumns && Wc >= 4 * RowTiles && QKNt % 2 == 0) ? 2 : 1;
+    constexpr int QKNtL           = QKNt / ColSplit;
+    constexpr int ProducerWarps   = RowTiles * ColSplit;
+    constexpr int ProducerThreads = ProducerWarps * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     constexpr float Log2E         = 1.4426950408889634074f;
     constexpr unsigned FullMask   = 0xffffffffu;
@@ -81,6 +93,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(Bc == 32 || Bc == 64);
     static_assert(RowTiles >= 1 && RowTiles <= 3);
     static_assert(Wc % RowTiles == 0);
+    static_assert(ProducerWarps < Wc, "at least one warp must dequantize V");
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
 
@@ -101,6 +114,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     __half* v_f16        = reinterpret_cast<__half*>(r_s + 2 * Bc * D);
     __shared__ __align__(16) __half p_s[Br * Bc];
     __shared__ float alpha_s[Br];
+    // Column-split pairs exchange their row maxima here, and their row sums after the loop.
+    __shared__ float pair_s[ColSplit == 2 ? 2 * Br : 1];
     __shared__ __align__(16) __half k_scale_s[Bc * Groups];
     __shared__ __align__(16) __half v_scale_s[Bc * Groups];
 
@@ -359,10 +374,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
+    const int producer_tile = warp / ColSplit;
+    const int producer_half = warp % ColSplit;
     float q_scale_r0[Groups];
     float q_scale_r1[Groups];
-    if (warp < RowTiles) {
-        const int producer_row0 = warp * 16 + gid;
+    // Absolute query positions of this lane's two score rows; loop invariant.
+    int qabs0 = -1;
+    int qabs1 = -1;
+    if (warp < ProducerWarps) {
+        const int producer_row0 = producer_tile * 16 + gid;
+        {
+            int q_head = 0, token0 = 0, token1 = 0;
+            causal_small_t_tc_row_to_qt<Geometry>(producer_row0, TokenTile, kv_head, q_head, token0);
+            causal_small_t_tc_row_to_qt<Geometry>(producer_row0 + 8, TokenTile, kv_head, q_head,
+                                                  token1);
+            qabs0 = producer_row0 < RowCount ? pos[token0] : -1;
+            qabs1 = producer_row0 + 8 < RowCount ? pos[token1] : -1;
+        }
 #pragma unroll
         for (int g = 0; g < Groups; ++g) {
             float qs0     = (lid == 0 && producer_row0 < RowCount)
@@ -475,7 +503,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
     };
 
-    int physical_page = block_table[first_tile >> kPagedKVPageShift];
+    // The next page's physical id is loaded one page ahead so the tile issue never waits on it.
+    int page_index            = first_tile >> kPagedKVPageShift;
+    const int last_page_index = (split_end - 1) >> kPagedKVPageShift;
+    int physical_page         = block_table[page_index];
+    int next_physical_page    = page_index < last_page_index ? block_table[page_index + 1] : 0;
     issue_kv_tile(first_tile, physical_page);
     ninfer::ops::cp_wait<0>();
     expand_k_tile(first_tile);
@@ -484,14 +516,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
 
-        // One warp per row tile produces P and alpha while the remaining warps
-        // stream/dequant V.
-        if (warp < RowTiles) {
-            const int producer_row_base = warp * 16;
+        // One warp (or column-split pair) per row tile produces P and alpha while the remaining
+        // warps dequantize V.
+        if (warp < ProducerWarps) {
+            const int producer_row_base = producer_tile * 16;
+            const int nt_base           = producer_half * QKNtL;
             __half* p_sw                = &p_s[producer_row_base * Bc];
-            float score[QKNt][4];
+            float score[QKNtL][4];
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
+            for (int nt = 0; nt < QKNtL; ++nt) {
                 score[nt][0] = 0.0f;
                 score[nt][1] = 0.0f;
                 score[nt][2] = 0.0f;
@@ -512,12 +545,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
 
 #pragma unroll
-                for (int nt = 0; nt < QKNt; ++nt) {
+                for (int nt = 0; nt < QKNtL; ++nt) {
                     int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
 #pragma unroll
                     for (int kk = 0; kk < GroupKc; ++kk) {
                         const int k    = g * GroupKc + kk;
-                        const int brow = nt * 8 + b_rin;
+                        const int brow = (nt_base + nt) * 8 + b_rin;
                         const int bcol = k * 16 + b_koff;
                         unsigned bf[2];
                         ldmatrix_x2(
@@ -526,7 +559,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
                                bf[1]);
                     }
-                    const int keya = nt * 8 + 2 * lid;
+                    const int keya = (nt_base + nt) * 8 + 2 * lid;
                     const int keyb = keya + 1;
                     float ka       = 0.0f;
                     float kb2      = 0.0f;
@@ -545,15 +578,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
             const int row0 = producer_row_base + gid;
             const int row1 = row0 + 8;
-            int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-            causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
-            causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
-            const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
-            const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0 = nt * 8 + 2 * lid;
+            for (int nt = 0; nt < QKNtL; ++nt) {
+                const int col0 = (nt_base + nt) * 8 + 2 * lid;
                 const int col1 = col0 + 1;
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
@@ -578,6 +606,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);
+            if constexpr (ColSplit == 2) {
+                // Both halves then hold identical m, nm and alpha; each keeps its own partial l.
+                if (lid == 0) {
+                    pair_s[producer_half * Br + row0] = bm0;
+                    pair_s[producer_half * Br + row1] = bm1;
+                }
+                asm volatile("bar.sync %0, %1;\n" : : "r"(1 + producer_tile), "r"(64) : "memory");
+                bm0 = fmaxf(bm0, pair_s[(producer_half ^ 1) * Br + row0]);
+                bm1 = fmaxf(bm1, pair_s[(producer_half ^ 1) * Br + row1]);
+            }
 
             const float nm0    = fmaxf(m0, bm0);
             const float nm1    = fmaxf(m1, bm1);
@@ -586,8 +624,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
             float bl0 = 0.0f, bl1 = 0.0f;
 #pragma unroll
-            for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0  = nt * 8 + 2 * lid;
+            for (int nt = 0; nt < QKNtL; ++nt) {
+                const int col0  = (nt_base + nt) * 8 + 2 * lid;
                 const int col1  = col0 + 1;
                 const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
                                       ? exp2_approx((score[nt][0] - nm0) * Log2E)
@@ -617,7 +655,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             l1 = l1 * alpha1 + bl1;
             m0 = nm0;
             m1 = nm1;
-            if (lid == 0) {
+            if (lid == 0 && producer_half == 0) {
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
@@ -667,7 +705,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (has_next) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = block_table[next_k0 >> kPagedKVPageShift];
+                physical_page = next_physical_page;
+                ++page_index;
+                next_physical_page =
+                    page_index < last_page_index ? block_table[page_index + 1] : 0;
             }
             issue_kv_tile(next_k0, physical_page);
         }
@@ -712,8 +753,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         __syncthreads();
     }
 
-    if (warp < RowTiles && lid == 0) {
-        const int row0 = warp * 16 + gid;
+    if constexpr (ColSplit == 2) {
+        // The loop's final barrier ordered every read of the row maxima before this reuse.
+        if (warp < ProducerWarps && producer_half == 1 && lid == 0) {
+            pair_s[producer_tile * 16 + gid]     = l0;
+            pair_s[producer_tile * 16 + gid + 8] = l1;
+        }
+        __syncthreads();
+        if (warp < ProducerWarps && producer_half == 0 && lid == 0) {
+            l0 += pair_s[producer_tile * 16 + gid];
+            l1 += pair_s[producer_tile * 16 + gid + 8];
+        }
+    }
+    if (warp < ProducerWarps && producer_half == 0 && lid == 0) {
+        const int row0 = producer_tile * 16 + gid;
         const int row1 = row0 + 8;
         if (row0 < RowCount) {
             int q_head = 0;
