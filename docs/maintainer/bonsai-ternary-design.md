@@ -1336,6 +1336,65 @@ Next steps, in order:
      30 s. With the default `--pending-timeout-ms 30000`, a first attempt without the override
      lost the third request to `request_queue_timeout` (HTTP 503). Three simultaneous long
      prompts need a longer pending timeout.
+8. rk4v4-e8 against int8 decode attention at 128K (Nsight Compute, 2026-09-25, HEAD `3d3181d`,
+   RTX 4090 at 60 Hz, server off). Command, once per KV mode:
+   `ncu --set full --kernel-name regex:causal_attention_small_t_i8_tiled --launch-skip 200
+   --launch-count 1 -o profiles\ncu\attn_{rk4v4,int8}_128k build\apps\ninfer.exe
+   E:\LLM\bonsai2_27b_vl.ninfer --messages examples\cli\messages\long_niah_128k.json
+   --max-context 262144 --kv-dtype {rk4v4-e8,int8} --prefill-chunk 1024 --greedy --max-new
+   256 --spec mtp --draft-tokens 2 --lm-head-draft`. Reasoning was on, and both runs still
+   answer `ORCHID=493817; COLOR=COBALT`.
+
+   Both KV modes run the same template, `causal_attention_small_t_i8_tiled_kernel`; there is
+   no `..._tc_partial_i8` kernel. The profiled launch is the same in both:
+   - grid 4 x 128 (the whole-wave split of item 7), 256 threads;
+   - 128 registers per thread;
+   - 43.65 KB of static shared memory per block, plus 1.02 KB reserved by the driver.
+
+   Occupancy is limited equally by registers and by shared memory (2 blocks each), so 16
+   warps per SM, 33.3 % theoretical.
+
+   | Per launch (SM 2.59 GHz, locked by ncu) | rk4v4-e8 | int8 |
+   |---|---|---|
+   | Duration | 284.2 us | 352.7 us |
+   | DRAM read | 142.4 MB at 500.9 GB/s | 275.0 MB at 779.6 GB/s |
+   | DRAM throughput, % of peak | 61.6 % | 88.1 % |
+   | L2 hit rate | 58.9 % | 47.3 % |
+   | Active warps per SM / achieved occupancy | 15.07 / 31.4 % | 15.03 / 31.3 % |
+   | Warp cycles per issued instruction | 10.52 | 17.00 |
+   | Issued instructions | 130.9 M | 98.9 M |
+   | Issue slots busy | 36.2 % | 23.6 % |
+   | Top stalls, cycles per issued instruction | barrier 2.61, long scoreboard 2.06, wait 1.55 | barrier 4.64, long scoreboard 4.64, wait 1.82 |
+   | Pipes (% of peak, active) | LSU 36.7, ALU 31.9, FMA-heavy 12.6, XU 10.5 | LSU 29.4, ALU 15.5, FMA-heavy 6.7, XU 8.5 |
+   | `cp.async` (LDGSTS) instructions | 32.5 K (scales only) | 553.0 K (codes, values and scales) |
+   | Shared-memory bank conflicts | 9.0 M | 9.1 M |
+
+   The stall samples rank the same way. rk4v4-e8: barrier 10.9 K, long scoreboard 9.9 K, wait
+   6.4 K. int8: barrier 17.5 K, long scoreboard 16.8 K, wait 5.6 K.
+
+   The hypothesis holds in part: the mechanism is confirmed, the dominant stall is not.
+   - **Confirmed: int8 overlaps, rk4v4-e8 does not.** int8 stages codes, values and scales
+     with `cp.async` (553 K LDGSTS) and runs at 88 % of DRAM peak, about 92 % of the ~845 GB/s
+     read ceiling (WINDOWS_PORT.md). It is bandwidth bound: its long-scoreboard and barrier
+     stalls are the wait for a saturated DRAM.
+   - rk4v4-e8 issues `cp.async` only for the scales (32.5 K). K is a direct global load
+     feeding `e8_root_decode_8d_int8`, and V is a synchronous `kv_cache_unpack_i4x16`; both
+     sit in the tile-load loop (`small_t_i8.cuh`, `issue_kv_tile`). It reads half the bytes
+     but reaches only 61.6 % of DRAM peak, with the issue slots 36 % busy. Neither memory nor
+     compute is saturated, so it is latency bound: each tile's loads, decode and MMAs run one
+     after another.
+   - **Not confirmed: long scoreboard does not dominate rk4v4-e8.** It is second at 2.06 of
+     10.52 cycles (20 %). The barrier is first (2.61, 25 %): warps wait at the tile's
+     `__syncthreads` for the slowest thread's synchronous loads and decode. The two together,
+     44 % of the cycles, are the unoverlapped load.
+   - The E8 decode costs 32 % more instructions (130.9 M against 98.9 M; ALU 31.9 % against
+     15.5 %). At 36 % issue utilization that is not yet the limit.
+
+   Lever: stage the rk4v4-e8 K and V code bytes with `cp.async` into shared memory, as int8
+   does, and decode from shared memory after `cp_wait`. The next tile's DRAM traffic then
+   overlaps the current tile's decode and MMAs. At int8's DRAM rate, the 142 MB would take
+   ~180 us instead of 284 us. The per-block shared-memory budget (43.65 KB, already one of the
+   two occupancy limits) has to hold the staged codes.
 
 ## Appendix: sources
 

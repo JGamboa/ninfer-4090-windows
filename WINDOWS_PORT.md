@@ -609,3 +609,44 @@ Failures. All three are the model's; the tasks and checkers behaved as intended:
 The only task that separates the two models is `if.answer_in_spanish`. With 5 to 9 tasks per
 category and one greedy sample, a one-task difference is noise (tools/eval README, Caveats):
 on this suite the ternary Bonsai matches Qwen3.8 within noise.
+
+## Qwen3.8 server with CUDA graphs: VRAM budget (2026-09-25)
+
+Windows' baseline, from `nvidia-smi` with every NInfer process stopped: 1464 MiB of 24564
+used and 22675 MiB free. The desktop at 60 Hz, Edge, the Claude app, Explorer and the shell
+hosts are WDDM processes that report no per-process figure.
+
+Starting `E:\LLM\ninfer\start-ninfer-server.bat` (Qwen3.8, DFlash2 d6 `--lm-head-draft`,
+rk4v4-e8 KV, `--max-context 100000 --kv-capacity 100000 --max-concurrency 3
+--device-state-slots 3 --host-state-slots 4 --host-kv-mib 4096 --prefill-chunk 1408`) without
+`--no-cuda-graph` fails. Full stderr:
+
+```
+2026-09-25 01:21:08.111  INFO  starting engine
+2026-09-25 01:21:08.631  INFO  loading weights | 18.3 GiB
+2026-09-25 01:21:13.173  INFO  weights ready | 18.3 GiB | 4.5s | 4.03 GiB/s
+2026-09-25 01:21:13.178  ERROR startup failed | finalizing target | 3.12 ms
+2026-09-25 01:21:13.253  FATAL server failed during startup | requested Engine runtime reservation requires 4785976064 bytes, but only 3546664960 bytes are available for runtime capacity
+```
+
+The engine fails before its `engine capacity` and `engine state_pools` lines. The shortfall
+is 1239311104 bytes (**1182 MiB**). The same launcher starts in each of these
+configurations:
+
+| Configuration (the rest as in the .bat) | Starts | `runtime_reservation_bytes` | `available_after_weights_bytes` | `cuda_graph_allowance_bytes` | Free after start (`nvidia-smi`) |
+|---|---|---|---|---|---|
+| 3 lanes, 3 state slots, 100000 KV, `--no-cuda-graph` (current .bat) | yes | 3276026624 (3124 MiB) | 3559313408 | 0 | 435 MiB |
+| 3 lanes, 3 state slots, 100000 KV, graphs | **no** | 4785976064 (4564 MiB) | 3546664960 | - | - |
+| 1 lane, 1 state slot, 100000 KV, graphs | yes | 2960890880 (2824 MiB) | 3568095232 | 503316480 (480 MiB) | 1172 MiB |
+| 3 lanes, 3 state slots, 32768 KV, graphs | yes | 3313041664 (3160 MiB) | 3615330304 | 1207959552 (1152 MiB) | 1445 MiB |
+
+`engine state_pools` for the current .bat (no graphs): `text_kv_bytes=1741357056` (100032
+tokens of rk4v4-e8, 17408 bytes per token), `gdn_state_bytes=923664384` (3 device state
+slots, 308 MB each), `replay_records_bytes=37545984`, `workspace_bytes=219974656` and
+`persistent_arena_bytes=3056051968`.
+
+The CUDA graphs cost 480 MiB with one lane and 1152 MiB with three. Ways to fit graphs, each
+from the measurements above:
+- one lane (`--max-concurrency 1 --device-state-slots 1`) at the full 100000 KV;
+- three lanes with the KV cut to roughly 45K tokens (32768 leaves 302 MB of planned slack);
+- freeing ~1.2 GiB elsewhere. Windows' own 1464 MiB is not enough by itself.
