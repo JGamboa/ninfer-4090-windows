@@ -1767,6 +1767,52 @@ Next steps, in order:
        three-lane aggregate against 166.9 tok/s and 37.09 ms per round, the one-request rate
        against 143.6 tok/s and 14.49 ms; plus an nsys round profile at three lanes (t5 kernel
        time per round against the ~29 ms estimate).
+14. Validation of the integrated branch (HANDOFF.md section 4). Build at `1515b53`, the same
+    code as HEAD `61a8fcd`, which only adds HANDOFF.md. Measured 2026-09-25, RTX 4090 at 60
+    Hz, server off. The previous binaries (`19d7567`) were kept in `build_19d7567\` for the
+    comparisons.
+    - Build: `cmake --build build -j` completes (399 steps, MSVC + CUDA 13.4).
+    - Tests, all passing:
+      - `ninfer_linear_t5_test` (`OK t5 A8`, with the new T = 5..72 cases),
+        `ninfer_attn_input_proj_test`, `ninfer_linear_q4_a16_test` and
+        `ninfer_linear_q5_a16_test`;
+      - `ninfer_softmax_attention_test --rk4v4-e8-only` (`PASS ... rk4v4-e8 independent
+        correctness`) and the full `ninfer_softmax_attention_test`;
+      - `ninfer_kv_cache_append_test`;
+      - `ctest -R "prism_loading|ngram_pool"`: `ngram_pool` and the prism loading interop
+        test pass (51 s). The bare `ninfer_qwen3_5_prism_loading_test` reports Skipped: it
+        returns 77 by design without the interop driver's arguments;
+      - `python -m pytest tests/test_spec_sim.py tests/convert/test_bonsai_recipe.py`:
+        27 passed. The `.venv` is Python 3.12.10, as used throughout on this machine.
+    - Quick regression, old (`build_19d7567`) and new binaries back to back:
+      - Bonsai quick perplexity: 5.854904 (wikitext 8.08458, pg19 9.28579, zhwiki 8.18278,
+        ninfer 1.8949), identical to item 9.
+      - Bonsai MTP 2, six prompts, one lane: the six texts are identical (same md5), and the
+        new binary is +0.2 to +1.3 % tok/s, within noise.
+      - Qwen3.8 MTP 3 with int8 KV (`scenario_code_python`, `--no-thinking`, 512 tokens):
+        identical text md5 (F010366E) and 25.66 ms per round with both binaries.
+    - Decode attention at 128K with the pair barrier on immediate IDs (`2f4789e`):
+      - `cuobjdump -sass` of `small_t.cu.obj` shows no `BAR.SYNC R..`; the pair barriers
+        are `BAR.SYNC.DEFER_BLOCKING 0x1/0x2/0x3, 0x40`.
+      - ncu of the same launch as items 8, 10 and 12, two runs (`profiles/ncu/rk4_src_2f47`,
+        `rk4_2f47_rep2`):
+
+        | Per launch | `b14ed06` | `19d7567` | `2f4789e` |
+        |---|---|---|---|
+        | Duration | 260.4-262.4 us | 323.4-326.5 us | **248.2 / 248.8 us** |
+        | Active warps per SM | 15.2 | 7.8-8.0 | **15.27 / 14.96** |
+        | DRAM | 66.8 %, 544 GB/s | 55-59 % | **72.8 %, 571 GB/s** (141.8 MB) |
+        | Barrier samples / total | 12249 / 44449 | 5251 / 55130 | 5058 / 37690 |
+        | Barrier after QK / V dequant | 10294 | 2303 | 3238 (line 717, charged to 720) |
+        | Barrier at the end of the iteration | 1768 | 2606 | 1398 (line 768, charged to 523) |
+        | Warp-pair barriers | - | 183 | ~170 (ids 1-3) |
+        | Long scoreboard at `has_next` / `block_table` | 3350 / 411 | 0 / 715 | 0 / 400 |
+        | Long scoreboard at the V `ldmatrix_x2_t` | - | 4255 | 2565 (line 758) |
+        | Registers / theoretical CTAs per SM / static shared memory | 128 / 2 / 43.65 KB | 128 / 2 / 43.90 KB | 128 / 2 / 43.90 KB |
+
+      With immediate barrier IDs, two CTAs per SM are resident again. The warp-pair split
+      now keeps its lower barrier stall, and the kernel is 4.6 % faster than `b14ed06`, the
+      best measured until now. The split stays; no revert.
 
 ## Appendix: sources
 
