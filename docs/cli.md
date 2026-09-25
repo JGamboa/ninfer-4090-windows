@@ -177,6 +177,20 @@ may be combined with `--vision`.
   --lm-head-draft
 ```
 
+With MTP, `--ngram chain` extends each round's MTP proposal with host n-gram drafts in the style
+of llama.cpp `ngram-mod`: a shared pool maps the hash of the last `--ngram-n` tokens (default 8) to
+the token that last followed them, and the proposal continues from it for up to `--ngram-max`
+drafts in total (default 15, range `draft-tokens + 3 .. 15`). Extensions shorter than
+`--ngram-min` (default 1) are dropped; `--ngram-pool-mib` (default 16) sizes the pool. A round
+verifies the wide window only when some row's draft reaches `draft-tokens + 3`; otherwise it keeps
+the MTP width and its CUDA Graphs. Greedy verification keeps the output of the non-speculative route
+up to floating-point ties. The summary reports the pool's drafted and accepted tokens and the wide
+rounds:
+
+```bash
+./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer   --prompt "Rewrite this file with one change: ..."   --spec mtp --draft-tokens 3 --lm-head-draft   --ngram chain --ngram-max 15
+```
+
 For DFlash:
 
 ```bash

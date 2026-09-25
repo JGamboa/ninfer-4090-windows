@@ -65,7 +65,7 @@ selected for this process.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
-| `GET /metrics` | llama.cpp-compatible Prometheus text counters plus NInfer draft and prefix-cache totals |
+| `GET /metrics` | llama.cpp-compatible Prometheus text counters plus NInfer draft (`ninfer:draft_*`, n-gram share `ninfer:ngram_draft_*`) and prefix-cache totals |
 | `GET /monitor` | live monitor page for a browser: throughput, KV occupancy, slots, recent requests |
 | `GET /monitor/stats` | the monitor's JSON snapshot: context, KV and scheduler gauges, cumulative totals, slots, last 32 requests |
 | `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
@@ -119,7 +119,7 @@ save. Sessions never saved or restored have no binding and are not spilled; an e
 server) that polls `GET /monitor/stats` once per second from the same origin, so it needs no
 `--cors`. The snapshot carries cumulative counters (prefill and decode tokens and unit seconds
 since the server attached, so the startup warmup is excluded; prompt and reused prompt tokens of
-completed requests; drafted and accepted tokens); the page differences consecutive snapshots into
+completed requests; drafted and accepted tokens, with the n-gram share); the page differences consecutive snapshots into
 decode and prefill tok/s, the current MTP acceptance and a two-minute throughput chart. Prompt
 reuse adds the requests in flight from their slot rows. `lanes` is `--max-concurrency`; the
 slot rows are the retained-conversation cells of `/slots`, of which there may be more than
@@ -844,6 +844,11 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--ngram chain` | extend MTP proposals with host n-gram drafts; requires `--spec mtp` (see [cli.md](cli.md#speculative-decoding)) | off |
+| `--ngram-max V` | n-gram verify window, `draft-tokens + 3 .. 15` | `15` |
+| `--ngram-n N` | n-gram lookup key length, `1..64` | `8` |
+| `--ngram-min N` | drop pool extensions shorter than N | `1` |
+| `--ngram-pool-mib M` | host n-gram pool size, `1..4096` | `16` |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -909,7 +914,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v22 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -935,7 +940,10 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
-`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, `verify_window`,
+`wide_rounds`, `ngram_drafted_tokens`, and `ngram_accepted_tokens` (the n-gram pool's share of the
+drafted and accepted counts). `server_start.engine.ngram` records the n-gram mode and, when it is
+enabled, `max_drafts`, `match_tokens`, `min_drafts`, and `pool_bytes`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.
