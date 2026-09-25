@@ -1921,6 +1921,59 @@ Next steps, in order:
 
       For the HANDOFF section 8 idea 4, the replay favours phase 1 (up to 15 drafts). It does
       not justify widths past 16 on this data.
+    - Prefill attention diagnosis (`e319660`), no code change.
+      - Command: `ncu --set full --import-source yes --kernel-name
+        regex:causal_attention_prompt_i8 --launch-skip 2000 --launch-count 1 -o
+        profiles\ncu\prompt_i8_128k_{int8,rk4} build\apps\ninfer.exe
+        E:\LLM\bonsai2_27b_vl.ninfer --messages examples\cli\messages\long_niah_128k.json
+        --max-context 262144 --kv-dtype {int8,rk4v4-e8} --prefill-chunk 1024 --no-thinking
+        --max-new 16 --greedy`.
+      - The profiled launch is one 1024-token chunk at ~126K keys: grid 384 (16 query blocks
+        x 24 query heads, one CTA per query head), 512 threads, 128 registers
+        (`__maxnreg__(128)`), 93.7 KB dynamic shared memory.
+
+      | Per launch | int8 | rk4v4-e8 |
+      |---|---|---|
+      | Duration | 16.57 ms | 20.79 ms |
+      | Tensor pipe active (HMMA / IMMA) | 30.1 % / 15.0 % | 25.8 % / 12.9 % |
+      | L2 throughput, % of peak | 32.9 % | 25.1 % |
+      | L2 -> L1 read bytes / L2 hit rate | 26.8 GB (~1.6 TB/s) / 98.6 % | 23.7 GB (~1.1 TB/s) / 97.8 % |
+      | DRAM | 530 MB, 32 GB/s, 4.0 % | 443 MB, 21 GB/s, 3.3 % |
+      | Occupancy | 16.0 warps per SM, 1 CTA per SM (registers and shared memory, 1 each) | same, 16.0 warps |
+      | Warp cycles per issued instruction / issue busy | 10.20 / 39.2 % | 9.22 / 43.4 % |
+      | Stall samples: total / barrier / math pipe / wait | 2.98 M / 998 K (33.5 %) / 764 K (25.7 %) / 428 K (14.4 %) | 3.46 M / 1.06 M (30.6 %) / 776 K (22.4 %) / 493 K (14.2 %) |
+      | Long / short scoreboard samples | 54 K / 160 K | 198 K / 196 K |
+      | Spills: executed spill instructions / local-load sectors | 98.7 M / 394.8 M (L1 hit 93.9 %) | 106.5 M / 425.6 M (L1 hit 24.9 %) |
+      | `LDL`/`STL` in SASS / their stall samples | 41 / 53 K (1.8 %) | 49 / 50 K (1.4 %) |
+
+      Stall samples by line (`prompt_i8.cuh`; the block barrier is the `bar.sync 0` lambda at
+      line 596, charged to its call sites):
+
+      | Line | Code | int8 barrier | rk4v4-e8 barrier |
+      |---|---|---|---|
+      | 596 | `block_barrier` lambda (inlined `bar.sync 0`) | 344791 | 347795 |
+      | 718 | `if (has_next) { block_barrier(); } // Y` | 310856 | 333551 |
+      | 706 | `for (int kb = 0; kb < key_blocks; ++kb)` (loop head after a barrier) | 269180 | 310574 |
+      | 611 | `block_barrier(); // Y: P(kb + 1), alpha(kb + 1) and V(kb + 1) FP16 published.` | 33361 | - |
+      | 502 | `bm0 = fmaxf(pair_m_s[row0], pair_m_s[Br + row0]);` | 24434 | 29416 |
+
+      The math-pipe stall sits in `mma.cuh`: 946 K (int8) and 907 K (rk4v4-e8) samples. The
+      rk4v4-e8 extra comes from the V fragment `ldmatrix_x4` (line 669, 52.6 K long
+      scoreboard), the nibble decode (`int8_g64_codec.cuh`, 183 K samples; line 103, 30.8 K
+      short scoreboard) and the `p_s` stores (lines 574/576, ~53 K long scoreboard). The spills
+      sit at the `has_next` branch (line 608), `cp_commit` (line 320) and the running sum
+      (line 558).
+
+      Answer:
+      - Not L2 bandwidth bound. The GQA re-reads are real: each K/V tile is read by 16 query
+        blocks x 6 query heads, 23.7-26.8 GB from L2 per launch. But L2 runs at 25-33 % of
+        peak with a ~98 % hit rate, and DRAM at 3-4 %.
+      - Not tensor-core bound: HMMA is active 26-30 % of cycles.
+      - Synchronization bound at low occupancy. The per-tile block barriers are 31-34 % of
+        the stall samples, and the math-pipe throttle is 22-26 %. With one 16-warp CTA per
+        SM (registers and shared memory each allow one), nothing hides the barrier waits.
+      - The spills cost little time (<= 1.8 % of samples) despite ~100 M executed spill
+        instructions. In rk4v4-e8 only 25 % of their local loads hit L1.
 
 ## Appendix: sources
 
