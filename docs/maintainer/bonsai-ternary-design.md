@@ -1851,6 +1851,25 @@ Next steps, in order:
         The three-lane aggregate doubles; the estimate was ~2x. One lane is unchanged. These
         use int8 KV and short prompts, so they are not comparable with the 143.6 / 166.9 tok/s
         of item 7 (rk4v4-e8, ~40K prompts).
+    - Long-context prefill (`e319660`, the pipelined int8 prompt kernel):
+      - `ninfer_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4
+        --kv-dtype int8 --batch 1 --tokens 1024 --context 8192,32768,65536,131072 --mapping
+        fragmented --execution eager --cache cold --warmup 5 --repeat 21`, median us per
+        1024-token chunk, old -> new: 8K 1449 -> 1132 (-21.9 %), 32K 5722 -> 4557 (-20.4 %),
+        64K 11671 -> 9224 (-21.0 %), 128K 22068 -> 17838 (-19.2 %). The bench does not accept
+        `--kv-dtype rk4v4-e8` in either binary (bf16, int8, fp8, nvfp4 and k8v4 only), so
+        rk4v4-e8 is covered end to end only.
+      - NIAH, `--max-context 262144 --prefill-chunk 1024 --no-thinking --greedy --max-new 128`,
+        MTP 2, old and new back to back. All eight answers are exactly
+        `ORCHID=493817; COLOR=COBALT`. Prefill:
+
+        | Prompt | int8 old -> new | rk4v4-e8 old -> new |
+        |---|---|---|
+        | `long_niah_64k` | 24.0 -> 23.0 s (-4.2 %) | 24.8 -> 23.9 s (-3.6 %) |
+        | `long_niah_128k` | 60.2 -> 55.3 s (-8.1 %) | 63.0 -> 58.9 s (-6.5 %) |
+
+        The kernel gains ~20 %; the whole 128K prefill gains 6.5-8.1 %, below the -13 to
+        -23 % estimate.
 
 ## Appendix: sources
 
