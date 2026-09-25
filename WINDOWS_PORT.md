@@ -191,10 +191,9 @@ write and 2N for a copy. Two runs, best of 5 trials (median in parentheses):
 | `kernel uint4 write` | 748.9 (742.4) | 747.0 (743.1) | 74 % |
 | `cudaMemsetAsync` (write) | 826.3 (722.3) | 826.0 (819.5) | 82 % |
 
-The probe's own "of peak" column and "Best sustained bus rate" line use its default
-`--peak-gbps 1792`, the RTX 5090's figure (46-47 % for the read here). The last column above
-is recomputed against the 4090's advertised 1008 GB/s; `--peak-gbps 1008` makes the probe
-print the same.
+These runs used the probe's former `--peak-gbps` default of 1792 (the RTX 5090's figure, 46-47 %
+for the read here); the last column above is recomputed against the 4090's advertised
+1008 GB/s, which is now the probe's default.
 
 **Ceiling: pure read ~845 GB/s, copy ~785 GB/s.** Decode is a weight-read stream, so the GB/s
 figures in this document are read against **~845 GB/s**, not the advertised 1008. On that

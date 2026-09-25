@@ -29,7 +29,7 @@ targets. Build it with the project's CUDA toolkit and run it from the repository
 
 ```bash
 mkdir -p build
-nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu \
+nvcc -O3 -std=c++17 -arch=sm_89 tools/hbm_bandwidth_probe.cu \
   -o build/hbm_bandwidth_probe
 ./build/hbm_bandwidth_probe
 ```
