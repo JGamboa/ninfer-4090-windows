@@ -1890,6 +1890,37 @@ Next steps, in order:
         estimate was <= 0.5 ms. The two Q8 runs differ by 0.22 ms, so the gain is above but
         close to the run-to-run spread. The one differing mix text is a greedy tie: the
         verification width follows the acceptance pattern.
+    - `ngram-mod` simulator (`1bde24c`, CPU only).
+      - Command: `python -m tools.spec_sim <14 transcripts> --claude-code --artifact
+        E:\LLM\qwen3_8_27b.ninfer --ngram-n 8,12,24 --caps 15,32,64 --json
+        profiles\spec_sim.json`, with `tokenizers` installed in the `.venv`.
+      - Input: every Claude Code transcript under `%USERPROFILE%\.claude\projects` (5 projects,
+        14 files, 37.9 MB) = 2695 records and 811982 completion tokens, run in 962 s.
+      - These transcripts were written by another model, so they measure how repetitive the
+        work is, not Qwen3.8's or Bonsai's behaviour.
+      - Tokens per round and acceptance are replay counts. The MTP acceptance and the tok/s
+        column are **projections** from the simulator's cost model (C(1) = 21.3 ms,
+        C(4) = 25.9, C(16) = 35.0, C(33) = 43.5, C(65) = 59.5), not measurements.
+
+      | Policy | n | Cap | Tokens per round | Accepted per round | Rounds accepting > 15 | Tokens from those rounds | Projected tok/s |
+      |---|---|---|---|---|---|---|---|
+      | mtp | - | - | 3.22 | 2.22 | 0 % | 0 % | 124.6 |
+      | ngram-mod | 8 | 15 | 1.66 | 0.66 | 0 % | 0 % | 73.0 |
+      | ngram-mod | 8 | 32 | 1.68 | 0.68 | 1.5 % | 24.8 % | 72.7 |
+      | select:ngram-mod | 12 | 15 | 4.18 | 3.18 | 0 % | 0 % | 153.0 |
+      | chain:ngram-mod | 8 | 15 | 4.38 | 3.38 | 0 % | 0 % | 159.6 |
+      | chain:ngram-mod | 8 | 32 | 4.62 | 3.62 | 4.2 % (13.9 % draft > 15) | 24.7 % | 162.8 |
+      | chain:ngram-mod | 8 | 64 | 4.69 | 3.69 | 3.7 % | 25.6 % | 156.2 |
+      | chain:ngram-mod | 24 | 15 | 3.88 | 2.88 | 0 % | 0 % | 146.2 |
+
+      - `ngram-mod` alone rejects 91-98 % of rounds. Chained after MTP with n = 8, it raises
+        tokens per round from 3.22 to 4.38 at cap 15: +28 % projected.
+      - Raising the cap to 32 adds 2 % projected: 4.2 % of rounds accept more than 15
+        tokens, and those rounds commit a quarter of the tokens.
+      - At cap 64 the projection falls again, because the wider verification costs more.
+
+      For the HANDOFF section 8 idea 4, the replay favours phase 1 (up to 15 drafts). It does
+      not justify widths past 16 on this data.
 
 ## Appendix: sources
 
