@@ -16,11 +16,12 @@ template <int InputRows, int TileCols>
 void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
     constexpr int kOutputRows = 5120;
     const dim3 grid(static_cast<unsigned>(kOutputRows / Q5KSplitMmaSchedule::kRowsPerCta));
-    q5_ksplit_mma_kernel<kOutputRows, InputRows, TileCols, true>
-        <<<grid, Q5KSplitMmaSchedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-            static_cast<__nv_bfloat16*>(residual_out.data), x.ne[1]);
+    const Q5KSplitOutput out{static_cast<__nv_bfloat16*>(residual_out.data), kOutputRows,
+                             static_cast<int>(residual_out.nb[1] / sizeof(__nv_bfloat16))};
+    q5_ksplit_mma_kernel<InputRows, TileCols, true><<<grid, Q5KSplitMmaSchedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales), out,
+        x.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 

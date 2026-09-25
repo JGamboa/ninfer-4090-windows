@@ -27,8 +27,8 @@ struct RouteSpec {
 };
 
 constexpr std::array<RouteSpec, 4> kRoutes{{
-    {{1, 12}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{13, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2},
+    {{1, 16}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
+    {{17, 32}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C32S2},
     {{33, 64}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR32C64S4},
     {{65, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2},
 }};

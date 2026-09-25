@@ -48,15 +48,32 @@ __device__ __forceinline__ unsigned q5_ksplit_bf16_pair(std::uint8_t packed, uns
     return *reinterpret_cast<const unsigned*>(&pair);
 }
 
-// out = W x (Residual = false) or out += W x (Residual = true), for `columns` <= TileCols
-// activation columns (TileCols - 8 < columns). x is [K, columns] BF16, out [OutputRows, columns].
-template <int OutputRows, int InputRows, int TileCols, bool Residual>
+// Destination of the projected rows: weight rows [0, first_rows) go to `first`, the rest (if
+// any) to `second` at row - first_rows; each is column-major BF16 with its own column stride.
+struct Q5KSplitOutput {
+    __nv_bfloat16* first;
+    int first_rows;
+    int first_ld;
+    __nv_bfloat16* second = nullptr;
+    int second_ld         = 0;
+
+    __device__ __forceinline__ __nv_bfloat16* at(int row, int col) const {
+        return row < first_rows
+                   ? first + static_cast<std::int64_t>(col) * first_ld + row
+                   : second + static_cast<std::int64_t>(col) * second_ld + (row - first_rows);
+    }
+};
+
+// out = W x (Residual = false) or out += W x (Residual = true) for the 16 weight rows of each CTA
+// (grid = weight rows / 16), over `columns` <= TileCols activation columns (TileCols - 8 <
+// columns). x is [K, columns] BF16.
+template <int InputRows, int TileCols, bool Residual>
 __launch_bounds__(Q5KSplitMmaSchedule::kThreads) __global__
     void q5_ksplit_mma_kernel(const __nv_bfloat16* __restrict__ x,
                               const std::uint8_t* __restrict__ codes,
                               const std::uint8_t* __restrict__ high,
-                              const std::uint8_t* __restrict__ scales,
-                              __nv_bfloat16* __restrict__ out, int columns) {
+                              const std::uint8_t* __restrict__ scales, Q5KSplitOutput out,
+                              int columns) {
     using Schedule              = Q5KSplitMmaSchedule;
     constexpr int kHidden       = InputRows;
     constexpr int kTileK        = Schedule::kTileKPerWarp;
@@ -69,7 +86,7 @@ __launch_bounds__(Q5KSplitMmaSchedule::kThreads) __global__
     constexpr int kScalesPerRow = kHidden / 64;
     constexpr int kNt           = TileCols / 8;
     static_assert(TileCols == 8 || TileCols == 16);
-    static_assert(kHidden % kGroupK == 0 && OutputRows % kRowsPerCta == 0);
+    static_assert(kHidden % kGroupK == 0);
 
     union SharedStorage {
         struct {
@@ -231,7 +248,7 @@ __launch_bounds__(Q5KSplitMmaSchedule::kThreads) __global__
     if (k_split == 0) {
         const auto store = [&](int row, int col, float value) {
             if (col >= columns) return;
-            __nv_bfloat16* destination = out + static_cast<std::int64_t>(col) * OutputRows + row;
+            __nv_bfloat16* destination = out.at(row, col);
             if constexpr (Residual) value += __bfloat162float(*destination);
             *destination = __float2bfloat16_rn(value);
         };
