@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/ngram_policy.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -824,6 +825,27 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+    if (const NgramOptions& ngram = options.speculative.ngram; ngram.mode != NgramDraftMode::Off) {
+        if (ngram.mode != NgramDraftMode::Chain) {
+            throw std::invalid_argument("unknown n-gram draft mode");
+        }
+        if (options.speculative.backend != SpeculativeBackend::Mtp) {
+            throw std::invalid_argument("n-gram drafts require the MTP backend");
+        }
+        if (ngram.max_drafts < options.speculative.draft_tokens + kNgramWideRoundMargin ||
+            ngram.max_drafts > kMaximumMtpVerifyDrafts) {
+            throw std::invalid_argument("n-gram verify window must be in [draft_tokens+3,15]");
+        }
+        if (ngram.match_tokens == 0 || ngram.match_tokens > NgramDraftPool::kMaximumMatchTokens) {
+            throw std::invalid_argument("n-gram match length must be in [1,64]");
+        }
+        if (ngram.min_drafts == 0 || ngram.min_drafts > ngram.max_drafts) {
+            throw std::invalid_argument("n-gram minimum draft must be in [1,max_drafts]");
+        }
+        if (ngram.pool_bytes < sizeof(std::uint32_t) || ngram.pool_bytes > (4ULL << 30U)) {
+            throw std::invalid_argument("n-gram pool size must be in [4 B,4 GiB]");
+        }
+    }
     if (device.compute_capability() != 89) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 8.9");
     }
@@ -852,6 +874,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
     impl->verify_window       = inputs.verify_window;
+    impl->ngram               = inputs.ngram;
     // DFlash keeps checkpoint state in its own cyclic mirror that only covers the resident
     // checkpoint; older ring entries could not rebuild it, so the ring stays off there.
     impl->turn_checkpoint_ring =
@@ -875,26 +898,35 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) {
-                    // The last AR step sees E+V+K keys (verify window V, depth K).
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->capacity, static_cast<std::uint64_t>(profile.max) +
-                                            impl->verify_window + impl->draft_window);
+            // One graph set per round width: K+1, and V+1 when n-gram drafts widen the window.
+            const auto width_allowance = [&](std::uint32_t verify_drafts) {
+                return graph_topology_allowance(
+                    profiles,
+                    [&](GraphExecutionProfile profile) {
+                        // The last AR step sees E+W-1+K keys (W-1 verified drafts, depth K).
+                        const std::uint64_t final_visible = std::min<std::uint64_t>(
+                            impl->capacity, static_cast<std::uint64_t>(profile.max) +
+                                                verify_drafts + impl->draft_window);
 #ifdef NINFER_SM86
-                    if (final_visible <= 4096) {
-                        // The reduced-startup graph set still consumes 35.8 MiB at C1/K3 and
-                        // 43.1 MiB at C1/K4 on SM86. K2 retains the smaller qualified allowance;
-                        // reserve one 64 MiB class for K3 and deeper captures.
-                        return (impl->draft_window >= 3 ? 64ULL : 16ULL) * kMiB;
-                    }
-                    return 86ULL * kMiB;
+                        if (final_visible <= 4096) {
+                            // The reduced-startup graph set still consumes 35.8 MiB at C1/K3 and
+                            // 43.1 MiB at C1/K4 on SM86. K2 retains the smaller qualified
+                            // allowance; reserve one 64 MiB class for K3 and deeper captures.
+                            return (impl->draft_window >= 3 ? 64ULL : 16ULL) * kMiB;
+                        }
+                        return 86ULL * kMiB;
 #else
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                        return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
 #endif
-                },
-                "MTP graph allowance");
+                    },
+                    "MTP graph allowance");
+            };
+            std::size_t per_batch_allowance = width_allowance(impl->draft_window);
+            if (impl->verify_window > impl->draft_window) {
+                per_batch_allowance = checked_add(per_batch_allowance,
+                                                  width_allowance(impl->verify_window),
+                                                  "MTP wide graph allowance");
+            }
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
         } else {
@@ -937,9 +969,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
-        .verify_window       = options.speculative.backend == SpeculativeBackend::Mtp
-                                   ? options.speculative.draft_tokens
-                                   : 0U,
+        .verify_window       = options.speculative.backend != SpeculativeBackend::Mtp ? 0U
+                               : options.speculative.ngram.mode != NgramDraftMode::Off
+                                   ? options.speculative.ngram.max_drafts
+                                   : options.speculative.draft_tokens,
+        .ngram               = options.speculative.ngram,
         .turn_checkpoint_ring = options.turn_checkpoint_ring,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,

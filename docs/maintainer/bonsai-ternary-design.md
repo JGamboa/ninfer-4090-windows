@@ -2103,6 +2103,39 @@ Next steps, in order:
       - Side effect: the `Boundary` and `CommitOutput` host time of that settlement now
         appears in the next published snapshot, like the publication's own maintenance time
         already did. No test or log depends on it.
+19. N-gram phase 1, stage 2: the host pool, the chain policy and the second graph width.
+    - Engine options: `SpeculativeOptions::ngram` (`NgramOptions`: mode off/chain, verify window
+      `max_drafts` in `[k+3, 15]`, lookup length n, minimum extension, pool bytes). It requires
+      the MTP backend, and with it the Program plans `V = max_drafts`.
+    - Program:
+      - `ProgramImpl` owns one `NgramDraftPool`. `SequenceState::ngram_observed` is reset where
+        every request rebinds its ledger, on retire, and on session restore.
+      - Each MTP round first reports the new ledger tokens to the pool, then drafts
+        `chain_ngram_drafts` per row: the MTP proposal followed by the pool's continuation of
+        ledger + proposal.
+      - The round widens to `V+1` only when some row's usable draft reaches `k + 3`
+        (`ngram_round_verify_drafts`); otherwise it keeps width `k+1`.
+      - Each width has its own graph family (`mtp_wide_graphs`), so alternating rounds never
+        re-update an executable. The graph allowance adds the wide set.
+      - `SpeculativeStats` gains `verify_window`, `wide_rounds`, `ngram_drafted_tokens` and
+        `ngram_accepted_tokens`.
+    - Tests:
+      - `ninfer_qwen3_5_ngram_policy_test` (host) covers the chain lookup key, the window and
+        minimum limits, the width margin and the source attribution. PASS.
+      - The pool, runtime mechanisms and mtp_round tests still pass.
+    - MTP-only regression, measured (n-gram off, old binary `cfbb128` against new, alternated
+      twice, six prompts, 512 tokens, greedy, 60 Hz):
+      - Text: 12 of 12 md5 identical in both rounds.
+      - VRAM: planned device total, graph allowance and reservation are unchanged (Bonsai
+        6.70 GiB / 16 MiB, Qwen3.8 17.2 GiB / 64 MiB).
+
+      | Round | Bonsai old | Bonsai new | Qwen3.8 old | Qwen3.8 new |
+      |---|---|---|---|---|
+      | 1 | 11.824 | 11.811 | 26.045 | 26.037 |
+      | 2 | 11.826 | 11.805 | 26.008 | 26.109 |
+
+      MTP-only rounds are not slower: every difference is at most 0.1 ms (0.4 %), within the
+      run-to-run spread.
 
 ## Appendix: sources
 

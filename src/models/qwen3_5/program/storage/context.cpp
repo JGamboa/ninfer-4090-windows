@@ -238,6 +238,7 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.execution_frontier = 0;
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
+    sequence.ngram_observed = 0;
     sequence.prefix_identity.clear();
     sequence.prefix_digests.clear();
     sequence.rope_delta              = 0;

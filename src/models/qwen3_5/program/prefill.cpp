@@ -647,6 +647,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         sequence.mtp_draft_count     = 0;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
+        // Every reuse path rebinds the ledger here; the first round reports the whole prompt,
+        // which also makes this request's own history the pool's latest continuations.
+        sequence.ngram_observed = 0;
         sequence.prefix_identity.swap(materialization_identity_);
         sequence.prefix_digests.swap(materialization_prefix_digests_);
         sequence.rebuild_work       = request_plan.root_rebuild_work;

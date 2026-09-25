@@ -356,23 +356,40 @@ void ProgramImpl::prepare_graphs() {
             nullptr);
         device.synchronize();
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                mtp_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
-                execution::capture_mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window + 1U,
-                    draft_window,
-                    mtp_causal_attention_envelopes(planned.max, draft_window, draft_window,
-                                                   capacity),
-                    profile.definition);
+        // One family per round width: K+1 for MTP-only rounds and, with n-gram drafts, V+1. A
+        // separate family keeps each width's executable installed across alternating rounds.
+        const auto capture_family = [&](DecodeGraphFamily& family, std::uint32_t verify_drafts) {
+            family.profiles.reserve(planned_profiles.size() * max_concurrency);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    family.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = family.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    execution::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), verify_drafts + 1U,
+                        draft_window,
+                        mtp_causal_attention_envelopes(planned.max, verify_drafts, draft_window,
+                                                       capacity),
+                        profile.definition);
+                }
             }
+        };
+        capture_family(mtp_graphs, draft_window);
+        if (verify_window > draft_window) {
+            // Load the wide routes' modules before capturing them.
+            prepare_representative(code_warm.min, 1);
+            device.synchronize();
+            execution::mtp_decode_batch(
+                mtp_state, 1, verify_window + 1U, draft_window,
+                mtp_causal_attention_envelopes(code_warm.max, verify_window, draft_window,
+                                               capacity),
+                nullptr);
+            device.synchronize();
+            capture_family(mtp_wide_graphs, verify_window);
         }
     }
     if (is_masked_draft_backend(speculative_backend)) {
@@ -430,6 +447,9 @@ void ProgramImpl::prepare_graphs() {
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
+        if (!mtp_wide_graphs.profiles.empty()) {
+            instantiate_graph_family(mtp_wide_graphs, "MTP wide", device, prepare_representative);
+        }
     }
     if (is_masked_draft_backend(speculative_backend)) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);

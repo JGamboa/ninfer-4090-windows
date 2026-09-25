@@ -43,8 +43,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      verify_window(plan.verify_window),
-      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
+      verify_window(plan.verify_window), ngram(plan.ngram), speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -93,6 +92,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         (workspace_plan.vision &&
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
+    }
+    if (ngram.mode != NgramDraftMode::Off) {
+        ngram_pool.emplace(NgramPoolSpec{
+            .match_tokens = ngram.match_tokens,
+            .entries      = static_cast<std::size_t>(ngram.pool_bytes / sizeof(std::uint32_t)),
+            .token_domain = dimension(parameters.model.resources().public_token_count),
+        });
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {

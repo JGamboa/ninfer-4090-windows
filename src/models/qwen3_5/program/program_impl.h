@@ -15,6 +15,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/speculative/ngram_pool.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -364,6 +365,8 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // Ledger prefix already reported to the n-gram pool; reset where a request rebinds the ledger.
+    std::size_t ngram_observed    = 0;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
@@ -572,6 +575,9 @@ public:
     // MTP: the widest verify window V, and the width of the round in flight (read at commit).
     const std::uint32_t verify_window;
     std::uint32_t mtp_round_width = 0;
+    const NgramOptions ngram;
+    // Shared by every lane of this Program; only the Engine worker mutates it.
+    std::optional<NgramDraftPool> ngram_pool;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -621,6 +627,8 @@ public:
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
+    // MTP rounds at the n-gram verify window V+1; empty without n-gram drafts.
+    DecodeGraphFamily mtp_wide_graphs;
     DecodeGraphFamily dflash_graphs;
 
     std::optional<PinnedHostBuffer> round_host;

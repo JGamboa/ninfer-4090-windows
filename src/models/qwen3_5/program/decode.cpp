@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
+#include "models/qwen3_5/program/speculative/ngram_policy.h"
 #include "core/nvtx.h"
 #include "core/device.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -9,6 +10,7 @@
 #include "ninfer/ops/scatter.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -144,6 +146,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(verified_positions, 0),
+        .verify_window         = speculative_backend == SpeculativeBackend::Mtp ? verify_window : 0U,
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -412,10 +415,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("MTP batch membership is invalid");
     }
 
-    // Drafts this round verifies (W-1). MTP proposes at most K=draft_window of them.
-    const std::uint32_t verify_drafts = draft_window;
-    const std::uint32_t width         = verify_drafts + 1;
-    std::uint32_t maximum_frontier    = 0;
+    std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -441,6 +441,45 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    // Row drafts: the MTP proposal, extended from the n-gram pool when enabled. The round verifies
+    // the full window V only when some row's usable draft pays for it; otherwise it keeps the MTP
+    // width K+1 and its graph set.
+    std::array<TokenId, kMaximumConcurrency * kMtpVerifyMaximumDrafts> row_drafts{};
+    std::array<std::uint32_t, kMaximumConcurrency> usable_drafts{};
+    std::array<std::uint32_t, kMaximumConcurrency> proposal_drafts{};
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        SequenceState& sequence = active_sequence(lanes[row]);
+        proposal_drafts[row]    = sequence.mtp_draft_count;
+        const std::span<const TokenId> proposal(sequence.mtp_drafts.data(),
+                                                sequence.mtp_draft_count);
+        const std::span<TokenId> drafts(row_drafts.data() + row * kMtpVerifyMaximumDrafts,
+                                        verify_window);
+        std::size_t count = proposal.size();
+        if (ngram_pool) {
+            ngram_pool->observe(sequence.ledger, sequence.ngram_observed);
+            sequence.ngram_observed = sequence.ledger.size();
+            std::array<TokenId, NgramDraftPool::kMaximumMatchTokens + kMtpDecodeMaximumDrafts>
+                context{};
+            count = chain_ngram_drafts(*ngram_pool, sequence.ledger, proposal, ngram.min_drafts,
+                                       context, drafts);
+        } else {
+            std::copy(proposal.begin(), proposal.end(), drafts.begin());
+        }
+        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                ? budgets[row].generated_tokens_remaining - 1
+                                                : 0;
+        usable_drafts[row] = std::min({static_cast<std::uint32_t>(count), max_by_budget,
+                                       capacity - sequence.execution_frontier - 1});
+    }
+    const std::uint32_t verify_drafts =
+        ngram_pool ? ngram_round_verify_drafts(
+                         std::span<const std::uint32_t>(usable_drafts.data(), lanes.size()),
+                         draft_window, verify_window)
+                   : draft_window;
+    const std::uint32_t width     = verify_drafts + 1;
+    const bool wide_round         = verify_drafts != draft_window;
+    DecodeGraphFamily& mtp_family = wide_round ? mtp_wide_graphs : mtp_graphs;
+
     const auto started = Clock::now();
     try {
         std::optional<nvtx::ScopedRange> submit_range;
@@ -451,9 +490,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_causal_attention_envelopes(maximum_frontier, verify_drafts, draft_window, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
-                select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
+                select_graph_profile(mtp_family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
+            executable = &install_graph_profile(mtp_family, profile, "MTP batch");
             envelopes  = mtp_causal_attention_envelopes(profile.max_execution_frontier,
                                                         verify_drafts, draft_window, capacity);
         }
@@ -462,12 +501,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1
-                                                    : 0;
-            const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, verify_drafts, max_by_budget,
-                          capacity - sequence.execution_frontier - 1});
+            const std::uint32_t extent        = std::min(usable_drafts[row], verify_drafts);
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -476,7 +510,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
             for (std::uint32_t j = 0; j < verify_drafts; ++j) {
                 mtp_host_ingress->current_drafts[row * verify_drafts + j] =
-                    j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
+                    j < extent ? row_drafts[row * kMtpVerifyMaximumDrafts + j]
+                               : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
                 const std::uint32_t position = frontier + std::min(j, extent);
@@ -544,6 +579,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             validate_licensed_tokens(row_tokens);
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
+            if (wide_round) { request.speculative_stats.wide_rounds += 1; }
             if (pcur == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -554,6 +590,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                const DraftSourceCounts sources = draft_source_counts(
+                    pcur, proposal_drafts[row], static_cast<std::uint32_t>(accepted_i));
+                request.speculative_stats.ngram_drafted_tokens += sources.ngram_drafted;
+                request.speculative_stats.ngram_accepted_tokens += sources.ngram_accepted;
             }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,

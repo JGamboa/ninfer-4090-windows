@@ -19,6 +19,10 @@ ninfer_add_test(ninfer_qwen3_5_frontend_test
 ninfer_add_test(ninfer_qwen3_5_ngram_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_pool.cpp")
 
+# Host-only: the n-gram chain and round-width policy is header-only.
+ninfer_add_test(ninfer_qwen3_5_ngram_policy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_policy.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
