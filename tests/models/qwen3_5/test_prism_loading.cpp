@@ -49,6 +49,36 @@ void valid(const std::filesystem::path& path) {
     require(plan.weights().mtp.has_value(), "copied MTP head was not bound");
 }
 
+// A `bonsai2_27b_mtp_*` artifact: the requantized MTP layer binds with its stored formats
+// (Q4/Q5; the mix as a Q4 query/key parent and a Q5 gate/value parent) and the fc input
+// projection stays Q8.
+void requantized_mtp(std::string_view variant, const std::filesystem::path& path) {
+    artifact::Reader reader(path);
+    const auto plan = qwen::plan_load(reader, {.speculative = SpeculativeBackend::Mtp});
+    require(plan.weights().mtp.has_value(), "requantized MTP head was not bound");
+    const auto& mtp       = *plan.weights().mtp;
+    const auto& attention = std::get<qwen::AttentionWeights>(mtp.layer.mixer);
+    const auto& mlp       = std::get<qwen::DenseWeights>(mtp.layer.ffn);
+    const bool mix        = variant == "q4q5";
+    const std::string q4  = (mix ? std::string("q4") : std::string(variant)) + "_g64_fp16";
+    const std::string q5  = (mix ? std::string("q5") : std::string(variant)) + "_g64_fp16";
+    for (const auto id : {attention.query, attention.key, mlp.gate, mlp.up}) {
+        require(format_of(plan, reader, id) == q4, "MTP query/key/gate/up format differs");
+    }
+    for (const auto id : {attention.gate, attention.value, attention.output, mlp.down}) {
+        require(format_of(plan, reader, id) == q5, "MTP gate/value/output/down format differs");
+    }
+    require(format_of(plan, reader, mtp.input_projection) == "q8_g32_fp16",
+            "MTP input projection is not the copied Q8");
+    const auto parent = [&](qwen::WeightId id) {
+        return plan.parameter(id).binding.parts.at(0).object;
+    };
+    require(parent(attention.key) == parent(attention.query) &&
+                parent(attention.value) == parent(attention.gate) &&
+                (parent(attention.query) == parent(attention.gate)) == !mix,
+            "MTP attention input parents differ from the recipe's packing");
+}
+
 void rejected(const std::filesystem::path& path, std::string_view expected) {
     try {
         artifact::Reader reader(path);
@@ -73,8 +103,11 @@ int main(int argc, char** argv) {
             valid(argv[1]);
         } else if (argc == 4 && std::string_view(argv[1]) == "--reject") {
             rejected(argv[3], argv[2]);
+        } else if (argc == 4 && std::string_view(argv[1]) == "--mtp") {
+            requantized_mtp(argv[2], argv[3]);
         } else {
-            std::cerr << "usage: " << argv[0] << " ARTIFACT | --reject MESSAGE ARTIFACT\n";
+            std::cerr << "usage: " << argv[0]
+                      << " ARTIFACT | --reject MESSAGE ARTIFACT | --mtp q5|q4|q4q5 ARTIFACT\n";
             return 2;
         }
         std::cout << "prism loading checks passed\n";

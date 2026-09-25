@@ -158,7 +158,7 @@ What the recipe writes:
 | GDN `a_projection`, `b_projection` | bf16, separate parents | GGUF BF16, grouped head order |
 | norms, `a_log`, `dt_bias`, `convolution`, q/k norms | as the Qwen3.8 recipe | GGUF F32 with the M0 conventions |
 | `text/hadamard/signs_{5120,6144,17408}` | bf16 | `prism.hadamard.sign_values` |
-| `mtp/*` | as stored in the reference (Q8 words copied exactly) | `qwen3_8_27b.ninfer` |
+| `mtp/*` | as stored in the reference (Q8 words copied exactly); the MTP layer in Q5/Q4/mix with the `bonsai2_27b_mtp_*` recipes (below) | `qwen3_8_27b.ninfer` |
 | `dflash2/*` | as the official recipes | DFlash2 HF companion |
 
 Run on Windows (venv of design doc section 6.5):
@@ -234,3 +234,22 @@ The preprocessor resources come from the reference's `vision` component, or from
 `bonsai_vision_check` prints the relative L2 difference of sampled Vision parameters
 against the reference tower (same weights: about 0.01 to 0.1 from the two quantizations;
 different weights: near 1). Synthetic coverage: `tests/convert/test_bonsai_vision.py`.
+
+### Lower-precision MTP layer
+
+`bonsai2_27b_mtp_q5`, `bonsai2_27b_mtp_q4` and `bonsai2_27b_mtp_q4q5` are `bonsai2_27b` with
+the MTP layer's projections (attention q/k/gate/v/output, MLP gate/up/down) quantized by
+grouped absmax from the reference's decoded Q8 values instead of copied: all Q5, all Q4, or
+the official Qwen3.8 mix (Q4 query/key and MLP gate/up, Q5 the rest). `mtp/input_projection`
+and the MTP norms stay copied exactly. They require the `mtp` component and cut the draft
+cost (design doc section 9.1, item 11). Same inputs as the Vision build above:
+
+```
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe bonsai2_27b_mtp_q5 ^
+  --components text,vision,mtp --source gguf=E:\LLM\Ternary-Bonsai-2-27B-PTQ1_0.gguf ^
+  --source mmproj=E:\LLM\bonsai\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf ^
+  --source mtp=E:\LLM\qwen3_8_27b.ninfer --proposal --name bonsai2-27b ^
+  --out E:\LLM\bonsai2_27b_vl_mtp_q5.ninfer --device cuda
+```
+
+Replace `q5` by `q4` or `q4q5` (recipe and output name) for the other two.

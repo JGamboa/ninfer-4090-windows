@@ -2,6 +2,7 @@
 
 #include "core/weight_view.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -158,7 +159,19 @@ public:
         out.input_norm          = tensor(w.layer.input_norm);
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
-        out.projection.packed   = ops::prepare_linear_weight(inputs);
+        // The recipe stores the four row banks in one parent or, in the mixed Q4/Q5 form, in a
+        // query/key parent and a gate/value parent.
+        const auto* parent = model_.weight(a.query).view.parts.front().parent;
+        const bool one_parent = std::ranges::all_of(inputs, [&](const ops::WeightInput& input) {
+            return std::ranges::all_of(input.weight.parts,
+                                       [&](const auto& part) { return part.parent == parent; });
+        });
+        if (one_parent) {
+            out.projection.complete = ops::prepare_linear_weight(inputs);
+        } else {
+            out.projection.complete = ops::prepare_attn_input_proj_weights(
+                inputs[0], inputs[1], inputs[2], inputs[3]);
+        }
         if (model_.config().text.architecture == Architecture::Qwen3_5) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
         }

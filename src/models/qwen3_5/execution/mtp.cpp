@@ -2,16 +2,32 @@
 
 #include "core/layout.h"
 #include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/linear_pair.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/mtp_pack.h"
 
 #include <algorithm>
+#include <stdexcept>
+#include <variant>
 
 namespace ninfer::models::qwen3_5::execution {
+namespace {
+
+std::size_t linear_bytes(const LinearParameters& p, std::int32_t first, std::int32_t last) {
+    const auto& w = p.weight;
+    return ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last);
+}
+
+} // namespace
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
-    const auto& p = parameters.packed;
+    if (std::holds_alternative<ops::PairedProjectionWeights>(parameters.complete)) {
+        if (first <= 0 || last < first) {
+            throw std::invalid_argument("MTP projection: invalid column interval");
+        }
+        return 0; // the paired attention-input routes use no transient storage
+    }
+    const auto& p = std::get<LinearParameters>(parameters.complete);
     const auto& w = p.weight;
     if (!parameters.rows) {
         return ops::attn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first,
@@ -19,8 +35,7 @@ std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parame
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {w.n, last});
-    (void)layout.alloc_bytes(
-        ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last));
+    (void)layout.alloc_bytes(linear_bytes(p, first, last));
     return layout.peak_bytes(1);
 }
 
@@ -28,8 +43,8 @@ std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
     if (parameters.rows) {
-        return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1].weight,
-                                                         (*parameters.rows)[3].weight, first, last);
+        return std::max(linear_bytes((*parameters.rows)[1], first, last),
+                        linear_bytes((*parameters.rows)[3], first, last));
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {dimension(config.query_width()), last});
@@ -42,12 +57,8 @@ std::size_t mtp_query_gate_workspace_bytes(const MtpProjectionParameters& parame
                                            const AttentionConfig& config, std::int32_t first,
                                            std::int32_t last) {
     if (parameters.rows) {
-        const auto bytes = [&](std::size_t index) {
-            const auto& p = (*parameters.rows)[index];
-            const auto& w = p.weight;
-            return ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last);
-        };
-        return std::max(bytes(0), bytes(2));
+        return std::max(linear_bytes((*parameters.rows)[0], first, last),
+                        linear_bytes((*parameters.rows)[2], first, last));
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {dimension(config.key_width()), last});
@@ -59,7 +70,11 @@ std::size_t mtp_query_gate_workspace_bytes(const MtpProjectionParameters& parame
 void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                     const AttentionConfig& config, Tensor& query, Tensor& gate, Tensor& key,
                     Tensor& value, WorkspaceArena& workspace, cudaStream_t stream) {
-    const auto& p = parameters.packed;
+    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.complete)) {
+        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
+        return;
+    }
+    const auto& p = std::get<LinearParameters>(parameters.complete);
     if (!parameters.rows) {
         ops::attn_input_proj(hidden, p.weight, query, gate, key, value, p.policy, workspace,
                              stream);
@@ -84,8 +99,15 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
     if (parameters.rows) {
-        ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
-                         value, stream);
+        // Row views of whichever parent holds K and V: one Linear each, in every stored format.
+        const auto& k = (*parameters.rows)[1];
+        const auto& v = (*parameters.rows)[3];
+        {
+            auto scope = workspace.scope();
+            ops::linear(hidden, k.weight, key, k.policy, workspace, stream);
+        }
+        auto scope = workspace.scope();
+        ops::linear(hidden, v.weight, value, v.policy, workspace, stream);
         return;
     }
     auto scope   = workspace.scope();
@@ -104,6 +126,7 @@ void mtp_query_gate_projection(const Tensor& hidden, const MtpProjectionParamete
             auto scope = workspace.scope();
             ops::linear(hidden, q.weight, query, q.policy, workspace, stream);
         }
+        auto scope = workspace.scope();
         ops::linear(hidden, g.weight, gate, g.policy, workspace, stream);
         return;
     }

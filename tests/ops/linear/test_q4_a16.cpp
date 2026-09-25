@@ -136,6 +136,33 @@ int q4_a16_conformance() {
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {34816, 5120, 113U, Comparison::Sampled, false, kN34816K5120});
 
+    // Q4 MTP layer: the packed Q/K/gate/V parent [14336,5120] and the down projection
+    // [5120,17408]. Full output covers every mechanism the two tables select at the decode
+    // extents and both sides of each K-split capacity; the sampled set covers the MMA tiers.
+    constexpr std::array kN14336K5120Full{
+        graph(1), a16(2), graph(3), a16(4), a16(5), graph(8), a16(9),
+        a16(16),  a16(17), graph(24), a16(25), a16(32), a16(33), a16(64),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {14336, 5120, 137U, Comparison::Full, true, kN14336K5120Full});
+    constexpr std::array kN14336K5120{
+        a16(65), graph(128), a16(129), a16(512), graph(1024), a16(1025),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {14336, 5120, 137U, Comparison::Sampled, false, kN14336K5120});
+
+    constexpr std::array kN5120K17408Full{
+        convenience(1), graph(1), a16(2), graph(3), a16(4), a16(5), graph(8), a16(9),
+        a16(16),        a16(17), a16(24), graph(25), a16(32), a16(33), a16(96), a16(97),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 17408, 139U, Comparison::Full, true, kN5120K17408Full});
+    constexpr std::array kN5120K17408{
+        a16(128), graph(192), a16(193), a16(512), graph(1024), a16(1025),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 17408, 139U, Comparison::Sampled, false, kN5120K17408});
+
     constexpr std::array kN131072K5120{
         a16(1), a16(2), a16(3), a16(4),   a16(5),   a16(6),
         a16(7), a16(8), a16(9), graph(3), graph(7), a16(128),

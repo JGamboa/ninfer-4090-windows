@@ -1138,10 +1138,9 @@ prompts (mean 163, draft 2, `--lm-head-draft`, ~13.0 ms per round); tg128 101 to
 
 Next steps, in order:
 
-1. Done 2026-09-24 (section 9, "Draft-side experiments"): a Q4/Q5 MTP layer needs Q4/Q5
-   routes in the MTP composition (`linear_pair` and a split attention parent) and was not
-   pursued; a 34816-row proposal head gains 2.1 % on average but loses on Spanish prose, so the
-   default stays 131072.
+1. Done 2026-09-24 (section 9, "Draft-side experiments"): a 34816-row proposal head gains
+   2.1 % on average but loses on Spanish prose, so the default stays 131072. The Q4/Q5 MTP
+   layer that experiment could not start now has its routes (item 11); it awaits measurement.
 2. Measure decode with the monitor cable on the iGPU (motherboard output), the six prompts,
    beside the 60 Hz figures of section 9. Expected: the ~2.2 ms of compositor stalls per round
    disappear. Until then the display runs at 60 Hz.
@@ -1578,6 +1577,50 @@ Next steps, in order:
       +0.54 ms and d12 +1.08 ms per round (`q5_ksplit_mma` +0.69 ms at d12, for example).
       That is clock and thermal drift between runs at 60 Hz, larger than the saving. The
       plain-run tok/s differ in text as well as time and are not a speed comparison.
+11. Q5, Q4 and Q4/Q5-mix MTP layer (2026-09-25, not yet built or measured on the RTX 4090).
+    The MTP layer (1.32 ms of a ~12.3 ms round in Q8, item 6A) can now be stored in Q5, Q4 or
+    the official Qwen3.8 mix (Q4 attention query/key and MLP gate/up; Q5 attention gate/value/
+    output and MLP down). `mtp/input_projection` ([5120,10240]) stays the copied Q8 words in
+    every variant: no Q4/Q5 Linear is registered at K = 10240. Bytes read per draft step drop
+    from ~0.45 GB (Q8) to ~0.30 GB (Q5), ~0.27 GB (mix) and ~0.25 GB (Q4), fc included.
+    - Model composition (`execution/mtp.cpp`, `parameters.cpp`). The complete Q/K/gate/V
+      projection is one Linear over a contiguous parent plus the split, as before, or, for the
+      mix's query/key (Q4) and gate/value (Q5) parents, the text layers' paired
+      `attn_input_proj`. The incremental prefill projects K and V with one `linear` per row
+      view instead of `linear_pair` (Q8 RowSplit only), so it runs in every stored format.
+      The MLP keeps the MTP's `linear` + `silu_mul` + `linear` composition: `linear` covers
+      all three variants with shape registrations only, while the fused FFN Ops of the text
+      layers have no Q5 gate/up nor Q4 K = 17408 down family.
+    - New `linear` problems (selection tables only, not retuned for these geometries): Q5
+      `[14336,5120]` and `[34816,5120]` (the n7168 table; every Q5 route takes its row count
+      at run time, so no new kernel instance), Q4 `[14336,5120]` (K-split capacities 4-24 of
+      that row count, then the shared MMA tiles) and Q4 `[5120,17408]` (the n5120_k6144 tiers
+      with a run-time-ownership GEMV at T = 1 and K-split instances at K = 17408). ptxas on
+      sm_89: no spills (K-split 39-78 registers, GEMV 47). The mix needs none of them: its
+      shapes were all registered.
+    - Converter: recipes `bonsai2_27b_mtp_q5`, `_q4`, `_q4q5` (`tools/convert/official_recipes.py`)
+      are `bonsai2_27b` with the MTP layer quantized by grouped absmax from the reference's
+      decoded Q8 values (commands in `bonsai-ternary-conversion.md`).
+    - Oracle coverage: `ninfer_linear_q5_a16_test` and `ninfer_linear_q4_a16_test` (FP64
+      oracle, full output at the decode extents, sampled across every route boundary, graph
+      replays); `tests/convert/test_bonsai_recipe.py` (every requantized element within half a
+      step of the reference value, formats, parents, the copied fc); the Prism loading
+      interop test plans all three variants and checks their MTP bindings.
+    - Acceptance: verification stays lossless, but a coarser drafter proposes worse tokens, so
+      the gain must be read as tokens per round and ms per round together, not tok/s alone.
+      Expected: at most ~0.5 ms per round (~4 %) if acceptance holds.
+
+    Validation the RTX 4090 session must run:
+    1. Build `ninfer_linear_q4_a16_test`, `ninfer_linear_q5_a16_test`,
+       `ninfer_qwen3_5_prism_loading_test` and the engine/CLI; run the two linear tests and
+       `ctest -R "prism_loading|linear_q[45]_a16"`.
+    2. Convert the three variants (same inputs as `bonsai2_27b_vl.ninfer`).
+    3. Six prompts, MTP draft 2, `--lm-head-draft`, greedy, 512 new tokens, display at 60 Hz,
+       for the Q8 reference and each variant: tok/s, tokens per round (acceptance) and ms per
+       round (wall time / rounds), as in the section 9 tables. One `nsys profile --trace=cuda,nvtx
+       --cuda-graph-trace=node` short-context run (item 6A setup) of the best variant for the
+       MTP layer's ms per round against 1.32.
+    4. Quick perplexity is unaffected (the MTP layer is draft-only); no need to rerun.
 
 ## Appendix: sources
 

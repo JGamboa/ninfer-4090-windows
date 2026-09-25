@@ -64,6 +64,21 @@ def _optional(model, recipe):
                 recipe.share(prefix + "context_" + role, prefix + role)
 
 
+# The official dense Q4/Q5 mix: Q4 for the query/key and gate/up banks, Q5 for the rest.
+_MIX_Q4 = (
+    "/attention/query",
+    "/attention/key",
+    "/gdn/query",
+    "/gdn/key",
+    "/mlp/gate",
+    "/mlp/up",
+)
+
+
+def _mixed_format(name):
+    return Q4 if name.endswith(_MIX_Q4) else Q5
+
+
 def _dense_groupwise(model, recipe, vocabulary):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
@@ -76,20 +91,7 @@ def _dense_groupwise(model, recipe, vocabulary):
         if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
             recipe.separate(name)
             continue
-        if name.endswith(
-            (
-                "/attention/query",
-                "/attention/key",
-                "/gdn/query",
-                "/gdn/key",
-                "/mlp/gate",
-                "/mlp/up",
-            )
-        ):
-            format = Q4
-        else:
-            format = Q5
-        _assign(recipe, name, format)
+        _assign(recipe, name, _mixed_format(name))
 
 
 def qwen3_6_27b(model, recipe, sources):
@@ -243,8 +245,22 @@ def _bonsai_geometry(model, gguf: PrismCheckpoint) -> None:
         raise ValueError("bonsai: the Prism GGUF has an untied output head")
 
 
-def _bonsai_mtp(model, recipe, reference: NInferArtifactStore) -> None:
-    """Copy MTP exactly: grouped-integer parents as stored words, direct values as stored."""
+# Formats of the MTP layer's projections (attention q/k/gate/v/output, MLP gate/up/down) for
+# the `bonsai2_27b_mtp_*` recipes, which requantize them from the reference's decoded values
+# to cut the draft cost (design doc section 9.1). `mtp/input_projection` ([5120,10240]) keeps
+# the copied Q8 words in every variant.
+BONSAI_MTP_LAYER_FORMATS = {
+    "q5": lambda name: Q5,
+    "q4": lambda name: Q4,
+    "q4q5": _mixed_format,
+}
+
+
+def _bonsai_mtp(model, recipe, reference: NInferArtifactStore, layer_format=None) -> None:
+    """Copy MTP exactly: grouped-integer parents as stored words, direct values as stored.
+
+    With `layer_format` (name -> format), the projections under `mtp/layers/` are instead
+    quantized with grouped absmax from the reference's decoded values."""
     component = reference.directory.components.get("text", {}).get("config", {})
     for key in _MTP_CONFIG_FIELDS:
         if component.get(key) != model.config.get(key):
@@ -254,17 +270,20 @@ def _bonsai_mtp(model, recipe, reference: NInferArtifactStore) -> None:
             continue
         source = reference.parameter_source(name, parameter.shape)
         format = reference.stored_format(name)
-        if isinstance(get_format(format), DirectFormat):
+        if layer_format is not None and parameter.projection and name.startswith("mtp/layers/"):
+            _assign(recipe, name, layer_format(name), source=source)
+        elif isinstance(get_format(format), DirectFormat):
             recipe.assign(name, format=format, method=cast_direct, source=source)
         else:
             recipe.assign(name, format=format, method=import_encoded, source=source)
 
 
-def bonsai2_27b(model, recipe, sources):
+def bonsai2_27b(model, recipe, sources, mtp_layer=None):
     """Prism Ternary Bonsai 2: t5 projections, output head and embedding, copied MTP.
 
     Sources: ``gguf`` (the PTQ1_0/PQ2_0 GGUF); with the ``mtp`` component, ``mtp`` (an
-    existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word); with the
+    existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word, or with its layer
+    requantized to the `BONSAI_MTP_LAYER_FORMATS[mtp_layer]` formats); with the
     ``vision`` component, ``mmproj`` (Prism's Qwen3-VL mmproj GGUF, not ternary), quantized
     to the official Vision formats (Q4/Q5/Q6/Q8, the registered Vision kernels).
     """
@@ -336,7 +355,10 @@ def bonsai2_27b(model, recipe, sources):
         "embedding_inverse": True,
     }
     if "mtp" in model.components:
-        _bonsai_mtp(model, recipe, sources["mtp"])
+        layer_format = None if mtp_layer is None else BONSAI_MTP_LAYER_FORMATS[mtp_layer]
+        _bonsai_mtp(model, recipe, sources["mtp"], layer_format)
+    elif mtp_layer is not None:
+        raise ValueError(f"bonsai2_27b_mtp_{mtp_layer} requires the mtp component")
     if "vision" in model.components:
         _bonsai_vision(model, recipe, sources["mmproj"])
 
@@ -352,6 +374,14 @@ def _bonsai_vision(model, recipe, mmproj):
             recipe.assign(name, source=source)
 
 
+def _bonsai2_27b_mtp(layer):
+    def configure(model, recipe, sources):
+        bonsai2_27b(model, recipe, sources, mtp_layer=layer)
+
+    configure.__name__ = f"bonsai2_27b_mtp_{layer}"
+    return configure
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -359,4 +389,5 @@ RECIPES = {
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "bonsai2_27b": bonsai2_27b,
+    **{f"bonsai2_27b_mtp_{layer}": _bonsai2_27b_mtp(layer) for layer in BONSAI_MTP_LAYER_FORMATS},
 }

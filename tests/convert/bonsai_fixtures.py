@@ -3,7 +3,7 @@
 `write_gguf` builds a Bonsai-shaped PQ2_0 GGUF (hidden 1024, 4 layers, a nontrivial 2 x 2
 GDN head permutation) and keeps the stored codes for independent oracles; `write_reference`
 converts a random Qwen3.8-shaped reference artifact with a Q8 MTP head; `convert_bonsai`
-runs `bonsai_base` and the `bonsai2_27b` CLI on both.
+runs `bonsai_base` and the `bonsai2_27b` (or a `bonsai2_27b_mtp_*`) CLI on both.
 """
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ def write_reference(tmp_path):
     return path
 
 
-def convert_bonsai(tmp_path, *extra):
+def convert_bonsai(tmp_path, *extra, recipe="bonsai2_27b"):
     """Write the GGUF, reference and base directory, then run the CLI; return all paths."""
     fixture, signs = write_gguf(tmp_path / "bonsai.gguf")
     reference = write_reference(tmp_path)
@@ -224,7 +224,7 @@ def convert_bonsai(tmp_path, *extra):
     convert_main(
         [
             "--model", str(tmp_path / "base"),
-            "--recipe", "bonsai2_27b",
+            "--recipe", recipe,
             "--components", "text,mtp",
             "--source", f"gguf={tmp_path / 'bonsai.gguf'}",
             "--source", f"mtp={reference}",

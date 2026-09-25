@@ -174,3 +174,59 @@ def test_mtp_is_copied_word_for_word(converted):
             else:
                 assert torch.equal(source.dequantize(name), result.dequantize(name)), name
 
+
+# Expected stored format of every MTP layer projection per `bonsai2_27b_mtp_*` variant: the
+# official Qwen3.8 mix puts the attention query/key and MLP gate/up banks in Q4, the rest in Q5.
+_MTP_LAYER = "mtp/layers/0/"
+_MTP_ROLES = (
+    "attention/query", "attention/key", "attention/gate", "attention/value", "attention/output",
+    "mlp/gate", "mlp/up", "mlp/down",
+)
+_MTP_Q4_IN_MIX = {"attention/query", "attention/key", "mlp/gate", "mlp/up"}
+_QMAX = {"q4_g64_fp16": 7, "q5_g64_fp16": 15}
+
+
+def _expected_mtp_format(variant, role):
+    if variant == "q4q5":
+        return "q4_g64_fp16" if role in _MTP_Q4_IN_MIX else "q5_g64_fp16"
+    return f"{variant}_g64_fp16"
+
+
+@pytest.mark.parametrize("variant", ["q5", "q4", "q4q5"])
+def test_mtp_layer_is_requantized_from_the_reference_values(tmp_path, variant):
+    *_, reference, out, _ = convert_bonsai(tmp_path, recipe=f"bonsai2_27b_mtp_{variant}")
+    with NInferArtifactStore(reference) as source, NInferArtifactStore(out) as result:
+        assert {n for n in source.parameters() if n.startswith("mtp/")} == {
+            n for n in result.parameters() if n.startswith("mtp/")
+        }
+        for role in _MTP_ROLES:
+            name = _MTP_LAYER + role
+            format = _expected_mtp_format(variant, role)
+            assert result.stored_format(name) == format, name
+            # Symmetric grouped absmax of the reference's decoded values: every element lies
+            # within half a step (binary16 scale absmax/qmax) of its source value.
+            values = source.dequantize(name).double()
+            groups = values.reshape(values.shape[0], -1, 64)
+            step = groups.abs().amax(dim=2, keepdim=True) / _QMAX[format]
+            error = (result.dequantize(name).double().reshape(groups.shape) - groups).abs()
+            assert bool((error <= step * (0.5 + 2.0**-9)).all()), name
+            assert float(error.max()) > 0, name  # requantized, not copied
+        # The fc input projection and every direct parameter are still copied exactly.
+        rows = result.dequantize("mtp/input_projection").shape[0]
+        a = source.encoded_rows("mtp/input_projection", 0, rows)
+        b = result.encoded_rows("mtp/input_projection", 0, rows)
+        assert torch.equal(a.codes, b.codes) and torch.equal(a.scales, b.scales)
+        for name in ("mtp/embedding_norm", "mtp/final_norm", _MTP_LAYER + "attention/query_norm"):
+            assert torch.equal(source.dequantize(name), result.dequantize(name)), name
+    with Artifact(out) as artifact:
+        query = _parent(artifact, _MTP_LAYER + "attention/query")
+        gate = _parent(artifact, _MTP_LAYER + "attention/gate")
+        # One Q/K/gate/V parent for a single format; the mix splits it into the query/key and
+        # gate/value parents the paired attention-input Op reads.
+        assert _parent(artifact, _MTP_LAYER + "attention/key").id == query.id
+        assert _parent(artifact, _MTP_LAYER + "attention/value").id == gate.id
+        assert (query.id == gate.id) == (variant != "q4q5")
+        assert _parent(artifact, _MTP_LAYER + "mlp/up").id == _parent(
+            artifact, _MTP_LAYER + "mlp/gate"
+        ).id
+

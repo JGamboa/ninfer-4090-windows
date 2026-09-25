@@ -58,10 +58,13 @@ struct TextParameters {
     std::vector<BlockParameters> layers;
 };
 
+// The MTP layer's Q/K/gate/V projection. `complete` is the whole projection of the decode
+// path: one contiguous parent is a Linear over the parent followed by the split (dense) or the
+// single-parent attention-input Op (MoE); a Q4 query/key parent with a Q5 gate/value parent
+// (the text layers' mixed form) is the paired attention-input Op. Dense MTP also keeps the
+// four row views: its incremental prefill projects K/V and Q/gate independently.
 struct MtpProjectionParameters {
-    LinearParameters packed;
-    // Dense MTP projects K/V and Q/gate independently in its incremental path.
-    // MoE MTP uses its existing complete-parent Attention projection.
+    ops::ProjectionWeights complete;
     std::optional<std::array<LinearParameters, 4>> rows;
 };
 

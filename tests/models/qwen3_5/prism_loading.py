@@ -54,6 +54,12 @@ def main() -> int:
         *_, out, _ = convert_bonsai(root / "valid")
         if subprocess.run([executable, str(out)]).returncode:
             return 1
+        for variant in ("q5", "q4", "q4q5"):
+            directory = root / f"mtp_{variant}"
+            directory.mkdir()
+            *_, out, _ = convert_bonsai(directory, recipe=f"bonsai2_27b_mtp_{variant}")
+            if subprocess.run([executable, "--mtp", variant, str(out)]).returncode:
+                return 1
         for name, message in CASES:
             directory = root / name
             directory.mkdir()

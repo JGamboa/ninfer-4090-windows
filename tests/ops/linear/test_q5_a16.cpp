@@ -80,6 +80,24 @@ int q5_a16_conformance() {
     failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
                           {7168, 5120, 163U, Comparison::Sampled, false, kN7168K5120});
 
+    // Q5 MTP layer parents: the packed Q/K/gate/V [14336,5120] and gate/up [34816,5120]. Full
+    // output at the decode extents (one and three draft columns, the capacity tiers), sampled
+    // across every other route boundary of the tables.
+    constexpr std::array kQ5MtpFull{
+        graph(1), a16(2), graph(3), a16(4), a16(5), graph(6), a16(7), a16(11), a16(12),
+    };
+    constexpr std::array kQ5MtpBulk{
+        a16(16), graph(24), a16(112), a16(113), graph(128), a16(512), a16(1024),
+    };
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {14336, 5120, 187U, Comparison::Full, true, kQ5MtpFull});
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {14336, 5120, 187U, Comparison::Sampled, false, kQ5MtpBulk});
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {34816, 5120, 191U, Comparison::Full, true, kQ5MtpFull});
+    failures += run_shape("Q5_A16", ActivationCompute::A16, make_q5_g64_fp16_weight,
+                          {34816, 5120, 191U, Comparison::Sampled, false, kQ5MtpBulk});
+
     constexpr std::array kN5120K6144{
         graph(1),
         a16(2),
