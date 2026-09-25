@@ -1620,6 +1620,50 @@ Next steps, in order:
        --cuda-graph-trace=node` short-context run (item 6A setup) of the best variant for the
        MTP layer's ms per round against 1.32.
     4. Quick perplexity is unaffected (the MTP layer is draft-only); no need to rerun.
+12. Warp-pair QK split for packed KV on sm_89 (`0354c53` + `19d7567`, measured 2026-09-25,
+    RTX 4090 at 60 Hz, server off). `0354c53` splits the small-T QK across warp pairs and
+    prefetches `block_table` and `pos[]` outside the loop.
+    - `0354c53` alone does not link. The device link of `ninfer_ops` stops with 320 nvlink
+      errors of the form `Entry function
+      '..._causal_attention_small_t_i8_tiled_kernel...' uses too much shared data (0xc040
+      bytes, 0xc000 max)`. The failing instances are:
+      - `CausalAttentionGeometry<24,4,1>` at TokenTile 6-8 and `<16,2,2>` at TokenTile 5-6;
+      - 12 and 24 warps, MinBlocks 1, KeyBlock 32;
+      - both the cached and the append input.
+
+      Each is 64 bytes over the 48 KiB static limit.
+    - `19d7567` keeps the column split within 48 KiB (the excess was `pair_s`). It builds.
+      `ninfer_softmax_attention_test --rk4v4-e8-only` passes (175 s), and the full
+      `ninfer_softmax_attention_test` passes (325 s).
+    - Nsight Compute, same launch as items 8 and 10: Bonsai `long_niah_128k`, rk4v4-e8,
+      `--launch-skip 200`, the same instance
+      `<CausalAttentionGeometry<24,4,1>, 3, 8, 2, 32, ...>` on a 4 x 128 grid. Report:
+      `profiles/ncu/rk4_src_19d`, source view `rk4_src_19d_sass.csv`. `b14ed06` -> `19d7567`:
+
+      | Per launch | `b14ed06` | `19d7567` |
+      |---|---|---|
+      | Duration | 260.4-262.4 us | **326.5 us (+25 %)** |
+      | DRAM | 141.7 MB at 544 GB/s, 66.8 % | 153.2 MB at 469 GB/s, 59.2 % |
+      | Registers per thread / theoretical CTAs per SM | 128 / 2 | 128 / 2 |
+      | Static shared memory per CTA (+1.02 KB driver; 102.4 KB carve-out in both) | 43.65 KB | 43.90 KB |
+      | Achieved occupancy (active warps per SM) | 31.7 % (15.2) | **16.6 % (7.98)** |
+      | Warp cycles per issued instruction | 10.44 | 6.36 |
+      | Issued instructions | 124.9 M | 128.5 M |
+      | Stall samples: total / barrier | 44449 / 12249 | 55130 / 5251 |
+      | Barrier after QK / V dequant | 10294 (line 664, charged to the `if (has_next)` branch) | 2303 (line 709, charged to line 712) |
+      | Barrier at the end of the iteration | 1768 (line 712, charged to the loop head) | 2606 (line 760, charged to line 523) |
+      | New warp-pair barrier (`BAR.SYNC R13, 0x40`, `pair_s` exchange, lines 620-623) | - | 183 |
+      | Long scoreboard at `has_next` | 3350 (line 666) | 0 (line 711) |
+      | Long scoreboard at the `block_table` load | 411 (line 670) | 715 (line 717, `next_physical_page =`) |
+      | Largest long-scoreboard line | 3350 (`has_next`) | 4255 (line 750, `ldmatrix_x2_t` of the V fragments) |
+
+      Within the kernel, the barrier stall falls to 43 % of its former count and the
+      `has_next` long scoreboard disappears. The launch is still slower because the achieved
+      occupancy halves: about one resident CTA per SM, against two before. The theoretical
+      limits and the shared-memory carve-out are unchanged, so the cause is not a resource
+      limit. The profile does not show which cause it is. The CTAs also read 8 % more DRAM
+      bytes.
+    - Qwen3.8 nsys at 128K was not run, because the kernel did not improve.
 
 12. Concurrent-lane MTP decode: small-T tensor-core route (implemented; compiled for sm_89 on
     Linux with CUDA 13, no GPU; not yet run on the RTX 4090).
