@@ -1870,6 +1870,26 @@ Next steps, in order:
 
         The kernel gains ~20 %; the whole 128K prefill gains 6.5-8.1 %, below the -13 to
         -23 % estimate.
+    - MTP layer in Q5, Q4 and the Q4/Q5 mix (`531f09b`, item 11).
+      - The three variants were converted with the `bonsai-ternary-conversion.md` command
+        (`--recipe bonsai2_27b_mtp_{q5,q4,q4q5}`, ~205 s each, ~6.5 GB each):
+        `E:\LLM\bonsai2_27b_vl_mtp_{q5,q4,q4q5}.ninfer`.
+      - Six prompts, MTP 2, `--lm-head-draft`, greedy, 512 new tokens, new binary. Q8 was run
+        before and after the variants to bound the drift; ms per round is decode time / MTP
+        rounds.
+
+        | MTP layer | Mean tok/s | Mean acceptance | Tokens per round | ms per round | Text vs Q8 |
+        |---|---|---|---|---|---|
+        | Q8 (first / repeat) | 175.2 / 180.0 | 57.0 % | 2.145 | 12.06 / 11.84 | reference |
+        | Q5 | 185.2 | 57.9 % | 2.162 | 11.66 | 6/6 identical |
+        | Q4 | 186.9 | 57.3 % | 2.148 | 11.48 | 6/6 identical |
+        | Q4/Q5 mix | 188.8 | 58.6 % | 2.175 | 11.44 | 5/6 identical |
+
+        Acceptance does not fall in any variant. Against the mean of the two Q8 runs (11.95
+        ms), the round is 0.29 (Q5), 0.47 (Q4) and 0.51 ms (mix) shorter, -2.4 to -4.3 %; the
+        estimate was <= 0.5 ms. The two Q8 runs differ by 0.22 ms, so the gain is above but
+        close to the run-to-run spread. The one differing mix text is a greedy tie: the
+        verification width follows the acceptance pattern.
 
 ## Appendix: sources
 
