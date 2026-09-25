@@ -2223,7 +2223,11 @@ Next steps, in order:
         419 tok/s) disagree in sign. The multi-lane effect is unresolved, not a measured loss.
       - Qwen3.8 through its launcher is in WINDOWS_PORT.md: long-context edits run 258 against
         139 tok/s (d6), agent prompts tie, and free-form prompts are 85 against 99.
-      - Both launchers are unchanged pending the user's decision.
+      - Prefill is unchanged by n-gram drafts: Bonsai 3.18-3.32K tok/s, Qwen3.8 1.90-1.98K tok/s
+        on the 6.6K and 10.6K prompts.
+      - Adopted on 2026-09-25: `start-bonsai-server - ninfer.bat` adds `--ngram chain`, and both
+        Qwen3.8 launchers move to MTP 3 + n-gram with CUDA graphs (backups
+        `.bak-20260925-ngram`).
 
 ## Appendix: sources
 

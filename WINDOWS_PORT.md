@@ -756,4 +756,9 @@ lane active; decode tok/s from the request log:
   variants: the transformer answer is 2537 tokens with d6 and 415 with MTP 3.
 - Three concurrent requests: the wall-clock throughput ties (187 against 182 tok/s), but the sampled
   output lengths differ per variant, so this comparison cannot separate them.
-- The launcher still runs DFlash2 d6; switching is a user decision.
+- Prefill is unchanged by the speculative variant: 1.90-1.98K tok/s on the 6.6K and 10.6K prompts
+  for both.
+- Adopted on 2026-09-25 by the user: both Qwen3.8 launchers (`start-ninfer-server.bat` and
+  `start-ninfer-server - mtp.bat`) now run `--spec mtp --draft-tokens 3 --lm-head-draft --ngram
+  chain` with CUDA graphs (backups `.bak-20260925-ngram`). The 131072-context launcher starts with
+  1.71 GB free after startup (graph allowance 580 MiB).
