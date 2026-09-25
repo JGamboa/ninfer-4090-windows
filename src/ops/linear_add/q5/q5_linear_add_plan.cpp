@@ -37,8 +37,11 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-constexpr std::array<RouteSpec, 6> kK6144Routes{{
-    {{1, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
+// T = 7..16 is the DFlash2 verification band (six to fifteen drafts); the SIMT split2 route
+// read the weights at ~350 GB/s there (WINDOWS_PORT.md, Qwen3.8 DFlash2 profile).
+constexpr std::array<RouteSpec, 7> kK6144Routes{{
+    {{1, 6}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{7, 13}, Q5LinearAddScheduleId::KSplitMmaResidual},
     {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
@@ -46,8 +49,9 @@ constexpr std::array<RouteSpec, 6> kK6144Routes{{
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
 }};
 
-constexpr std::array<RouteSpec, 6> kK17408Routes{{
-    {{1, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
+constexpr std::array<RouteSpec, 7> kK17408Routes{{
+    {{1, 6}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{7, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
     {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
@@ -116,6 +120,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
     switch (schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:
         return "linear_add.q5.simt.split2.exact.residual";
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        return "linear_add.q5.mma.ksplit.r16.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         return "linear_add.q5.mma.r64.c16.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C24:
@@ -174,6 +180,9 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     switch (plan.schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::KSplitMmaResidual:
+        q5_linear_add_ksplit_mma_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);

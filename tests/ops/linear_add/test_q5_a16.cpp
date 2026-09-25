@@ -21,16 +21,16 @@ int q5_a16_conformance() {
     // 560/561/562 for k=6144 (528/529/530 for k=17408), 704/705/706 for the tail=192/193
     // composite-to-wide fallback, and 1024/1025/1026 for a zero, one and two column tail after the
     // second whole wave.
-    constexpr std::array<std::int32_t, 15> kInteriors{1,  2,   3,   8,   24,  40,  56,  64,
-                                                      96, 128, 129, 256, 640, 768, 1024};
-    constexpr std::array<std::int32_t, 5> kK6144RouteStarts{14, 33, 49, 193, 513};
+    constexpr std::array<std::int32_t, 16> kInteriors{1,  2,   3,   8,   11,  24,  40,  56,
+                                                      64, 96, 128, 129, 256, 640, 768, 1024};
+    constexpr std::array<std::int32_t, 6> kK6144RouteStarts{7, 14, 33, 49, 193, 513};
     constexpr std::array<std::int32_t, 6> kK6144GraphTokens{513, 526, 545, 561, 705, 1025};
 
     int failures = 0;
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 6144, 401U, kK6144RouteStarts, kInteriors, kK6144GraphTokens, false, 512});
-    constexpr std::array<std::int32_t, 5> kK17408RouteStarts{17, 33, 49, 193, 513};
+    constexpr std::array<std::int32_t, 6> kK17408RouteStarts{7, 17, 33, 49, 193, 513};
     constexpr std::array<std::int32_t, 6> kK17408GraphTokens{513, 529, 545, 561, 705, 1025};
     failures +=
         ninfer::test::linear_add::run_shape("Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,

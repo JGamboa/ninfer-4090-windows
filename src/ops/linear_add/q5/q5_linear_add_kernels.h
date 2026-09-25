@@ -9,6 +9,9 @@ namespace ninfer::ops::detail {
 
 void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream);
+// T = 1..16 tensor-core split-K route (TileCols - 8 < T for its 8- or 16-column tile).
+void q5_linear_add_ksplit_mma_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                     cudaStream_t stream);
 void q5_linear_add_mma_r64_c16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream);
 void q5_linear_add_mma_r64_c24_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
