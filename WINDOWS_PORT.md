@@ -710,3 +710,29 @@ The steady-state aggregate is a tie: d6 wins the two most predictable prompts by
 MTP 3 wins the long code prompt and the prose by 5-12 %. Without graphs, d6's first requests
 after a start are slower. MTP 3 does not win both rounds, so the launcher keeps DFlash2 d6. MTP 3
 with graphs remains the option that frees ~1.8 GB of VRAM at equal steady speed.
+
+### MTP 3 + n-gram chain against DFlash2 d6 (2026-09-25)
+
+N-gram phase 1 (`--ngram chain`, pool 16 MiB, n = 8, V = 15; design and Bonsai results in
+`docs/maintainer/bonsai-ternary-design.md` section 9.1, items 16-20). Measured with the CLI on the RTX
+4090 at 60 Hz: one request, greedy, `--no-thinking`, `--kv-dtype rk4v4-e8`, `--lm-head-draft`,
+up to 1024 new tokens, two rounds with the order reversed in round 2. DFlash2 d6 runs with
+`--no-cuda-graph` as in the launcher, MTP with graphs. Four agent-style prompts restate their input
+(add type hints to a Python module, bump ports in a JSON list, rename a phrase in a document,
+rename a C++ variable); two are free-form (lighthouse story, transformer explanation).
+
+| Decode tok/s (mean of both rounds) | DFlash2 d6 | MTP 3 | MTP 3 + n-gram |
+|---|---|---|---|
+| Agent prompts (4) | 214.6 | 152.3 | 288.7 |
+| Free-form prompts (2) | 95.6 | 97.0 | 97.1 |
+
+Per prompt (round 1; round 2 within 2 tok/s): Python 207.0 / 150.5 / 273.3, JSON 219.1 / 152.3 /
+271.5, document 221.3 / 152.9 / 374.5, C++ 208.9 / 153.9 / 234.6, story 75.7 / 83.6 / 83.7,
+transformer 115.4 / 110.4 / 110.4. Tokens per round with n-gram reach 6.8-11.8 on the agent
+prompts (MTP 3 alone: 3.9-4.0; d6: 6.5-7.0).
+
+- On restating work MTP 3 + n-gram is 35 % faster than d6 and 90 % faster than MTP 3 alone.
+- On free-form text the pool drafts nothing, so it equals MTP 3 (97.1 against 97.0) and is 1.6 %
+  above d6.
+- Scope: short contexts (under 2K tokens), one lane, no thinking. The launcher runs three lanes
+  with thinking; the launcher is unchanged until that is measured through the server.

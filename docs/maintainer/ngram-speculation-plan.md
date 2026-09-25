@@ -54,7 +54,9 @@ autoregressive depth. Stage 1 (below) split them; the MTP depth limit stays 5.
 
 Progress, recorded in [Bonsai ternary design](bonsai-ternary-design.md) section 9.1:
 stage 1 (split `V` from `k`) is item 16; stage 2 (pool, `chain` policy, width policy, second graph
-width) is item 19. Stage 3 is flags, logs and measurement. Only `chain` is implemented; `select`
+width) is item 19; stage 3 (flags, logs, lossless test, CLI measurements) is item 20. Remaining for
+phase 1: measurement through `ninfer-serve` at the launchers' settings (three lanes, thinking, long
+contexts) before changing either launcher. Only `chain` is implemented; `select`
 below stays unbuilt unless measurement asks for it. A round widens to `V+1` only when some row's
 draft reaches `k + 3`.
 

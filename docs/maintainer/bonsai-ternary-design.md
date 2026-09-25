@@ -2136,6 +2136,74 @@ Next steps, in order:
 
       MTP-only rounds are not slower: every difference is at most 0.1 ms (0.4 %), within the
       run-to-run spread.
+20. N-gram phase 1, stage 3: flags, logs, the lossless test and the measurements.
+    - Two stage 2 defects surfaced as soon as `--ngram chain` started, both at CUDA Graph startup:
+      - ReplaySSM records are sized for V+1, but the record Ops and the fold require the record
+        width to equal the round width. A `k+1` round now records and folds through a
+        `GdnReplayRecords::narrowed(k+1)` view of the same planes, with its own fold plan; every
+        round records and folds at one width.
+      - At width 16 the attention route (prompt or chunked small-T) changes with the batch, the KV
+        storage and the visible keys: bf16 near 640 keys, int8/rk* near 256, fp8 near 320. The
+        wide profiles now take their topology class from a public Op query,
+        `ops::causal_softmax_attention_topology_class`, and split where it changes. A failed
+        update now names the family, batch and frontier range.
+    - Product: `--ngram chain --ngram-max V --ngram-n N --ngram-min N --ngram-pool-mib M` in the
+      CLI and `ninfer-serve`, validated against `--spec mtp`. The CLI summary prints the pool's
+      drafted and accepted tokens and the wide rounds. Request log schema 22 adds
+      `speculative.{verify_window, wide_rounds, ngram_drafted_tokens, ngram_accepted_tokens}` and
+      `server_start.engine.ngram`; `/metrics` adds `ninfer:ngram_draft_tokens_total` and
+      `ninfer:ngram_draft_accepted_tokens_total`.
+    - Lossless test `ninfer_qwen3_5_ngram_lossless_real_test`, with the criterion decided on
+      2026-09-25:
+      - The first run, against 0.05 nats absolute, showed the scorer's gaps are multiples of 1/16
+        nat (differences of BF16 logits). It also showed that MTP alone already diverges from the
+        non-speculative route by 0.25 nats (bf16 KV) and 0.75 nats (rk4v4-e8).
+      - The criterion is therefore relative to MTP. With BF16 KV (blocking), every divergence the
+        n-gram adds over MTP alone must be within one BF16 step (1/16 nat) under the scoring
+        route. With quantized KV the divergences are reported only. The same configuration in two
+        fresh Engines must give identical ids (blocking), and the pool must draft and accept in
+        wide rounds.
+      - Results, six raw-continuation prompts of 384 tokens (4 repetitive, 2 free-form):
+
+      | Model, KV | Divergences per 1000: MTP + n-gram / MTP | Added by n-gram | Pool drafted / accepted, wide rounds |
+      |---|---|---|---|
+      | Bonsai MTP 2, bf16 | 1.82 / 1.82 | 0 | 1027 / 548, 80 of 737 |
+      | Bonsai MTP 2, int8 | 1.79 / 1.04 | 1 (0.125 nat) | 1027 / 543, 80 of 747 |
+      | Bonsai MTP 2, rk4v4-e8 | 3.27 / 1.17 | 2 (0.0625 and 0.5625 nat) | 965 / 477, 75 of 788 |
+      | Qwen3.8 MTP 3, bf16 | 1.70 / 1.70 | 0 | 894 / 565, 75 of 556 |
+      | Qwen3.8 MTP 3, int8 | 3.16 / 3.16 | 0 | 892 / 544, 75 of 563 |
+
+      All five runs pass, and determinism holds in every KV mode.
+    - VRAM, measured with `ninfer-serve` at the Bonsai launcher's flags (3 lanes, 262144 context,
+      KV auto, rk4v4-e8, Vision):
+      - The graph allowance goes from 258 to 532 MiB and the auto KV from 786432 to 766720 tokens
+        (-2.5 %).
+      - Free memory after startup rises from 490 to 695 MiB. The wide set therefore uses about
+        144 MiB of the 274 MiB reserved: the 348 MiB of KV given up minus the 204 MiB left
+        unused.
+      - The ~350-400 MiB estimate held; the reservation fits the 1037 MiB planned slack.
+    - Decode speed, measured with the CLI:
+      - Setup: one request, greedy, `--no-thinking`, rk4v4-e8, `--lm-head-draft`, up to 1024
+        tokens, two rounds with the order reversed. Four agent-style prompts restate their input
+        (type hints, JSON port bump, phrase rename, C++ variable rename); two are free-form.
+      - Bonsai MTP 2 (round 2 within 1 tok/s of round 1):
+
+      | Decode tok/s | MTP 2 | MTP 2 + n-gram |
+      |---|---|---|
+      | Agent prompts, mean | 250.0 | 531.9 (x2.13) |
+      | Python / JSON / document / C++ | 250.4 / 253.7 / 252.1 / 244.2 | 497.8 / 490.5 / 735.8 / 405.0 |
+      | Tokens per round, same order | 2.95 / 3.00 / 2.97 / 2.90 | 6.61 / 7.69 / 10.83 / 5.45 |
+      | Free-form prompts, mean | 167.3 | 167.4 |
+
+      - Qwen3.8 MTP 3 + n-gram against DFlash2 d6 is in WINDOWS_PORT.md. On agent prompts it
+        runs 288.7 tok/s against 214.6 (d6) and 152.3 (MTP 3); on free-form prompts 97.1 against
+        95.6 and 97.0.
+      - On free-form text the pool drafts nothing, so MTP + n-gram equals MTP.
+      - MTP 2 alone reaches ~250 tok/s here because restating text is predictable: acceptance
+        nearly fills every round (3.0 of 3 tokens). The ~160-190 tok/s seen before is prose and
+        code written from scratch.
+    - Not measured yet: the servers (three lanes, thinking, long contexts). Both launchers are
+      unchanged.
 
 ## Appendix: sources
 
