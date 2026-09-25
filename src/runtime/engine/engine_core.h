@@ -1206,7 +1206,7 @@ private:
         }
         if (program_transaction) { return false; }
 
-        bool changed = false;
+        std::vector<SettledRequest> settled;
         for (;;) {
             std::optional<std::uint32_t> selected;
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1244,21 +1244,44 @@ private:
                 }
             }
             request->terminal_reason.reset();
-
-            finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            complete_success(request, reason);
             remove_completed_slot(lane);
-            boundary = begin_host_phase();
-            changed  = true;
+            settled.push_back(SettledRequest{.request = request, .reason = reason});
         }
-        if (changed) { publish_runtime_stats(); }
-        return changed;
+        if (settled.empty()) { return false; }
+        complete_settled(settled, boundary);
+        return true;
+    }
+
+    struct SettledRequest {
+        std::shared_ptr<Request> request;
+        FinishReason reason;
+    };
+
+    // A caller that observes its result must also observe the settlement that produced it: publish
+    // the released lanes and slots first, then wake the callers in publication order.
+    void complete_settled(std::span<const SettledRequest> settled, HostPhaseMeasurement& boundary) {
+        publish_runtime_stats();
+        finish_engine_phase(boundary, EngineHostPhase::Boundary);
+        std::size_t index = 0;
+        try {
+            for (; index < settled.size(); ++index) {
+                complete_success(settled[index].request, settled[index].reason);
+            }
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            // The slots are already released, so the failure latch cannot reach these callers.
+            for (; index < settled.size(); ++index) {
+                complete_error(settled[index].request, error);
+            }
+            throw;
+        }
+        boundary = begin_host_phase();
     }
 
     void cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary,
                                 HostPhaseMeasurement& boundary) {
         if (instance_.program->has_context_transaction()) { return; }
-        bool changed = false;
+        std::vector<SettledRequest> settled;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
@@ -1272,13 +1295,10 @@ private:
             request->speculative_stats  = std::move(aborted.speculative);
             if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
-            finish_engine_phase(boundary, EngineHostPhase::Boundary);
-            complete_success(request, FinishReason::Cancelled);
+            settled.push_back(SettledRequest{.request = request, .reason = FinishReason::Cancelled});
             remove_completed_slot(lane);
-            boundary = begin_host_phase();
-            changed  = true;
         }
-        if (changed) { publish_runtime_stats(); }
+        if (!settled.empty()) { complete_settled(settled, boundary); }
     }
 
     [[nodiscard]] bool expire_pending_requests() {
