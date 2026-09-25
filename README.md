@@ -146,7 +146,16 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 cmake --build build -j
 ```
 
-**2. Download** into `E:\LLM` (any folder works; adjust the paths below):
+**2. Get the model.** The fastest way is the ready-made artifact:
+[jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090)
+(`bonsai2_27b_vl_mtp_q4q5.ninfer`, 6.4 GiB, text + vision + MTP). With it, skip to step 4:
+
+```bat
+hf download jgamboa/Ternary-Bonsai-2-27B-NInfer-4090 bonsai2_27b_vl_mtp_q4q5.ninfer --local-dir E:\LLM
+```
+
+To convert it yourself instead, download the sources into `E:\LLM` (any folder works; adjust
+the paths below):
 
 - `Ternary-Bonsai-2-27B-PTQ1_0.gguf` and, for images, `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`
   from [prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf);
