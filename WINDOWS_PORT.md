@@ -174,6 +174,35 @@ rises, and past a point the extra verification cost outweighs the extra accepted
 DFlash2 weights (adds ~1.6 GiB to the load); the server auto-detects and requires them
 when `--spec dflash2` is passed.
 
+## Memory bandwidth ceiling on this RTX 4090 (2026-09-25)
+
+`tools/hbm_bandwidth_probe.cu`, built with `nvcc -O3 -std=c++17 -arch=sm_89
+tools/hbm_bandwidth_probe.cu -o build\hbm_bandwidth_probe.exe` and run with no arguments. The
+monitor was on the RTX 4090 at 60 Hz and `ninfer-serve` was off. The buffers were 4 GiB each
+(57x L2), with 768 resident blocks of 256 threads. Bus GB/s counts N bytes for a read or a
+write and 2N for a copy. Two runs, best of 5 trials (median in parentheses):
+
+| Method | Run 1 bus GB/s | Run 2 bus GB/s | Of the 4090's 1008 GB/s |
+|---|---:|---:|---:|
+| `kernel uint4 read` (pure read) | 839.1 (802.5) | 848.1 (844.2) | 83-84 % |
+| `kernel uint4 copy` | 785.5 (774.4) | 791.0 (785.1) | 78 % |
+| `kernel uint4x4 copy` | 785.8 (782.8) | 783.3 (783.0) | 78 % |
+| `cudaMemcpyAsync` D2D | 820.6 (811.9) | 831.1 (825.6) | 81-82 % |
+| `kernel uint4 write` | 748.9 (742.4) | 747.0 (743.1) | 74 % |
+| `cudaMemsetAsync` (write) | 826.3 (722.3) | 826.0 (819.5) | 82 % |
+
+The probe's own "of peak" column and "Best sustained bus rate" line use its default
+`--peak-gbps 1792`, the RTX 5090's figure (46-47 % for the read here). The last column above
+is recomputed against the 4090's advertised 1008 GB/s; `--peak-gbps 1008` makes the probe
+print the same.
+
+**Ceiling: pure read ~845 GB/s, copy ~785 GB/s.** Decode is a weight-read stream, so the GB/s
+figures in this document are read against **~845 GB/s**, not the advertised 1008. On that
+scale:
+- Qwen3.8 tg128 (~800 GB/s) runs at ~95 % of the ceiling.
+- The best K-split MMA instances in the DFlash2 verification (~680-690 GB/s) run at ~81 %.
+- The Q4 gate+up at T = 13 (608 GB/s) runs at ~72 %.
+
 ## Qwen3.8 baseline on the Bonsai branch (2026-09-24)
 
 Measured on `feat/bonsai-ternary` at `15df903` with `E:\LLM\qwen3_8_27b.ninfer` (15.92 GiB of
@@ -191,8 +220,8 @@ decode work on this model.
 | pp2048 | 2035 tok/s |
 | tg128 | 47.0 tok/s (46.9 with the default bf16 KV) |
 
-tg128 reads ~16 GiB of weights per token, about 800 GB/s, which is ~80 % of the 4090's
-1008 GB/s.
+tg128 reads ~16 GiB of weights per token, about 800 GB/s. That is ~95 % of the measured
+~845 GB/s read ceiling (see the section above); the advertised figure is 1008 GB/s.
 
 **Prefill profile** (`nsys profile --trace=cuda,nvtx` of `ninfer_bench -p 2048 -r 3
 --kv-dtype int8`, saved as `profiles/nsys/qwen38_pp2048`). pp2048 runs as two 1024-token
