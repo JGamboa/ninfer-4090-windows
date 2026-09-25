@@ -373,3 +373,62 @@ Before and after were measured back to back with the same scripts.
   Byte counts are the bench's for the same shapes. The verification's largest costs are now
   the two other small-T families: Q4 gate+up (11.5 ms, 155 us per call) and the grouped
   mixed Q4/Q5 in_proj and qkvg (10.9 + 3.2 ms, ~180-200 us per call, ~230-290 GB/s).
+
+### K-split GDN in_proj and the k = 6144 route through T = 16 (`58b5683`, `fa5dad0`, 2026-09-25)
+
+The two commits extend the small-T K-split routes to the rest of the DFlash2 band:
+- `58b5683`: the mixed Q4/Q5 GDN input projection runs its two sides as separate K-split
+  MMAs up to T = 16. The Q4 side is 4096 rows (`q4_ksplit_mma`, grid 256); the Q5 side is
+  12288 rows (`q5_ksplit_mma`, grid 768). They replace `rowsplit_grouped_mma`.
+- `fa5dad0`: the 5120 x 6144 Q5 `linear_add` takes the K-split route through T = 16, closing
+  the T = 14..16 cliff.
+
+Validated on the RTX 4090 at HEAD `fa5dad0` against the `a29aed7` build, with the same
+scripts, desktop at 60 Hz and server off.
+
+- `ninfer_linear_add_q5_a16_test`, `ninfer_gdn_input_proj_test`,
+  `ninfer_gdn_input_proj_conv_snapshot_test` and `ninfer_gdn_input_proj_conv_record_test` all
+  pass (the snapshot test compares against its sampled FP64 reference with 0 failures).
+- Microbenches, graph execution, 100 repeats, median us (bench-reported GB/s):
+
+  | T | Q5 `linear_add` 5120 x 6144, a29aed7 -> fa5dad0 | GDN in_proj Q4/Q5 16384 x 5120 (cold L2), a29aed7 -> fa5dad0 |
+  |---:|---|---|
+  | 7 | 43.0 -> 44.0 | 97.3 -> 98.3 (542 -> 536) |
+  | 12 | 45.1 -> 47.1 | 157.7 -> 98.3 (336 -> 539) |
+  | 13 | 46.1 -> 48.1 | 225.3 -> 97.3 (235 -> 545) |
+  | 14 | 95.3 -> 48.1 (222 -> 439) | - |
+  | 15 | 95.2 -> 49.2 | - |
+  | 16 | 95.2 -> 48.1 (222 -> 440) | 226.3 -> 104.4 (235 -> 509) |
+  | 17 | 101.4 -> 101.4 | 226.3 -> 227.3 |
+
+  5120 x 17408 is unchanged (T = 7 / 13 / 16 / 17: 103 / 113 / 117 / 299 us). T <= 6 is
+  unchanged in both benches.
+- DFlash2 on the profile prompt (`scenario_code_python`, `--no-thinking --greedy
+  --lm-head-draft`), per-round time against `a29aed7`:
+
+  | Draft | ms per round a29aed7 -> fa5dad0 | tok/s | Acceptance | Tokens per round | Text vs a29aed7 |
+  |---|---|---|---|---|---|
+  | d6 (T = 7) | 28.9 -> 29.6 (noise; T = 7 was already on the new routes) | 129.6 -> 129.3 | 46.5 % | 3.79 | identical |
+  | d12 (T = 13) | 41.8 -> 36.4 (-13 %) | 99.5 -> 116.5 | 26.8 -> 27.1 % | 4.19 -> 4.22 | now identical to d6's text |
+  | d15 (T = 16) | 46.8 -> 37.6 (-20 %) | 86.0 -> 108.7 (+26 %) | 20.7 -> 20.9 % | 4.06 -> 4.09 | identical |
+  | Qwen3.8 MTP 3 | 25.3 -> 25.3 | 126.6 -> 128.5 | 74.6 % | 3.23 | identical (md5) |
+  | Bonsai MTP 2 | 11.8 -> 11.8 | 153.9 -> 154.6 | 42.4 % | 1.85 | identical (md5) |
+
+  d15's text is unchanged, so its +26 % is a like-for-like speedup. d12 now produces exactly
+  d6's text. On this prompt d6 is still the fastest configuration (129 tok/s), but d12 is
+  within 10 % of it (116.5); it was 35 % behind after `a29aed7` and 30 % behind at `c4b6038`.
+- d12 round (`profiles/nsys/qwen38_dflash2_d12_ksplit16`), per round:
+  - wall 43.9 -> 37.7 ms; verification 39.5 -> 33.3 ms; drafter 3.55 ms.
+  - 782 launches (+48: the two in_proj sides).
+  - GDN in_proj 10.85 -> 4.51 ms: 201 -> ~94 us per layer (Q4 side ~20 us + Q5 side ~61 us,
+    plus launch gaps), ~53 MB at ~565 GB/s.
+  - mlp down 7.86 ms (102 us) and o_proj/out_proj 2.46 ms (39 us), unchanged.
+
+  What remains of the T = 13 verification:
+  - Q4 gate+up: 11.3 ms, 155 us per call, ~650 GB/s.
+  - attention qkvg: 3.2 ms, still `rowsplit_grouped_mma` at 179 us per call, ~245 GB/s. It
+    is the last grouped route in the band; the GDN treatment would save ~1.5 ms per round.
+  - head: 1.7 ms.
+
+Across the three commits, the d12 round on this prompt went from 51.4 to 37.7 ms (-27 %),
+and d12 decode from 78.7 to 116.5 tok/s.
