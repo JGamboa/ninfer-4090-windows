@@ -650,3 +650,30 @@ from the measurements above:
 - one lane (`--max-concurrency 1 --device-state-slots 1`) at the full 100000 KV;
 - three lanes with the KV cut to roughly 45K tokens (32768 leaves 302 MB of planned slack);
 - freeing ~1.2 GiB elsewhere. Windows' own 1464 MiB is not enough by itself.
+
+### What the CUDA graphs are worth (2026-09-25)
+
+`ninfer-serve` at HEAD `432ec32` ran with the flags of `start-ninfer-server.bat`, changed to
+one lane (`--max-concurrency 1 --device-state-slots 1`, rk4v4-e8, `--max-context 100000
+--kv-capacity 100000`), once with and once without `--no-cuda-graph`. The request was the
+profile prompt (`examples\cli\messages\scenario_code_python.json`) with thinking off
+(`chat_template_kwargs.enable_thinking=false`), temperature 0, seed 1234 and 512 tokens.
+Each configuration got the request three times; the table shows medians from the response
+`timings`. A round is one verification: rounds = `predicted_n` - `draft_n_accepted`.
+
+| Speculation | CUDA graphs | tok/s (three requests) | ms per round | Tokens per round | Acceptance | Graph reservation | Free after start (`nvidia-smi`) |
+|---|---|---|---|---|---|---|---|
+| DFlash2 d12, `--lm-head-draft` | on | 111.9 (111.3 / 112.0 / 111.9) | 32.4 | 3.63 | 22.2 % | 480 MiB | 1215 MiB |
+| DFlash2 d12, `--lm-head-draft` | off | 109.9 (109.3 / 110.2 / 109.9) | 33.6 | 3.71 | 23.1 % | 0 | 1273 MiB |
+| MTP 3, `--lm-head-draft` | on | 124.0 (124.2 / 124.0 / 124.0) | 25.9 | 3.22 | 74.8 % | 86 MiB | 3040 MiB |
+| MTP 3, `--lm-head-draft` | off | 118.5 (118.6 / 118.5 / 118.4) | 27.1 | 3.22 | 74.8 % | 0 | 3043 MiB |
+
+The graphs save 1.2 ms per round: -3.6 % for DFlash2 d12 and -4.4 % for MTP 3, whose
+graphed and eager text is identical (+4.6 % tok/s). The d12 text differs between the two
+paths (another near-tie), so its tok/s moves by the per-round saving and an acceptance
+difference together.
+
+The gain is under 10 %, so the two-lane capacity search with graphs was not run. With graphs
+on, the reservation is 480 MiB per lane for DFlash2 and 86 MiB for MTP 3. For the three-lane
+DFlash2 launcher, that makes `--no-cuda-graph` a cheap way to keep 100000 tokens of KV:
+about 4 % of decode speed.
