@@ -5,18 +5,17 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/common/rowsplit_tall_mma.cuh"
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 
 using GateUpC40Cfg = GemmCfg<64, 40, 64, 64, 8, 2, 1, false, true, true>;
-// WN32 (4 warps) measured against the inherited WN16 on sm_89 with the
-// variants bench: +1.3% at T=1024 and +3.4% at T=2048, tied at T=512. The
-// sm_120a-tuned WN16 remains correct; this is an Ada occupancy preference.
-using GateUpC128Cfg = GemmCfg<64, 128, 64, 64, 32, 2, 1, false, true, true>;
+constexpr std::int32_t kTallTokens = 128;
 
 template <class Cfg, bool Full>
 void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -54,22 +53,36 @@ void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     });
 }
 
-} // namespace
-
-void q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(const Tensor& x, const Weight& weight,
-                                                          Tensor& out, cudaStream_t stream) {
-    launch_route<GateUpC128Cfg>(x, weight, out, stream);
+void launch_tall(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    const std::int32_t intermediate = out.ne[0];
+    const std::int32_t k            = x.ne[0];
+    if (intermediate % 64 != 0 || k % 64 != 0 || weight.padded_shape[1] != k) {
+        throw std::invalid_argument("q4 linear_swiglu: pipelined GEMM shape is unsupported");
+    }
+    const rowsplit_tall::SwiGluQ4Problem problem{
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
+        intermediate};
+    rowsplit_tall::launch<kTallTokens>(problem, intermediate / 64,
+                                       static_cast<const __nv_bfloat16*>(x.data), k, x.ne[1],
+                                       stream);
 }
 
-void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x,
-                                                               const Weight& weight, Tensor& out,
-                                                               cudaStream_t stream) {
-    // One 128-column folded tile is the widest block the 48 KiB static shared budget allows, so a
-    // wider extent is served by several of them in one multi-column-tile launch. A remainder of at
-    // most kNarrowTailCols columns measured cheaper on the narrow routes than a second 128-wide
-    // tile that would be almost entirely empty, so that remainder is launched on its own; any wider
+} // namespace
+
+void q4_linear_swiglu_mma_folded_pipelined_r64_c128_launch(const Tensor& x, const Weight& weight,
+                                                           Tensor& out, cudaStream_t stream) {
+    launch_tall(x, weight, out, stream);
+}
+
+void q4_linear_swiglu_mma_folded_pipelined_r64_c128_tail_launch(const Tensor& x,
+                                                                const Weight& weight, Tensor& out,
+                                                                cudaStream_t stream) {
+    // The pipelined kernel serves a wide extent in 128-column tiles. A remainder of at most
+    // kNarrowTailCols columns measured cheaper on the narrow routes than a 128-wide tile that
+    // would be almost entirely empty, so that remainder is launched on its own; any wider
     // remainder keeps the single wide launch.
-    constexpr std::int32_t kBlockCols     = GateUpC128Cfg::BN;
+    constexpr std::int32_t kBlockCols      = kTallTokens;
     constexpr std::int32_t kNarrowTailCols = 40;
     constexpr std::int32_t kExactTailCols  = 24;
 
@@ -77,14 +90,14 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x,
     const std::int32_t blocks = tokens / kBlockCols;
     const std::int32_t tail   = tokens - blocks * kBlockCols;
     if (blocks == 0 || tail == 0 || tail > kNarrowTailCols) {
-        q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x, weight, out, stream);
+        q4_linear_swiglu_mma_folded_pipelined_r64_c128_launch(x, weight, out, stream);
         return;
     }
 
     const std::int32_t wide_cols = blocks * kBlockCols;
     const Tensor x_wide = x.slice(1, 0, wide_cols);
     Tensor out_wide     = out.slice(1, 0, wide_cols);
-    q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x_wide, weight, out_wide, stream);
+    q4_linear_swiglu_mma_folded_pipelined_r64_c128_launch(x_wide, weight, out_wide, stream);
     const Tensor x_tail = x.slice(1, wide_cols, tail);
     Tensor out_tail     = out.slice(1, wide_cols, tail);
     if (tail == 1) {

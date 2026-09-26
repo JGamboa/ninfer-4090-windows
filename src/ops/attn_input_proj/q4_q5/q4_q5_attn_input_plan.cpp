@@ -24,8 +24,8 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
         return "attn_input_proj.q4_q5.mixed.r32.c64.s3";
     case Q4Q5AttnInputScheduleId::PairR32C64S3:
         return "attn_input_proj.q4_q5.pair.r32.c64.s3";
-    case Q4Q5AttnInputScheduleId::MixedR64C128S2:
-        return "attn_input_proj.q4_q5.mixed.r64.c128.s2";
+    case Q4Q5AttnInputScheduleId::MixedPipelinedR128C128:
+        return "attn_input_proj.q4_q5.mixed.pipelined.r128.c128";
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         return "attn_input_proj.q4_q5.pair.r32.c64.s4";
     }
@@ -47,7 +47,7 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
     if (problem.cols <= 64) return {Q4Q5AttnInputScheduleId::MixedR32C64S3};
     if (problem.cols <= 104) return {Q4Q5AttnInputScheduleId::PairR32C64S3};
     if (problem.cols <= 128 || problem.cols >= 193)
-        return {Q4Q5AttnInputScheduleId::MixedR64C128S2};
+        return {Q4Q5AttnInputScheduleId::MixedPipelinedR128C128};
     return {Q4Q5AttnInputScheduleId::PairR32C64S4};
 }
 
@@ -79,9 +79,9 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
         q4_q5_attn_input_pair_r32_c64_s3_launch(x, query_key_weight, gate_value_weight, q, gate, k,
                                                 v, stream);
         return;
-    case Q4Q5AttnInputScheduleId::MixedR64C128S2:
-        q4_q5_attn_input_mixed_r64_c128_s2_launch(x, query_key_weight, gate_value_weight, q, gate,
-                                                  k, v, stream);
+    case Q4Q5AttnInputScheduleId::MixedPipelinedR128C128:
+        q4_q5_attn_input_mixed_pipelined_r128_c128_launch(x, query_key_weight, gate_value_weight,
+                                                          q, gate, k, v, stream);
         return;
     case Q4Q5AttnInputScheduleId::PairR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,

@@ -14,7 +14,7 @@ enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
     GroupedMixedMmaR32C32S2,
     GroupedMixedMmaR32C64S4,
-    GroupedMixedMmaR64C128S2,
+    GroupedMixedPipelinedR128C128,
 };
 
 enum class Q4Q5GdnInputConvScheduleId {

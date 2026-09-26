@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
+#include "ops/common/rowsplit_tall_mma.cuh"
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
@@ -78,6 +79,24 @@ void launch_grouped(const Tensor& x, const Weight& qk_weight, const Weight& valu
     });
 }
 
+void launch_tall(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                 Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    constexpr std::int32_t kValueRows = 6144;
+    auto* qkv_out                     = static_cast<__nv_bfloat16*>(qkv.data);
+    rowsplit_tall::GroupedProblem problem{{
+        rowsplit_tall::grouped_job(qk_weight, 0, qk_weight.n, qkv_out, qkv.ne[0], 0),
+        rowsplit_tall::grouped_job(value_z_weight, 0, kValueRows, qkv_out, qkv.ne[0],
+                                   qk_weight.n),
+        rowsplit_tall::grouped_job(value_z_weight, kValueRows, kValueRows,
+                                   static_cast<__nv_bfloat16*>(z.data), z.ne[0], 0),
+        {},
+    }};
+    const std::int32_t blocks =
+        problem.jobs[0].blocks + problem.jobs[1].blocks + problem.jobs[2].blocks;
+    rowsplit_tall::launch<128>(problem, blocks, static_cast<const __nv_bfloat16*>(x.data),
+                               x.ne[0], x.ne[1], stream);
+}
+
 } // namespace
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
@@ -92,9 +111,8 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
         launch_grouped<GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>>(
             x, qk_weight, value_z_weight, qkv, z, stream);
         return;
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128S2:
-        launch_grouped<GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>>(
-            x, qk_weight, value_z_weight, qkv, z, stream);
+    case Q4Q5GdnInputScheduleId::GroupedMixedPipelinedR128C128:
+        launch_tall(x, qk_weight, value_z_weight, qkv, z, stream);
         return;
     case Q4Q5GdnInputScheduleId::IndependentDirectFixed:
         break;

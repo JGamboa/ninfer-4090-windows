@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
+#include "ops/common/rowsplit_tall_mma.cuh"
 #include "ops/common/token_slices.h"
 
 #include <cstdint>
@@ -139,10 +140,16 @@ void q4_q5_attn_input_pair_r32_c64_s3_launch(const Tensor& x, const Weight& w0, 
     launch<GemmCfg<32, 64, 64, 32, 16, 3, 2, false, true, true>>(x, w0, w1, q, g, k, v, stream);
 }
 
-void q4_q5_attn_input_mixed_r64_c128_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
-                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
-                                               cudaStream_t stream) {
-    launch_mixed<GemmCfg<64, 128, 64, 64, 16, 2, 2, false, true, true>>(x, w0, w1, q, g, k, v,
-                                                                        stream);
+void q4_q5_attn_input_mixed_pipelined_r128_c128_launch(const Tensor& x, const Weight& w0,
+                                                       const Weight& w1, Tensor& q, Tensor& g,
+                                                       Tensor& k, Tensor& v, cudaStream_t stream) {
+    rowsplit_tall::GroupedProblem problem{{
+        rowsplit_tall::grouped_job(w0, 0, 6144, static_cast<__nv_bfloat16*>(q.data), q.ne[0], 0),
+        rowsplit_tall::grouped_job(w0, 6144, 1024, static_cast<__nv_bfloat16*>(k.data), k.ne[0], 0),
+        rowsplit_tall::grouped_job(w1, 0, 6144, static_cast<__nv_bfloat16*>(g.data), g.ne[0], 0),
+        rowsplit_tall::grouped_job(w1, 6144, 1024, static_cast<__nv_bfloat16*>(v.data), v.ne[0], 0),
+    }};
+    rowsplit_tall::launch<128>(problem, 14336 / 128, static_cast<const __nv_bfloat16*>(x.data),
+                               x.ne[0], x.ne[1], stream);
 }
 } // namespace ninfer::ops::detail
