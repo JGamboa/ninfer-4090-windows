@@ -4,19 +4,18 @@
 // INT8 through m16n8k32.s8 Tensor Cores; V alone is dequantized to FP16 for the PV product.
 //
 // Warp specialization with a one-tile software pipeline. Eight producer warps (four 16-row
-// tiles x two Bc column halves) own QK, the online softmax and the K tile; eight worker warps
+// tiles x two Bc column halves) own QK, the online softmax and the K tiles; eight worker warps
 // own the FP32 output accumulator (two 16-row tiles x one 64-dimension group each) and the V
 // tile. While the workers multiply P(t) by V(t), the producers score tile t + 1 and hold its
 // probabilities in registers, so the INT8 QK and the FP16 PV Tensor Core work of consecutive
-// tiles overlap. Each tile has two block barriers:
-//   X  PV(t) done (P, alpha and the V FP16 tile are free); V(t + 1) codes have landed.
-//   Y  the producers have published P(t + 1), alpha(t + 1) and the V(t + 1) FP16 tile.
-// Producers issue K(t + 2) as soon as every producer has finished reading K(t + 1) (the
+// tiles overlap. The roles meet at two one-sided named barriers per tile (PFree: PV(t) has
+// read P(t); PReady: P(t + 1) is published), so neither side waits through the other's decode
+// work. Producers issue K(t + 2) as soon as every producer has finished reading K(t + 1) (the
 // named-barrier max exchange), and wait for it at the start of the next scoring pass. Workers
-// issue V(t + 1) at the start of PV(t) and wait for it at its end. Packed K codes (rk4v4,
-// rk4v4-e8) land by cp.async in the unused upper half of each packed V row and each producer
-// expands the chunks it issued; packed V codes stay packed in shared memory and are expanded
-// by the FP16 dequantizer.
+// issue V(t + 1) at the start of PV(t) and dequantize it to FP16 right after PV(t), off the
+// producers' scoring path. Packed K codes (rk4v4, rk4v4-e8) land by cp.async in the unused
+// upper half of each packed V row and each producer expands the chunks it issued; packed V
+// codes stay packed in shared memory until the FP16 dequantizer.
 //
 // Consumer Ada runs f32-accumulate HMMA at half rate, so each 64-key PV tile accumulates in
 // packed FP16 at full rate and is folded into the FP32 accumulator once per tile.
@@ -148,9 +147,14 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
     constexpr int kPackedKStage   = D / 2;
     constexpr float Log2E         = 1.4426950408889634074f;
     constexpr unsigned FullMask   = 0xffffffffu;
-    constexpr unsigned kMaxBarrier    = 1;
-    constexpr unsigned kKReadyBarrier = 2;
-    constexpr unsigned kWorkerBarrier = 3;
+    constexpr unsigned kMaxBarrier     = 1;
+    constexpr unsigned kKReadyBarrier  = 2;
+    constexpr unsigned kWorkerBarrier  = 3;
+    // Producer/worker handoff barriers, one side syncing and the other only arriving:
+    //   PFree:  workers arrive when PV(t) has read P(t) and alpha(t).
+    //   PReady: producers arrive when P(t + 1) and alpha(t + 1) are published.
+    constexpr unsigned kPFreeBarrier   = 4;
+    constexpr unsigned kPReadyBarrier  = 5;
     // Padded FP32 output rows for the rotated-V epilogue, staged over the then idle K, V, V FP16
     // and P tiles (contiguous from k_i8).
     constexpr int kOutStride = D + 8;
@@ -209,7 +213,7 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
     // causal guards; the boundary blocks after them keep the exact masked path.
     const int n_full_blocks = (q0 + Br <= tokens) ? min(key_blocks, (base_pos + q0 + 1) / Bc) : 0;
 
-    // Producers stage K codes and scales (thread index ptid); workers stage V (wtid).
+    // Producers stage and expand K (thread index ptid); workers stage and dequantize V (wtid).
     const int ptid = tid;
     const int wtid = tid - ProducerThreads;
 
@@ -320,13 +324,13 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
         ninfer::ops::cp_commit();
     };
 
-    // The producers expand the staged V codes into the swizzled FP16 tile (phase Y), which keeps
-    // the dequantizer out of the register budget of the workers' FP32 accumulator.
+    // The workers expand the staged V codes into the swizzled FP16 tile between their PV passes,
+    // off the producers' scoring path.
     auto dequant_v_tile = [&](int kb, auto full_tag) {
         constexpr bool FullTile = decltype(full_tag)::value;
         const int tile_k0       = kb * Bc;
-#pragma unroll
-        for (int chunk = ptid; chunk < Bc * (D / 8); chunk += ProducerThreads) {
+#pragma unroll 2
+        for (int chunk = wtid; chunk < Bc * (D / 8); chunk += WorkerThreads) {
             const int key_l = chunk / (D / 8);
             const int d     = (chunk - key_l * (D / 8)) * 8;
             __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
@@ -344,13 +348,17 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
         }
     };
 
+    auto issue_k_block = [&](int kb) {
+        if (kb < n_full_blocks) {
+            issue_k_tile(kb, std::true_type{});
+        } else {
+            issue_k_tile(kb, std::false_type{});
+        }
+    };
+
     // Tile 0 staging overlaps the Q quantization.
     if (producer) {
-        if (n_full_blocks > 0) {
-            issue_k_tile(0, std::true_type{});
-        } else {
-            issue_k_tile(0, std::false_type{});
-        }
+        issue_k_block(0);
     } else {
         if (n_full_blocks > 0) {
             issue_v_tile(0, std::true_type{});
@@ -439,25 +447,32 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
         for (int ntl = 0; ntl < QKNtL; ++ntl) {
             score[ntl][0] = score[ntl][1] = score[ntl][2] = score[ntl][3] = 0.0f;
         }
+        // Key-tile-outer: one 8-byte load brings a key's four group scales, and one x4 ldmatrix
+        // both k-steps of a group. Each score still sums its groups in ascending order.
 #pragma unroll
-        for (int grp = 0; grp < Groups; ++grp) {
+        for (int ntl = 0; ntl < QKNtL; ++ntl) {
+            const int nt   = col_half * QKNtL + ntl;
+            const int keya = nt * 8 + 2 * lid;
+            const uint2 ks_a = load_vec<uint2>(&k_scale_s[keya * Groups]);
+            const uint2 ks_b = load_vec<uint2>(&k_scale_s[(keya + 1) * Groups]);
+            const __half* ks_ah = reinterpret_cast<const __half*>(&ks_a);
+            const __half* ks_bh = reinterpret_cast<const __half*>(&ks_b);
 #pragma unroll
-            for (int ntl = 0; ntl < QKNtL; ++ntl) {
-                const int nt = col_half * QKNtL + ntl;
+            for (int grp = 0; grp < Groups; ++grp) {
                 int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                // Lanes 16-31 address the second k-step of the group.
+                const int brow = nt * 8 + b_rin;
+                const int bcol = (grp * GroupKc + (lane >> 4)) * 16 + b_koff;
+                unsigned bf[GroupKc][2];
+                ldmatrix_x4(bf[0][0], bf[0][1], bf[1][0], bf[1][1],
+                            smem_addr(&k_b16[brow * DB16 + causal_prompt_swz(brow, bcol)]));
 #pragma unroll
                 for (int kk = 0; kk < GroupKc; ++kk) {
-                    const int brow = nt * 8 + b_rin;
-                    const int bcol = (grp * GroupKc + kk) * 16 + b_koff;
-                    unsigned bf[2];
-                    ldmatrix_x2(bf[0], bf[1],
-                                smem_addr(&k_b16[brow * DB16 + causal_prompt_swz(brow, bcol)]));
                     mma_s8(c0, c1, c2, c3, qf[grp][kk][0], qf[grp][kk][1], qf[grp][kk][2],
-                           qf[grp][kk][3], bf[0], bf[1]);
+                           qf[grp][kk][3], bf[kk][0], bf[kk][1]);
                 }
-                const int keya  = nt * 8 + 2 * lid;
-                const float ks0 = __half2float(k_scale_s[keya * Groups + grp]);
-                const float ks1 = __half2float(k_scale_s[(keya + 1) * Groups + grp]);
+                const float ks0 = __half2float(ks_ah[grp]);
+                const float ks1 = __half2float(ks_bh[grp]);
                 score[ntl][0]   = __fmaf_rn(qs0[grp] * ks0, static_cast<float>(c0), score[ntl][0]);
                 score[ntl][1]   = __fmaf_rn(qs0[grp] * ks1, static_cast<float>(c1), score[ntl][1]);
                 score[ntl][2]   = __fmaf_rn(qs1[grp] * ks0, static_cast<float>(c2), score[ntl][2]);
@@ -501,13 +516,7 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
         asm volatile("bar.sync %0, %1;" ::"n"(kMaxBarrier), "n"(ProducerThreads) : "memory");
         bm0 = fmaxf(pair_m_s[row0], pair_m_s[Br + row0]);
         bm1 = fmaxf(pair_m_s[row1], pair_m_s[Br + row1]);
-        if (kb + 1 < key_blocks) {
-            if (kb + 1 < n_full_blocks) {
-                issue_k_tile(kb + 1, std::true_type{});
-            } else {
-                issue_k_tile(kb + 1, std::false_type{});
-            }
-        }
+        if (kb + 1 < key_blocks) { issue_k_block(kb + 1); }
 
         const float nm0        = fmaxf(running_m0, bm0);
         const float nm1        = fmaxf(running_m1, bm1);
@@ -590,26 +599,35 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
     };
 
     // The two roles run separate loops so the register allocator can give the producer state
-    // (Q fragments, statistics, P) and the worker accumulator the same registers. Both loops
-    // meet at the same sequence of whole-block barriers:
-    //   prologue, then per tile X and, unless it is the last tile, Y.
+    // (Q fragments, statistics, P) and the worker accumulator the same registers. They meet at
+    // two one-sided barriers per tile (the waiting side syncs, the other side only arrives):
+    //   PReady(t): producers publish P(t), alpha(t); workers wait before PV(t).
+    //   PFree(t):  workers finish PV(t);        producers wait before publishing P(t + 1).
+    // An arrival for tile t + 1 always follows the other side's wait for tile t, so the hardware
+    // barrier never mixes two tiles' arrivals.
     auto block_barrier = []() { asm volatile("bar.sync 0;" ::: "memory"); };
+    auto sync_handoff  = [](auto id_tag) {
+        asm volatile("bar.sync %0, %1;" ::"n"(decltype(id_tag)::value),
+                     "n"(kCausalPromptI8Threads)
+                     : "memory");
+    };
+    auto arrive_handoff = [](auto id_tag) {
+        asm volatile("bar.arrive %0, %1;" ::"n"(decltype(id_tag)::value),
+                     "n"(kCausalPromptI8Threads)
+                     : "memory");
+    };
+    using PFree  = std::integral_constant<unsigned, kPFreeBarrier>;
+    using PReady = std::integral_constant<unsigned, kPReadyBarrier>;
     if (producer) {
-        // Prologue: P(0) and the V(0) FP16 tile; K(1) is issued inside produce.
         produce_block(0);
         publish_p();
-        dequant_block(0);
-        block_barrier();
+        arrive_handoff(PReady{});
 #pragma unroll 1
-        for (int kb = 0; kb < key_blocks; ++kb) {
-            const bool has_next = kb + 1 < key_blocks;
-            if (has_next) { produce_block(kb + 1); }
-            block_barrier(); // X: P(kb), alpha(kb) and the FP16 V tile are free.
-            if (has_next) {
-                publish_p();
-                dequant_block(kb + 1);
-                block_barrier(); // Y: P(kb + 1), alpha(kb + 1) and V(kb + 1) FP16 published.
-            }
+        for (int kb = 0; kb + 1 < key_blocks; ++kb) {
+            produce_block(kb + 1);
+            sync_handoff(PFree{}); // PV(kb) has read P(kb) and alpha(kb).
+            publish_p();
+            arrive_handoff(PReady{}); // P(kb + 1), alpha(kb + 1) published.
         }
         if (lid == 0) {
             pair_l_s[col_half * Br + row0] = running_l0;
@@ -701,7 +719,9 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
             }
         };
 
-        block_barrier();
+        // V(0) codes landed before the Q barrier.
+        dequant_block(0);
+        sync_handoff(PReady{});
 #pragma unroll 1
         for (int kb = 0; kb < key_blocks; ++kb) {
             const bool has_next = kb + 1 < key_blocks;
@@ -713,9 +733,15 @@ __global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
                 }
             }
             pv();
-            if (has_next) { ninfer::ops::cp_wait<0>(); }
-            block_barrier(); // X: V(kb + 1) codes landed.
-            if (has_next) { block_barrier(); } // Y
+            if (has_next) {
+                arrive_handoff(PFree{});
+                // Every worker has finished PV(kb) (the FP16 V tile is free) and its own V(kb + 1)
+                // copies have landed.
+                ninfer::ops::cp_wait<0>();
+                asm volatile("bar.sync %0, %1;" ::"n"(kWorkerBarrier), "n"(WorkerThreads) : "memory");
+                dequant_block(kb + 1);
+                sync_handoff(PReady{}); // P(kb + 1) and the V(kb + 1) FP16 tile published.
+            }
         }
         block_barrier(); // pair row sums written
         block_barrier(); // final row sums written

@@ -575,7 +575,11 @@ Python tools run independently of CMake; the standalone HBM probe has its own
   warp-specialized and software-pipelined: eight worker warps own the fp32 accumulator and run
   PV of key tile t while the eight producer warps score tile t + 1, K/V (including packed
   rk4v4/rk4v4-e8 codes) stage by cp.async one tile ahead, and the accumulator no longer spills
-  around QK.
+  around QK. The worker warps dequantize V to FP16 themselves right after PV, the roles hand P
+  over through one-sided named barriers (arrive/sync) instead of two block barriers per tile,
+  and QK loads a key's four group scales at once and both k-steps of a group with one
+  `ldmatrix`: the prompt kernel runs 15-23% faster (int8) and 17-25% faster (rk4v4-e8) at 8K-128K
+  keys, and rk4v4-e8 NIAH prefill drops from 23.5 s to 22.6 s (64K) and 58.6 s to 54.4 s (128K).
 - **Causal-tile partitioned key-block traversal.** Interior key blocks (wholly below the causal
   diagonal for the whole CTA tile) run a separate instantiation of the key-block body: KV stages
   with unconditional copies and the softmax drops its masking selects; boundary blocks keep the
