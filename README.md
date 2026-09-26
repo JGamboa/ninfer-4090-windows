@@ -23,6 +23,7 @@ What is new on this branch, in short:
 | **Concurrent-lane** tensor-core route for ternary weights | 3 lanes: 185 → 360 tok/s aggregate (1.95x) |
 | MTP layer in **Q4/Q5** instead of Q8 | +3.5–4.8 % decode, same acceptance |
 | **Long-context attention**: whole-wave splits, pipelined prompt kernel, packed-KV fixes | 128K prefill −6.5 to −8.1 %; exact needle retrieval to 128K on both KV modes |
+| **Prefill**: pipelined ternary GEMM for tall weights, prompt-attention producer offload | Bonsai: 8K +31–37 %, 64K 24.3 → 18.6 s, 128K 59.5 → 46.2 s; Qwen3.8: 64K/128K −3/−4 % |
 | Qwen3.8 **DFlash2 verification** routes (K-split tensor-core GEMMs) | MLP gate+up at 13 columns: 72 → 95 % of the card's measured read ceiling |
 | Context cache: publication-order and test fixes | every `prefix_real` scenario passes on both models |
 
@@ -51,8 +52,8 @@ Same machine for every row: RTX 4090 at stock clocks, Core i9-13900K, Windows 11
 | Decode, edit-style agent prompts (MTP 2 + n-gram) | **532 tok/s** | — |
 | Decode, 3 concurrent requests, aggregate (MTP 2) | **360 tok/s** | — |
 | Decode, no speculation (`tg128`) | **101 tok/s** | 77 tok/s |
-| Prefill (`pp512`) | **3,061 tok/s** | 1,363 tok/s |
-| Prefill (`pp2048`) | **3,349 tok/s** | — |
+| Prefill (`pp512`) | **4,182–4,251 tok/s** | 1,363 tok/s |
+| Prefill (`pp2048`) | **4,460–4,502 tok/s** | — |
 | Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
 | Weights in VRAM, text only | 5.52 GiB | 5.53 GiB |
 | Weights in VRAM with the Q4/Q5 MTP head | 6.11 GiB (6.39 GiB with Vision) | — |
@@ -67,6 +68,8 @@ Same machine for every row: RTX 4090 at stock clocks, Core i9-13900K, Windows 11
   items 14, 15 and 20).
 - Perplexity: wikitext and code are the two corpora where both tools score comparable text.
   NInfer's quick run over four corpora gives an overall 5.8556 (Qwen3.8-27B Q4/Q5: 4.80).
+- NInfer's prefill rows are `ninfer_bench -p 512,2048 -r 3` (bf16 KV), two runs on 2026-09-26
+  ([design notes](docs/maintainer/bonsai-ternary-design.md) section 9.1, item 25).
 - The fork's prefill figure uses the PTQ1_0 packing; Prism's model card says its PQ2_0 packing
   processes prompts faster, so part of the prefill gap is the file format, not the engine.
 - The RTX 4090 in these measurements also drives a 4K desktop. See
@@ -90,7 +93,9 @@ three reasons:
    is fused into the activation quantization, and the whole decode round replays as one CUDA
    Graph.
 3. **Prefill in large tiles.** The int8 tensor-core GEMM decodes each weight tile once per 128
-   tokens and loads its operands with `ldmatrix`.
+   tokens and loads its operands with `ldmatrix`. Weights of 8192 rows or more run a pipelined
+   kernel: double-buffered activation and code stages, and two warp halves that alternate
+   tensor-core and integer work, so the MMAs overlap the ternary decode.
 
 The costs: about 0.6 GB of VRAM for the Q4/Q5 MTP head, and an MTP head that was trained for
 Qwen3.8, not for Bonsai, so acceptance varies with the content.

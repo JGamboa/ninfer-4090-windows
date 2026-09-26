@@ -2290,6 +2290,103 @@ Next steps, in order:
       (a third of the GEMM time) are unchanged, and attention, GDN and quantization are ~30 % of
       the prefill.
 
+22. Prompt attention producer offload (measured 2026-09-25, RTX 4090, CUDA 13.4; applies to every
+    model with int8 or packed KV, so Qwen3.8 too).
+    - Nsight Compute at ~126K keys (rk4v4-e8) put the 8 producer warps on the critical path:
+      workers spent 43 % of their stall samples at the two per-tile block barriers, producers
+      4.5 %. The producers also carried the V FP16 dequant (~12 % of their samples) and a scalar
+      INT4 key unpack (~11 %).
+    - The workers now dequantize V(t+1) right after PV(t), behind a worker-only barrier. P and
+      alpha are handed over through one-sided named barriers (`PFree`: workers arrive after
+      PV(t); `PReady`: producers arrive after publishing P(t+1)).
+    - QK walks key tiles outermost, with one 8-byte load of a key's four group scales and one x4
+      `ldmatrix` per group; the summation order is unchanged, so scores are bit-identical.
+    - `kv_cache_unpack_i4x16` is bytewise and exact; `small_t_i8` (decode) uses it too.
+    - Shared memory stays at 93696 B; spills of the production instance fall from 84/92 B to
+      44/56 B.
+    - Append bench (1024 tokens, d256-h24-kv4, two alternating rounds), median us per chunk:
+
+      | KV | 8K | 32K | 64K | 128K |
+      |---|---|---|---|---|
+      | int8 | 1127-1182 -> 935 | 4018-4195 -> 3303-3338 | 9132-9139 -> 7063-7219 | 17795-18026 -> 15078-15163 |
+      | rk4v4-e8 | 1319-1323 -> 1079-1081 | 4705-5235 -> 3808 | 10572-10576 -> 7964-8092 | 20636-20896 -> 17130-17190 |
+
+    - Rejected, measured: moving K staging and expansion to the workers with K double-buffered in
+      the Q region (worker-bound; 128K rk4v4-e8 19.5 vs 18.5 ms); producer-side K double
+      buffering (no gain beyond noise). GQA packing was analysed and not built: packing heads into
+      the same 64 rows leaves the CTAs and per-CTA key tiles unchanged, and more rows per CTA does
+      not fit sm_89's registers with an FP32 accumulator at D = 256.
+    - After the change the producers' QK IMMA mostly waits on the tensor pipe shared with the
+      workers' HMMA (math-pipe throttle ~30 % of producer samples).
+    - Full `ninfer_softmax_attention_test` and `--rk4v4-e8-only` pass with unchanged criteria.
+
+23. Pipelined t5 prefill GEMM (measured 2026-09-25, RTX 4090 at 60 Hz).
+    - Nsight Compute on the 16-warp 128 x 128 tile of item 21 (gate+up, T = 1024): tensor pipe
+      active 35 % of the time; ~18 % of stall samples were funnel shifts waiting on code bytes
+      loaded in the same step; I2F conversions were 7.4 % of instructions (quarter rate); two
+      CTA-wide barriers per step.
+    - Weights of at least 8192 rows now run `gemm_tall_kernel`: eight warps of 64 x 32, one CTA
+      per SM, double-buffered activation and code-word stages (68.6 KB), one barrier per step.
+      Warps 0-3 multiply before their decode and FP32 update, warps 4-7 after, so each
+      sub-partition overlaps one warp's MMAs with the other's ALU work (tensor active 52 %, 409M
+      instead of 603M warp instructions).
+    - Both GEMM kernels start each step's int32 sums at `0x4B400000`, so `(code . q - sum)` is one
+      exact FADD; they load code bytes a step ahead and shift them only at the decode, launch the
+      token tiles of a row block adjacently, and decode trits with one `PRMT` per word.
+    - Arithmetic per output is unchanged: quick perplexity 5.854904; `ninfer_linear_t5_test`
+      passes, now including a row-offset parent view at T = 129.
+    - `ninfer_t5_bench` rot, T = 1024, us: gate+up 1724 -> 1158, in_proj 787 -> 555, qkvg
+      690 -> 494, o_proj 365 -> 342, down 1015 -> 912. At T = 2048 the tall shapes gain 33-35 %.
+    - Rejected, measured: warp-specialized producer/consumer rings (gate+up 1206-1520 us),
+      16-warp single-barrier tiles (1260-1517), row-tile-outer MMA ordering (+2-4 %),
+      row-block-fastest launch order (+5 %).
+    - Remaining headroom: part of the ping warps' post-MMA work is still exposed; per-half
+      barriers with deeper rings are the next lever.
+
+24. Split-K tail of the 64 x 128 GEMM: measured, not merged (branch `perf/t5-splitk`, `f639250c`,
+    on top of item 21).
+    - Tail tiles of the last resident wave (fewer tiles than SMs) were split along K over up to
+      four CTAs, with FP32 partials, an arrival counter zeroed by a memset node and a fixed-order
+      reduction by the last CTA (deterministic; the FP64-oracle test covered uneven splits,
+      partial token tiles, residual accumulate and graph replay; perplexity 5.854904).
+    - Gains exist only at widths that leave a partial last wave: o_proj 5120 x 6144 at T = 512
+      239 -> 179 us, down 5120 x 17408 at T = 512 600 -> 507 us, down at T = 96/128 ~232/258 ->
+      ~127/136 us.
+    - The 1024-token chunk does not split (its 128-tile last wave gives every SM one CTA, which
+      runs nearly as fast as two); splitting it measured no gain, and the wave-quantization loss
+      there is at most ~4 %. CLI prefill: long_niah_64k unchanged (2.73K tok/s), long_niah_8k
+      within noise.
+    - Not merged: end to end it only touches the last partial chunk of a prompt (~10 ms out of
+      2.3 s at 8K, estimated), and it adds a kernel instantiation and workspace to every
+      5120-row weight. Revisit only if short prompts (T = 96-512 chunks) become a target.
+
+25. Items 21-23 together (`01f48d4f`, measured 2026-09-26, RTX 4090 at 60 Hz, server off).
+    - Checks on the integrated build: `ninfer_linear_t5_test` passes; full
+      `ninfer_softmax_attention_test` and `--rk4v4-e8-only` pass (oracle quality line identical to
+      item 22); quick perplexity 5.854904.
+    - Decode is unchanged: the six-prompt MTP regression (512 tokens, greedy) against `4f1cf770`
+      gives identical text on all six prompts for Bonsai (MTP 2) and Qwen3.8 (MTP 3, int8 KV), at
+      the same ms per round (11.8 and 25.9).
+    - CLI NIAH prefill (rk4v4-e8, `--prefill-chunk 1024`, MTP flags, `--no-thinking`). Three
+      binaries alternated: the pre-item-21 build (`build_t5_base`), `4f1cf770` (item 21) and the
+      integrated build; 8K and 64K twice with the order reversed, 128K once. All 30 answers are
+      exact.
+
+      | Model, prompt | Before item 21 | Item 21 | Integrated |
+      |---|---|---|---|
+      | Bonsai `long_niah_8k` | 3.23 / 3.30K tok/s | 3.40 / 3.35K | **4.43 / 4.34K** (+31 to +37 %) |
+      | Bonsai `long_niah_64k` | 24.3 / 24.3 s | 23.4 / 23.3 s | **18.6 / 18.6 s** (-23 %) |
+      | Bonsai `long_niah_128k` | 59.5 s | 57.7 s | **46.2 s** (-22 %) |
+      | Qwen3.8 `long_niah_8k` | 3.9 / 3.9 s | 4.0 / 3.9 s | 3.9 / 3.9 s |
+      | Qwen3.8 `long_niah_64k` | 37.4 / 37.3 s | 37.4 / 37.3 s | **36.3 / 36.3 s** (-3 %) |
+      | Qwen3.8 `long_niah_128k` | 85.6 s | 85.6 s | **82.4 s** (-4 %) |
+
+      Qwen3.8 gains only from the attention change (item 22); its prefill is dominated by the
+      Q4/Q5 GEMMs, which items 21 and 23 do not touch.
+    - `ninfer_bench -p 512,2048 -r 3` on `bonsai2_27b_vl.ninfer` (bf16 KV, two runs): pp512
+      4182 / 4251 tok/s, pp2048 4502 / 4460 tok/s, against 3061 and 3349 in item 9 (measured
+      2026-09-24, not re-run alternated).
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf

@@ -762,3 +762,24 @@ lane active; decode tok/s from the request log:
   `start-ninfer-server - mtp.bat`) now run `--spec mtp --draft-tokens 3 --lm-head-draft --ngram
   chain` with CUDA graphs (backups `.bak-20260925-ngram`). The 131072-context launcher starts with
   1.71 GB free after startup (graph allowance 580 MiB).
+
+### Prompt attention producer offload: Qwen3.8 prefill (`7b6ed558`, 2026-09-26)
+
+The int8/packed-KV prompt attention kernel now dequantizes V on the worker warps and hands P over
+through one-sided named barriers (Bonsai design notes, section 9.1, item 22). Qwen3.8 uses the same
+kernel, so its long prompts gain; the ternary GEMM changes of the same series do not apply to it.
+
+CLI NIAH prefill, rk4v4-e8, `--prefill-chunk 1024`, `--max-context 132096`, MTP 3,
+`--no-thinking`, measured on the RTX 4090 at 60 Hz. The build before the series and the integrated
+build (`01f48d4f`) were alternated; 8K and 64K twice with the order reversed, 128K once. All answers
+are exact.
+
+| Prompt | Before | After |
+|---|---|---|
+| `long_niah_8k` | 3.9 / 3.9 s (1.96K tok/s) | 3.9 / 3.9 s |
+| `long_niah_64k` | 37.4 / 37.3 s (1.73K tok/s) | 36.3 / 36.3 s (1.78K tok/s, -3 %) |
+| `long_niah_128k` | 85.6 s (1.52K tok/s) | 82.4 s (1.58K tok/s, -4 %) |
+
+MTP 3 decode on the six-prompt regression gives identical text at the same 25.9 ms per round. The
+Qwen3.8 prefill remains GEMM-bound on the Q4/Q5 weights (about 1.9K tok/s at 8K against 4.4K for
+Bonsai).
