@@ -172,13 +172,24 @@ machine:
 | Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
 | Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
-| Prefill, `pp512` / `pp2048` | 1,821 / 2,035 tok/s |
-| Prefill, 64K / 128K-token prompt (needle test, answer exact) | 36.3 s / 82.4 s |
+| Prefill, `pp512` / `pp2048` | 2,457 / 2,584 tok/s |
+| Prefill, 64K / 128K-token prompt (needle test, answer exact) | 29.4 s / 69.2 s |
 | Perplexity, quick four-corpus run | 4.80 |
 | Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 |
 
-Qwen3.8 prefill is bound by its Q4/Q5 GEMMs and is being worked on. Measurements and methods:
-[WINDOWS_PORT.md](WINDOWS_PORT.md).
+Against the official llama.cpp on the same machine and the same Qwen3.8-27B fine-tune (ColdFusion;
+llama.cpp `a894dae` on the Q4_K_S GGUF with q8_0 KV and flash attention, NInfer on the Q4/Q5
+artifact with int8 KV; same needle prompts, thinking off, no speculation, two runs each):
+
+| Prompt prefill | llama.cpp | NInfer |
+|---|---:|---:|
+| 8K tokens | 3.0 s (2,558-2,585 tok/s) | 3.0-3.1 s (2,470-2,530 tok/s) |
+| 64K tokens | 29.8-29.9 s | **28.9-29.4 s** |
+| 128K tokens | 73.6-73.8 s | **66.8-66.9 s** (-9 %) |
+| `pp512` / `pp2048` (bench tools) | **2,756 / 2,729 tok/s** | 2,334 / 2,594 tok/s |
+
+llama.cpp leads on short prompts; NInfer ties at 8K-64K and leads at 128K. Measurements and
+methods: [WINDOWS_PORT.md](WINDOWS_PORT.md).
 
 ### Speculative decoding by workload
 
@@ -403,9 +414,9 @@ The full protocol reference, including every field and error code, is in
 - One RTX 4090, one process, one resident model. No multi-GPU, no weight offload, no request
   preemption or priorities.
 - Prefill runs one request at a time; decode of other lanes waits while it runs.
-- Qwen3.8 prefill is behind llama.cpp: the upstream 4090 port measured it 4-10 % slower through
-  the server on 64K-128K prompts, on Linux ([docs/llamacpp-comparison.md](docs/llamacpp-comparison.md)),
-  while NInfer decode led at every depth. Bonsai prefill is about 3x Prism's llama.cpp fork.
+- Qwen3.8 prefill trails llama.cpp on short prompts (`pp512` 2,334 against 2,756 tok/s on the same
+  machine) and matches or leads it from 8K up ([Qwen3.8 performance](#qwen38-27b)). Bonsai
+  prefill is about 3x Prism's llama.cpp fork.
 - Long-context decode slows with depth: a Bonsai MTP round costs 18.5-20.8 ms at 128K against
   12.8 ms at short context, all of it in attention.
 - DFlash2 is not supported with Bonsai's ternary output head; use MTP.
@@ -459,9 +470,6 @@ reads. [fraserprice/bonsai-vllm](https://github.com/fraserprice/bonsai-vllm) was
 for the Hadamard kernel and a ternary tensor-core GEMM. The Bonsai port was developed with
 [Claude Code](https://claude.com/claude-code), with every kernel checked against FP64 oracles and
 every performance claim measured on the RTX 4090.
-
-If you find the engine useful, the upstream author accepts support on
-[Ko-fi](https://ko-fi.com/neroued).
 
 ## License
 

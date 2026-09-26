@@ -816,3 +816,92 @@ model and prompt, order alternated per prompt; RTX 4090 at 60 Hz. Tokens are all
 - With one greedy sample per prompt, this does not reproduce the author's -24 to -46 % mean token
   reduction; the per-prompt variance is larger than the effect. The base artifact stays the
   default.
+
+## Pipelined Q4/Q5 prefill GEMMs (`4ba151cf`, 2026-09-26)
+
+The wide routes of the four Qwen3.8 prefill GEMM families (Q4 gate+up SwiGLU, Q5 `linear_add`
+down/o_proj/out_proj, grouped Q4/Q5 GDN in_proj and attention qkvg; 96 % of prefill) now run one
+engine, `src/ops/common/rowsplit_tall_mma.cuh`:
+
+- 128 weight rows x 128 tokens (64 tokens for the 5120-row Q5 weights), 8 warps, one CTA per SM,
+  64 KB of dynamic shared memory.
+- Double-buffered dequantized-weight and activation stages with one barrier per K step; code
+  bytes are loaded a step ahead.
+- Ping-pong warp halves (warps 0-3 multiply then decode, warps 4-7 the reverse), as in the ternary
+  GEMM of the Bonsai design notes, item 23.
+- Token tiles launch fastest, so a row block's weights are shared in L2; the epilogue is staged in
+  shared memory and written as coalesced 16-byte chunks.
+
+The dequantization `bf16_rn(float(q) * float(scale))`, the m16n8k16 MMA sequence, the K order and
+the epilogue rounding per output are unchanged, so outputs are bit-identical: a bitwise old/new
+comparison at real shapes for T = 128 to 2048 found no differing output, and the quick perplexity
+is 4.800742 before and after. The narrow routes keep their kernels.
+
+Nsight Compute, T = 1024, SM clock locked at ~2.6 GHz:
+
+| Kernel | Duration | DRAM read | Tensor pipe active |
+|---|---|---|---|
+| gate+up 34816 x 5120 | 3.31 -> 2.50 ms | 747 -> 111 MB | 32.3 -> 42.9 % |
+| down 5120 x 17408 | 1.56 -> 1.26 ms | 245 -> 105 MB | 34.6 -> 42.9 % |
+| o_proj 5120 x 6144 | 0.56 -> 0.46 ms | 46 -> 44 MB | 34.1 -> 42.4 % |
+| GDN in_proj 16384 x 5120 | 1.36 -> 1.18 ms | 108 -> 67 MB | 38.4 -> 42.7 % |
+| qkvg 14336 x 5120 | 1.17 -> 1.04 ms | 90 -> 54 MB | 38.9 -> 42.9 % |
+
+ncu's tensor percentage is against the FP16-accumulate peak; 43 % is about 86 % of the
+FP32-accumulate HMMA rate, so at most ~14 % remains in the gate+up kernel.
+
+Op benches (cold L2, median us, T = 512 / 1024 / 2048): gate+up 1720 -> 1273 / 3184 -> 2400 /
+6868 -> 5290; down 978 -> 742 / 1505 -> 1208 / 2758 -> 2398; o_proj 359 -> 273 / 549 -> 439 /
+994 -> 860; GDN in_proj 794 -> 590 / 1526 -> 1167 / 2979 -> 2327; qkvg 644 -> 573 / 1166 -> 995 /
+2272 -> 1990.
+
+End to end on the integrated build (`build_qwen_base` = `29b203fc` against `4ba151cf`,
+alternated twice; rk4v4-e8, `--prefill-chunk 1024`, MTP 3, `--no-thinking`; all answers exact):
+
+| Measurement | Before | After |
+|---|---|---|
+| `long_niah_8k` | 3.9-4.1 s (1.89-1.96K tok/s) | 3.1 s (2.47-2.50K tok/s) |
+| `long_niah_64k` | 36.0 / 36.0 s | 29.5 / 29.4 s (-18 %) |
+| `long_niah_128k` (once, qwen-gemm agent) | 82.9 s | 69.2 s (-16.5 %) |
+| `ninfer_bench` pp512 / pp2048, int8 KV | 1,813 / 1,998 tok/s | 2,457 / 2,584 tok/s |
+
+Unchanged: the six-prompt greedy regression gives identical text for Bonsai (MTP 2) and Qwen3.8
+(MTP 3) at the same ms per round, and the Bonsai `pp512`/`pp2048` rates are within noise. The
+Q4/Q5 op tests (`ninfer_linear_swiglu_q4_a16_test`, `ninfer_linear_add_q5_a16_test`,
+`ninfer_gdn_input_proj_test`, `ninfer_attn_input_proj_test`, `ninfer_linear_q4_a16_test`) pass
+with unchanged criteria.
+
+Rejected, measured: 128-token tiles on the 5120-row Q5 weights (down 1500 against 1261 us at
+T = 1024: 40 row blocks leave a half-empty last wave) and decoding by the pong warps only (+25-30 %).
+
+## Prefill against the official llama.cpp on this machine (2026-09-26)
+
+Same RTX 4090 (display at 60 Hz), same Qwen3.8-27B fine-tune (Cold Fusion) in each engine's own
+format, after `4ba151cf`:
+
+- llama.cpp `a894dae` (official, MSVC + CUDA build) with `Qwen3.8-27B-ColdFusion-MTP-Q4_K_S.gguf`
+  (16.32 GiB): `llama-server -c 132096 -ngl 99 --flash-attn on -ctk q8_0 -ctv q8_0 -ub 1024
+  -b 4096 --jinja -np 1`; requests with `cache_prompt: false` and
+  `chat_template_kwargs.enable_thinking: false`; prefill time from the response `timings`.
+- NInfer with `coldfusion_27b_v2.ninfer` (Q4/Q5): `ninfer.exe --messages <prompt> --max-context
+  132096 --no-thinking --prefill-chunk 1024 --kv-dtype int8 --max-new 16 --greedy`, no
+  speculation; prefill time from `text prefill`.
+- Prompts: `examples/cli/messages/long_niah_{8k,64k,128k}.json` (7,680 / 64,512 / 130,048
+  prompt tokens in both engines). Two rounds, engine order reversed in the second. Every answer
+  was exact.
+
+| Prompt | llama.cpp r1 / r2 | NInfer r1 / r2 |
+|---|---|---|
+| 8K | 3.0 / 3.0 s (2,558 / 2,585 tok/s) | 3.1 / 3.0 s (2,47K / 2,53K tok/s) |
+| 64K | 29.8 / 29.9 s | 29.4 / 28.9 s |
+| 128K | 73.6 / 73.8 s | 66.8 / 66.9 s (-9 %) |
+
+Bench tools at depth 0 (`llama-bench -p 512,2048 -n 0 -fa 1 -ctk q8_0 -ctv q8_0 -ub 1024 -b 4096
+-r 3` against `ninfer_bench -p 512,2048 -r 3 --kv-dtype int8`): pp512 2,756 against 2,334 tok/s,
+pp2048 2,729 against 2,594 tok/s.
+
+llama.cpp leads on short prompts (+18 % at 512 tokens, +5 % at 2K); the engines tie at 8K-64K and
+NInfer leads at 128K, where attention weighs more. The weights differ slightly (Q4_K_S against
+NInfer's Q4/Q5 mix), as do the KV formats (q8_0 against int8 with group-64 scales). The earlier
+comparison in [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md) was measured on another
+4090 under Linux before the prefill work of 2026-09-25/26.
