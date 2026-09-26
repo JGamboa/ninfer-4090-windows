@@ -9,11 +9,19 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 | **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **188 tok/s** | **532 tok/s** (MTP + n-gram) | 4,500 tok/s |
 | **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,008 tok/s** |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 107 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
+| **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
-Both Qwen3.8 files hold the same weights, byte for byte; the int8-prefill file lets prompt
+The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
 processing run on int8 tensor cores (1.6-1.8x faster, same decode, same quality within noise).
 For reference, the official llama.cpp prefills a Qwen3.8-27B Q4_K_S GGUF at 2,729 tok/s
 (`pp2048`) on the same card.
+
+Swift 1.5 is a separate fine-tune of Qwen3.8-27B by UkisAI, trained to avoid overthinking. With
+the model card's sampling and thinking on, it used 27 % fewer tokens than base Qwen3.8 on six hard
+problems (three seeds each, 18/18 correct for both), mostly by cutting the longest reasonings;
+decode was slightly faster (129.8 against 121.8 tok/s) thanks to higher MTP acceptance
+([WINDOWS_PORT.md](WINDOWS_PORT.md#sampled-comparison-swift-15-against-base-2026-09-26)). Its
+license limits commercial use above a revenue threshold; see the model card.
 
 Every figure in this README was measured on the same RTX 4090 under Windows unless it says
 otherwise; the conditions are next to each table. Both models run the full 262K-token context on

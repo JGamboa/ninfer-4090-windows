@@ -817,6 +817,40 @@ model and prompt, order alternated per prompt; RTX 4090 at 60 Hz. Tokens are all
   reduction; the per-prompt variance is larger than the effect. The base artifact stays the
   default.
 
+### Sampled comparison, Swift 1.5 against base (2026-09-26)
+
+The greedy runs above do not match how Swift is evaluated, so the comparison was repeated with the
+model card's sampling: temperature 1.0, top-p 0.95, top-k 20, min-p 0, thinking on (template
+default `xhigh`), three seeds (11, 22, 33) per problem, model order alternated. Both models ran as
+int8-prefill artifacts (`qwen3_8_27b_a8.ninfer` and `swift15_27b_a8.ninfer`, converted from the
+Swift BF16 safetensors with `qwen3_8_27b_a8` in 155 s) on the same binary, int8 KV, MTP 3 with
+`--lm-head-draft`, up to 20,000 new tokens. Script: `ninfer.exe <artifact> --prompt/--messages ...
+--temperature 1.0 --top-p 0.95 --top-k 20 --seed <s>`.
+
+| Problem (answer) | Base, mean tokens | Swift, mean tokens | Change |
+|---|---:|---:|---:|
+| AIME 2026 #1 (277) | 1,318 | 1,853 | +41 % |
+| Probability, 4 of 12 balls (73/165) | 1,177 | 1,944 | +65 % |
+| Pairs with a*b a square (310) | 11,600 | 5,760 | -50 % |
+| Zebra puzzle (German) | 2,916 | 1,949 | -33 % |
+| Cubic divisible by 7 (86) | 1,627 | 2,439 | +50 % |
+| Clock right angle (3:32:44) | 2,047 | 1,207 | -41 % |
+| **Total, 18 runs each** | **62,059** | **45,458** | **-27 %** |
+
+- Both models answered all 18 runs correctly.
+- Token-weighted decode speed: 121.8 tok/s base, 129.8 tok/s Swift; mean MTP acceptance 59.7 %
+  against 64.5 % (16 of the 18 runs per model logged these fields).
+- The saving comes from the long reasonings (the pairs problem: 12,463 / 9,497 / 12,841 against
+  4,237 / 8,686 / 4,358 tokens); on problems the base solves in 1,200-1,600 tokens Swift often
+  thinks longer.
+- Two harder AIME 2026 problems (#15, #30), seed 11, up to 60,000 tokens: both models ran out of
+  tokens on #15 (about 9-10 min each); on #30 the base ran out with the correct value (393) already
+  in its reasoning, and Swift answered 372 after 42,021 tokens.
+- Swift 1.5 therefore thinks about a quarter less on this set at equal accuracy, faster per token,
+  less than UkisAI's reported -42 to -58 %. Published as
+  [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090);
+  the base artifact stays the default.
+
 ## Pipelined Q4/Q5 prefill GEMMs (`4ba151cf`, 2026-09-26)
 
 The wide routes of the four Qwen3.8 prefill GEMM families (Q4 gate+up SwiGLU, Q5 `linear_add`
