@@ -172,10 +172,16 @@ machine:
 | Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
 | Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
-| Prefill, `pp512` / `pp2048` | 2,457 / 2,584 tok/s |
-| Prefill, 64K / 128K-token prompt (needle test, answer exact) | 29.4 s / 69.2 s |
-| Perplexity, quick four-corpus run | 4.80 |
-| Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 |
+| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **4,436 / 5,008 tok/s** |
+| Prefill, 8K / 64K / 128K-token prompt, official artifact (needle test, answer exact) | 2.9 s / 27.4-27.6 s / 64.0 s |
+| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.6 s / 17.2 s / 43.0 s** |
+| Perplexity, quick four-corpus run, official / int8 artifact | 4.8007 / 4.7944 |
+| Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 (2026-09-25); 45/45 on both artifacts (2026-09-26) |
+
+The **int8 artifact** (`qwen3_8_27b_a8.ninfer`) holds the same weights as the official one, byte
+for byte, and allows the prefill GEMMs to quantize their activations to int8 (per token and per 64
+channels) and run on int8 tensor cores; decode is unchanged. It is built from the official file in
+a few minutes, without a BF16 checkpoint ([conversion](#converting-models)).
 
 Against the official llama.cpp on the same machine and the same Qwen3.8-27B fine-tune (ColdFusion;
 llama.cpp `a894dae` on the Q4_K_S GGUF with q8_0 KV and flash attention, NInfer on the Q4/Q5
@@ -188,8 +194,10 @@ artifact with int8 KV; same needle prompts, thinking off, no speculation, two ru
 | 128K tokens | 73.6-73.8 s | **66.8-66.9 s** (-9 %) |
 | `pp512` / `pp2048` (bench tools) | **2,756 / 2,729 tok/s** | 2,334 / 2,594 tok/s |
 
-llama.cpp leads on short prompts; NInfer ties at 8K-64K and leads at 128K. Measurements and
-methods: [WINDOWS_PORT.md](WINDOWS_PORT.md).
+With the official artifact, llama.cpp leads on short prompts and NInfer ties at 8K-64K and leads
+at 128K. The int8 artifact prefills `pp512` / `pp2048` at 4,436 / 5,008 tok/s, 1.6-1.8x the
+llama.cpp rates above (the int8 runs used the base Qwen3.8 artifact; the ColdFusion files were
+removed). Measurements and methods: [WINDOWS_PORT.md](WINDOWS_PORT.md).
 
 ### Speculative decoding by workload
 
@@ -322,7 +330,8 @@ CUDA graph.
   activation quantization.
 - **Groupwise weights (Qwen3.8).** Q4/Q5 codes with one FP16 scale per 64 weights, dequantized in
   shared memory for BF16 tensor-core GEMMs, with K-split routes for the 5-16-token verification
-  band of DFlash2.
+  band of DFlash2. Prefill runs pipelined one-CTA-per-SM GEMMs; with the int8 artifact the codes
+  feed int8 tensor cores directly against per-token, per-64-channel int8 activations.
 - **Speculative decoding.** MTP uses the model's own multi-token-prediction layer (Bonsai borrows
   Qwen3.8's, which shares its architecture); DFlash2 is a separate drafter; the n-gram pool
   (16 MiB, 8-token keys) extends MTP drafts with text from the context, up to 15 tokens per round.
@@ -383,7 +392,21 @@ python -m tools.convert --model E:\LLM\my-qwen38-finetune --recipe qwen3_8_27b ^
 ```
 
 Use NInfer's `qwen3_8.jinja` template: it adds developer and mid-conversation system messages
-and tool-result handling that agent clients need. Custom recipes and every option are in the
+and tool-result handling that agent clients need.
+
+**Qwen3.8 int8 prefill artifact.** The `qwen3_8_27b_a8` recipe copies an existing
+`qwen3_8_27b.ninfer` word for word and only grants int8 activations to the prefill GEMMs. It needs
+a configuration directory (the Qwen3.8 `config.json` and tokenizer/template files) and takes about
+four minutes on the CPU:
+
+```bat
+python -m tools.convert --model E:\LLM\qwen38-config --recipe qwen3_8_27b_a8 ^
+  --source reference=E:\LLM\qwen3_8_27b.ninfer --source dflash2=E:\LLM\dflash2-src ^
+  --components text,vision,mtp,dflash2 --name qwen3.8-27b --out E:\LLM\qwen3_8_27b_a8.ninfer
+```
+
+The [conversion guide](docs/weight-conversion.md) lists the files the configuration directory
+needs. Custom recipes and every option are in the
 [weight conversion guide](docs/weight-conversion.md).
 
 ## Serving
@@ -414,9 +437,9 @@ The full protocol reference, including every field and error code, is in
 - One RTX 4090, one process, one resident model. No multi-GPU, no weight offload, no request
   preemption or priorities.
 - Prefill runs one request at a time; decode of other lanes waits while it runs.
-- Qwen3.8 prefill trails llama.cpp on short prompts (`pp512` 2,334 against 2,756 tok/s on the same
-  machine) and matches or leads it from 8K up ([Qwen3.8 performance](#qwen38-27b)). Bonsai
-  prefill is about 3x Prism's llama.cpp fork.
+- With the official Qwen3.8 artifact, prefill trails llama.cpp on short prompts (`pp512` 2,334
+  against 2,756 tok/s on the same machine); the int8 artifact leads at every length
+  ([Qwen3.8 performance](#qwen38-27b)). Bonsai prefill is about 3x Prism's llama.cpp fork.
 - Long-context decode slows with depth: a Bonsai MTP round costs 18.5-20.8 ms at 128K against
   12.8 ms at short context, all of it in attention.
 - DFlash2 is not supported with Bonsai's ternary output head; use MTP.

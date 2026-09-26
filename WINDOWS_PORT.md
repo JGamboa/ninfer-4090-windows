@@ -1007,3 +1007,11 @@ Remaining headroom (estimated): the tensor pipe is still idle 57 % of the time; 
 are 128-K steps (half the barriers, needs a second int32 accumulator set), quantizing the SwiGLU
 output inside the gate+up epilogue (saves the 17408-wide quantization pass and a BF16 round trip,
 ~7 % of the down projection), and fusing RMSNorm into the quantization.
+
+Integrated verification on `feat/bonsai-ternary` (2026-09-26, same machine, A16 and A8 artifacts on
+the same binary, alternated): the eight affected op suites pass (Q4/Q5 A16 and A8, GDN and
+attention input projections, `linear_q4_a16`, `linear_t5`); quick perplexity 4.800742 (A16,
+unchanged) and 4.794439 (A8); NIAH prefill 8K 2.9 / 2.9 s against 1.6 / 1.6 s, 64K 27.6 / 27.4 s
+against 17.2 / 17.2 s, 128K 64.0 s against 43.0 s, every answer exact; `ninfer_bench` int8 KV
+pp512 / pp2048 2,536 / 2,762 against 4,436 / 5,008 tok/s. The six-prompt greedy regression gives
+identical text and ms per round for Bonsai (MTP 2) and Qwen3.8 (MTP 3) against the pre-A8 binary.
