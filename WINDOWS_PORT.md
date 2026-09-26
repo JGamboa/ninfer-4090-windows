@@ -783,3 +783,36 @@ are exact.
 MTP 3 decode on the six-prompt regression gives identical text at the same 25.9 ms per round. The
 Qwen3.8 prefill remains GEMM-bound on the Q4/Q5 weights (about 1.9K tok/s at 8K against 4.4K for
 Bonsai).
+
+## Swift 1.5 (Qwen3.8-27B fine-tune) against the base artifact (2026-09-26)
+
+`ukisai/Swift-1.5-Qwen3.8-27b` is a merged LoRA fine-tune of Qwen3.8-27B trained to think less; the
+architecture, config, tokenizer and MTP head layout are unchanged. Converted on Windows from the BF16
+safetensors with the official recipe in 99 s (measured; same 20,437,521,664-byte size as
+`qwen3_8_27b.ninfer`):
+
+```powershell
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\swift15-src --recipe qwen3_8_27b `
+  --source dflash2=E:\LLM\dflash2-src --components text,vision,mtp,dflash2 `
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja --proposal `
+  --name swift-1.5-qwen3.8-27b --out E:\LLM\swift15_27b.ninfer
+```
+
+CLI, greedy, thinking on (template default), int8 KV, MTP 3 with `--lm-head-draft`, one run per
+model and prompt, order alternated per prompt; RTX 4090 at 60 Hz. Tokens are all generated tokens
+(thinking + answer):
+
+| Set | Base tokens | Swift tokens | Base decode | Swift decode | Correct (base / Swift) |
+|---|---|---|---|---|---|
+| Six short prompts (regression set) | 2,691 | 3,780 | 24.9 s | 34.2 s | n/a |
+| Six hard problems (probability, a*b square count, zebra puzzle, LIS proof, cubic mod 7, clock) | 15,900 | 18,194 | 136.8 s | 143.7 s | 6/6 / 6/6 |
+
+- Per hard problem, Swift / base tokens: 1116 / 1197, 11452 / 5850, 1706 / 2519, 1562 / 3952,
+  1233 / 1282, 1125 / 1100. Swift thinks much less on three problems (-32 % and -60 % on two) and
+  twice as long on the square-count problem, which dominates the total.
+- On the short set, one explanation prompt is 2.3x longer with Swift (1901 against 814 tokens); the
+  other five are within +-30 %.
+- Decode speed per token and MTP acceptance are the same (the base MTP head serves the fine-tune).
+- With one greedy sample per prompt, this does not reproduce the author's -24 to -46 % mean token
+  reduction; the per-prompt variance is larger than the effect. The base artifact stays the
+  default.
