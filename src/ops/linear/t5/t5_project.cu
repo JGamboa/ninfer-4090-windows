@@ -83,23 +83,36 @@ void launch_small_t(const QuantizedX& q, const Weight& w, int tokens,
 template <int WarpsM, int WarpsN>
 void launch_gemm(const QuantizedX& q, const Weight& w, int tokens, const t5_a8::Outputs& outputs,
                  bool accumulate, cudaStream_t stream) {
-    using Config               = t5_a8::GemmConfig<WarpsM, WarpsN>;
+    using Config                = t5_a8::GemmConfig<WarpsM, WarpsN>;
     constexpr std::size_t kSmem = t5_a8::gemm_shared_bytes<WarpsM, WarpsN>();
-    if constexpr (kSmem > 48 * 1024) {
-        static const bool opted_in = [] {
-            CUDA_CHECK(cudaFuncSetAttribute(t5_a8::gemm_kernel<WarpsM, WarpsN>,
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            static_cast<int>(kSmem)));
-            return true;
-        }();
-        (void)opted_in;
-    }
-    const dim3 grid(static_cast<unsigned>(w.n / Config::kRows),
-                    static_cast<unsigned>((tokens + Config::kTokens - 1) / Config::kTokens));
+    static_assert(kSmem <= 48 * 1024);
+    const int token_tiles = (tokens + Config::kTokens - 1) / Config::kTokens;
+    const unsigned grid   = static_cast<unsigned>(w.n / Config::kRows * token_tiles);
     t5_a8::gemm_kernel<WarpsM, WarpsN><<<grid, Config::kThreads, kSmem, stream>>>(
         static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
         static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, outputs, accumulate);
+        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, token_tiles, outputs,
+        accumulate);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_tall_gemm(const QuantizedX& q, const Weight& w, int tokens,
+                      const t5_a8::Outputs& outputs, bool accumulate, cudaStream_t stream) {
+    constexpr std::size_t kSmem = t5_a8::gemm_tall_shared_bytes();
+    static const bool opted_in  = [] {
+        CUDA_CHECK(cudaFuncSetAttribute(t5_a8::gemm_tall_kernel,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(kSmem)));
+        return true;
+    }();
+    (void)opted_in;
+    const int token_tiles = (tokens + t5_a8::kTallTokens - 1) / t5_a8::kTallTokens;
+    const unsigned grid   = static_cast<unsigned>(w.n / t5_a8::kTallRows * token_tiles);
+    t5_a8::gemm_tall_kernel<<<grid, t5_a8::kTallThreads, kSmem, stream>>>(
+        static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
+        static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, token_tiles, outputs,
+        accumulate);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -117,12 +130,12 @@ bool use_small_gemm_tile(const Weight& w, int tokens) {
     return large_ctas < device_sm_count() && w.k < kLongK;
 }
 
-// Weights of at least 8192 rows take 128 x 128 CTAs: each staged activation tile then serves 128
-// rows, halving the L2 activation reads per output (gate+up, GDN in_proj and attention qkvg:
-// -10 to -28 % at T = 128..2048). The 5120-row weights keep 64-row CTAs: 40 row blocks leave
-// the one-CTA-per-SM tile too few CTAs per wave (o_proj +8 % at T = 1024).
+// Weights of at least 8192 rows take the 128 x 128 kernel: each staged activation tile then
+// serves 128 rows, halving the L2 activation reads per output (gate+up, GDN in_proj and attention
+// qkvg). The 5120-row weights keep 64-row CTAs: 40 row blocks leave the one-CTA-per-SM tile too
+// few CTAs per wave (o_proj +8 % at T = 1024, design 9.1).
 bool use_tall_gemm_tile(const Weight& w) {
-    return w.n >= 8192 && w.n % t5_a8::GemmConfig<4, 4>::kRows == 0;
+    return w.n >= 8192 && w.n % t5_a8::kTallRows == 0;
 }
 
 void require_input(const Tensor& x, const Weight& w, const char* what) {
@@ -184,7 +197,7 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
     } else if (use_small_gemm_tile(w, tokens)) {
         launch_gemm<2, 2>(q, w, tokens, packed, accumulate, stream);
     } else if (use_tall_gemm_tile(w)) {
-        launch_gemm<4, 4>(q, w, tokens, packed, accumulate, stream);
+        launch_tall_gemm(q, w, tokens, packed, accumulate, stream);
     } else {
         launch_gemm<2, 4>(q, w, tokens, packed, accumulate, stream);
     }
