@@ -892,9 +892,18 @@ format, after `4ba151cf`:
 
 | Prompt | llama.cpp r1 / r2 | NInfer r1 / r2 |
 |---|---|---|
-| 8K | 3.0 / 3.0 s (2,558 / 2,585 tok/s) | 3.1 / 3.0 s (2,47K / 2,53K tok/s) |
+| 8K | 3.0 / 3.0 s (2,558 / 2,585 tok/s) | 3.1 / 3.0 s (2,470 / 2,530 tok/s) |
 | 64K | 29.8 / 29.9 s | 29.4 / 28.9 s |
 | 128K | 73.6 / 73.8 s | 66.8 / 66.9 s (-9 %) |
+
+With 4-bit KV in both engines (llama.cpp `-ctk q4_0 -ctv q4_0`, NInfer `--kv-dtype rk4v4-e8`;
+the E8-lattice keys keep more precision than `q4_0`), same protocol:
+
+| Prompt | llama.cpp q4_0 r1 / r2 | NInfer rk4v4-e8 r1 / r2 |
+|---|---|---|
+| 8K | 3.0 / 3.0 s | 3.2 / 3.1 s |
+| 64K | 29.8 / 29.9 s | 29.4 / 29.5 s |
+| 128K | 73.0 / 73.5 s | 69.4 / 68.5 s (-6 %) |
 
 Bench tools at depth 0 (`llama-bench -p 512,2048 -n 0 -fa 1 -ctk q8_0 -ctv q8_0 -ub 1024 -b 4096
 -r 3` against `ninfer_bench -p 512,2048 -r 3 --kv-dtype int8`): pp512 2,756 against 2,334 tok/s,
