@@ -40,6 +40,7 @@ struct Options {
     Format format                  = Format::All;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
+    ops::LinearPolicy q4q5_policy  = ops::LinearPolicy::A16Only;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
@@ -71,7 +72,7 @@ struct Measurement {
                  "error: %s\n"
                  "usage: ninfer_gdn_input_proj_bench "
                  "[--format q4q5|q8|nvfp4|fp8|all] [--nvfp4-policy a16|a4] "
-                 "[--fp8-policy a16|a8] "
+                 "[--fp8-policy a16|a8] [--q4q5-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] "
                  "[--profile] [--csv-out PATH]\n",
@@ -145,6 +146,14 @@ Options parse_options(int argc, char** argv) {
                 options.fp8_policy = ops::LinearPolicy::AllowA8;
             else
                 usage("--fp8-policy expects a16 or a8");
+        } else if (argument == "--q4q5-policy") {
+            const std::string_view value(next("--q4q5-policy requires a value"));
+            if (value == "a16")
+                options.q4q5_policy = ops::LinearPolicy::A16Only;
+            else if (value == "a8")
+                options.q4q5_policy = ops::LinearPolicy::AllowA8;
+            else
+                usage("--q4q5-policy expects a16 or a8");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -318,18 +327,26 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens);
     DeviceBuffer qkv(static_cast<std::size_t>(kQkRows + kValueRows) * max_tokens * 2);
     DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
+    const auto capacity = [&](std::int32_t tokens) {
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::Q4_G64_FP16, QType::Q5_G64_FP16, kHidden, options.q4q5_policy, tokens, tokens);
+    };
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::gdn_input_proj_workspace_capacity_bytes(QType::Q4_G64_FP16, QType::Q5_G64_FP16,
+                                                     kHidden, options.q4q5_policy, 1, max_tokens),
+        256));
     const auto make_launch = [&](std::int32_t tokens) {
         return [&, tokens](cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {kHidden, tokens});
             Tensor tqkv(qkv.p, DType::BF16, {kQkRows + kValueRows, tokens});
             Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, launch_stream);
+            ops::gdn_input_proj(x, qk.weight, value_z.weight, tqkv, tz, options.q4q5_policy,
+                                workspace, launch_stream);
         };
     };
-    measure_points(
-        options, "q4q5", "a16", kHidden, kOutputRows,
-        qk.model_weight_bytes() + value_z.model_weight_bytes(),
-        [](std::int32_t) { return std::size_t{0}; }, make_launch, flush, stream, results);
+    measure_points(options, "q4q5", policy_name(options.q4q5_policy), kHidden, kOutputRows,
+                   qk.model_weight_bytes() + value_z.model_weight_bytes(), capacity, make_launch,
+                   flush, stream, results);
 }
 
 void run_q8(const Options& options, DeviceBuffer& flush, cudaStream_t stream,

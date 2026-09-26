@@ -42,6 +42,7 @@ struct Options {
     Format format                  = Format::All;
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     ops::LinearPolicy fp8_policy   = ops::LinearPolicy::AllowA8;
+    ops::LinearPolicy q4q5_policy  = ops::LinearPolicy::A16Only;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
     int warmup   = 5;
@@ -75,7 +76,7 @@ struct Measurement {
                  "error: %s\n"
                  "usage: ninfer_attn_input_proj_bench "
                  "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
-                 "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
+                 "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] [--q4q5-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -155,6 +156,14 @@ Options parse_options(int argc, char** argv) {
                 options.fp8_policy = ops::LinearPolicy::AllowA8;
             else
                 usage("--fp8-policy expects a16 or a8");
+        } else if (argument == "--q4q5-policy") {
+            const std::string_view value(next("--q4q5-policy requires a value"));
+            if (value == "a16")
+                options.q4q5_policy = ops::LinearPolicy::A16Only;
+            else if (value == "a8")
+                options.q4q5_policy = ops::LinearPolicy::AllowA8;
+            else
+                usage("--q4q5-policy expects a16 or a8");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), "--tokens");
         } else if (argument == "--cache") {
@@ -375,6 +384,11 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     vary_groupwise(qk);
     vary_groupwise(gv);
     DeviceBuffer input = varied_input(static_cast<std::size_t>(hidden) * max_tokens);
+    const char* policy = policy_name(options.q4q5_policy);
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::attn_input_proj_workspace_capacity_bytes(QType::Q4_G64_FP16, QType::Q5_G64_FP16,
+                                                      hidden, options.q4q5_policy, 1, max_tokens),
+        256));
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer gate(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
@@ -386,12 +400,13 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
         Tensor tk(k.p, DType::BF16, {kv_rows, tokens});
         Tensor tv(v.p, DType::BF16, {kv_rows, tokens});
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, launch_stream);
+            ops::attn_input_proj(x, qk.weight, gv.weight, tq, tg, tk, tv, options.q4q5_policy,
+                                 workspace, launch_stream);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
         if (options.profile) {
-            profile_public(launch, "q4q5", "a16", profile_cache, flush, stream, options.warmup,
+            profile_public(launch, "q4q5", policy, profile_cache, flush, stream, options.warmup,
                            options.graph);
             continue;
         }
@@ -403,7 +418,11 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
                 continue;
-            append_result(results, "q4q5", "a16", tokens, cache, 0, logical, flops,
+            append_result(results, "q4q5", policy, tokens, cache,
+                          ops::attn_input_proj_workspace_capacity_bytes(
+                              QType::Q4_G64_FP16, QType::Q5_G64_FP16, hidden,
+                              options.q4q5_policy, tokens, tokens),
+                          logical, flops,
                           measure_public(launch, cache, flush, stream, options.warmup,
                                          options.repeat, options.graph));
         }

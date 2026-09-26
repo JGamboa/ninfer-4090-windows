@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/arena.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -16,6 +17,7 @@ enum class Q4LinearSwiGluScheduleId {
     Materialized,
     MmaFoldedPipelinedR64C128,
     MmaFoldedPipelinedR64C128Tail,
+    A8MmaFoldedPipelinedR64C128,
 };
 
 struct Q4LinearSwiGluProblem {
@@ -24,6 +26,7 @@ struct Q4LinearSwiGluProblem {
     std::int32_t k;
     std::int32_t padded_k;
     std::int32_t cols;
+    LinearPolicy policy = LinearPolicy::A16Only;
 };
 
 struct Q4LinearSwiGluPlan {
@@ -38,12 +41,13 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
 
 std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
                                                       std::int32_t output_rows, std::int32_t k,
-                                                      std::int32_t padded_k, std::int32_t min_cols,
-                                                      std::int32_t max_cols);
+                                                      std::int32_t padded_k, LinearPolicy policy,
+                                                      std::int32_t min_cols, std::int32_t max_cols);
 
 void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
-                                   Tensor& out, WorkspaceArena& ws, cudaStream_t stream);
-void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                               cudaStream_t stream);
+                                   Tensor& out, LinearPolicy policy, WorkspaceArena& ws,
+                                   cudaStream_t stream);
+void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                               WorkspaceArena& ws, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

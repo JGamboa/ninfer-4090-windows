@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ops/direct_bf16_weight.h"
+#include "ops/a8_g64_reference.h"
 #include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
@@ -36,9 +37,10 @@ constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
 // Retain the original seven grid points while stabilizing the distribution-level A4 criterion.
 constexpr std::int32_t kA4SampleRows = 31;
 
+template <class Value>
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
-                  std::int32_t output_rows, const std::vector<float>& activation,
+                  std::int32_t output_rows, const std::vector<Value>& activation,
                   std::int32_t hidden, std::int32_t tokens,
                   const ReductionCriterion& criterion = kAttnInputProjA16Tolerance,
                   std::int32_t sample_count           = 7) {
@@ -76,7 +78,8 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
                                                       k = key.tensor(), v = value.tensor();
     const auto capacity =
-        dual ? 0
+        dual ? ops::attn_input_proj_workspace_capacity_bytes(
+                   QType::Q4_G64_FP16, QType::Q5_G64_FP16, hidden, policy, tokens, tokens)
              : ops::attn_input_proj_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, 14336,
                                                              hidden, policy, tokens, tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
@@ -91,7 +94,8 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         {q_weight, policy}, {k_weight, policy}, {g_weight, policy}, {v_weight, policy});
     const auto launch = [&] {
         if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&prepared)) {
-            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, device.stream);
+            ops::attn_input_proj(x, pair->first, pair->second, q, g, k, v, pair->policy,
+                                 workspace, device.stream);
         } else {
             const auto& single = std::get<ops::SingleProjectionWeight>(prepared);
             ops::attn_input_proj(x, single.weight, q, g, k, v, single.policy, workspace,
@@ -124,6 +128,12 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         cuda_synchronize(device.stream);
         const bool a8 =
             policy == ops::LinearPolicy::AllowA8 || policy == ops::LinearPolicy::AllowA4;
+        // The paired Q4/Q5 form quantizes its activation as documented from kA8G64MinTokens on;
+        // the oracle applies that quantization, so the A16 criterion still holds.
+        std::vector<double> oracle_input(activation.begin(), activation.end());
+        if (dual && a8 && tokens >= kA8G64MinTokens) {
+            oracle_input = a8_g64_dequantized(activation_bits, hidden, tokens);
+        }
         const auto criterion     = dual ? kAttnInputProjA16Tolerance
                                    : a8 ? kAttnInputProjA8Tolerance
                                         : kFp8AttnInputProjA16Tolerance;
@@ -131,16 +141,16 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
         const std::string suffix = std::string(dual ? " Q4/Q5" : " FP8") +
                                    (a8 ? " allow-a8" : " a16") + " T=" + std::to_string(tokens) +
                                    " phase=" + std::to_string(phase);
-        failures += verify_output("attn q" + suffix, query, parent.host, 0, qrows, activation,
+        failures += verify_output("attn q" + suffix, query, parent.host, 0, qrows, oracle_input,
                                   hidden, tokens, criterion, sample_count);
-        failures += verify_output("attn k" + suffix, key, parent.host, qrows, kvrows, activation,
+        failures += verify_output("attn k" + suffix, key, parent.host, qrows, kvrows, oracle_input,
                                   hidden, tokens, criterion, sample_count);
         failures += verify_output("attn gate" + suffix, gate, dual ? gate_value->host : parent.host,
-                                  dual ? 0 : 7168, qrows, activation, hidden, tokens, criterion,
+                                  dual ? 0 : 7168, qrows, oracle_input, hidden, tokens, criterion,
                                   sample_count);
         failures += verify_output("attn value" + suffix, value,
                                   dual ? gate_value->host : parent.host, dual ? 6144 : 13312,
-                                  kvrows, activation, hidden, tokens, criterion, sample_count);
+                                  kvrows, oracle_input, hidden, tokens, criterion, sample_count);
         failures += verify_preserved("attn input" + suffix, input, activation_bits);
         failures += scratch.verify_guards(suffix);
         if (workspace.used() != 0 || workspace.peak_used() > capacity) {
@@ -171,6 +181,14 @@ int run_q4_q5() {
     for (int t : {1, 8, 12, 13, 16, 17, 32, 63, 64, 65, 96, 104, 105, 127, 128, 129, 192, 193})
         failures +=
             run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only, true);
+    // AllowA8 on all four inputs: A16 below kA8G64MinTokens, the documented A8 quantization from
+    // it on (one and several 128-token tiles, a partial last tile), eager and captured.
+    for (int t : {1, 16, 128, 129, 130, 256, 300})
+        failures +=
+            run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::AllowA8);
+    for (int t : {128, 129, 300})
+        failures +=
+            run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::AllowA8, true);
     return failures;
 }
 

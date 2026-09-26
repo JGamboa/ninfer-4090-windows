@@ -1,7 +1,9 @@
 #include "core/weight.h"
+#include "core/decode_graph.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
+#include "ops/a8_g64_reference.h"
 #include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
@@ -25,10 +27,11 @@ constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06
 constexpr ReductionCriterion kGdnInputProjA4Tolerance{0.16, 4.0e-3, 0.16};
 constexpr std::int32_t kA8SampleRows = 31;
 
+template <class Value>
 int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t full_rows, std::int32_t output_row_offset,
                         std::int32_t output_rows, const quantized_weight::PackedWeight& weight,
-                        std::int32_t weight_row_offset, const std::vector<float>& activation,
+                        std::int32_t weight_row_offset, const std::vector<Value>& activation,
                         std::int32_t hidden, std::int32_t tokens) {
     const std::vector<double> actual =
         gather_rows(output.values(), full_rows, output_row_offset, output_rows, tokens);
@@ -149,6 +152,73 @@ int run_q4_q5_graph_case(DevicePackedWeight& query_key, DevicePackedWeight& valu
     return failures;
 }
 
+// AllowA8 on the paired parents: A16 below kA8G64MinTokens, the documented A8 quantization
+// from it on, which the oracle applies, so the A16 criterion still holds.
+int run_q4_q5_a8_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
+                      std::int32_t tokens, bool replay) {
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kQkRows    = 4096;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kRows      = kQkRows + kValueRows;
+    constexpr auto kPolicy            = ops::LinearPolicy::AllowA8;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 431U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    const std::vector<double> oracle_input =
+        tokens >= kA8G64MinTokens ? a8_g64_dequantized(activation_bits, kHidden, tokens)
+                                  : std::vector<double>(activation.begin(), activation.end());
+    DeviceBuffer device_activation = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor output   = qkv.tensor();
+    Tensor z_output = z.tensor();
+    const std::size_t capacity = ops::gdn_input_proj_workspace_capacity_bytes(
+        QType::Q4_G64_FP16, QType::Q5_G64_FP16, kHidden, kPolicy, tokens, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+    DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
+    DeviceContext device;
+    const auto launch = [&] {
+        ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, kPolicy,
+                            workspace, device.stream);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    cuda_synchronize();
+    if (replay) {
+        definition.capture(device.stream, launch);
+        graph.instantiate(definition);
+    }
+    qkv.repaint(device.stream);
+    z.repaint(device.stream);
+    if (replay) {
+        graph.launch(device.stream);
+    } else {
+        launch();
+    }
+    cuda_synchronize(device.stream);
+
+    const std::string suffix =
+        std::string(" Q4/Q5 allow-a8") + (replay ? " graph" : "") + " T=" + std::to_string(tokens);
+    int failures = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
+    failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
+    failures += verify_output_range("gdn qk" + suffix, qkv, kRows, 0, kQkRows, query_key.host, 0,
+                                    oracle_input, kHidden, tokens);
+    failures += verify_output_range("gdn value" + suffix, qkv, kRows, kQkRows, kValueRows,
+                                    value_z_weight.host, 0, oracle_input, kHidden, tokens);
+    failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, value_z_weight.host,
+                                    kValueRows, oracle_input, kHidden, tokens);
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += scratch.verify_guards(suffix);
+    if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+        std::cerr << "gdn" << suffix << ": exact workspace query/execution mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
@@ -166,6 +236,12 @@ int run_q4_q5() {
     // One captured replay per route, including a 128-column tail slice (129 = 128 + 1).
     for (const std::int32_t tokens : {7, 8, 9, 12, 13, 16, 17, 33, 65, 129}) {
         failures += run_q4_q5_graph_case(query_key, value_z_weight, tokens);
+    }
+    for (const std::int32_t tokens : {1, 16, 128, 129, 130, 256, 300}) {
+        failures += run_q4_q5_a8_case(query_key, value_z_weight, tokens, false);
+    }
+    for (const std::int32_t tokens : {128, 129, 300}) {
+        failures += run_q4_q5_a8_case(query_key, value_z_weight, tokens, true);
     }
     return failures;
 }

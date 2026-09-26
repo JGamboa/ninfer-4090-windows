@@ -151,9 +151,11 @@ inline std::vector<double> gather_rows(const std::vector<double>& full, std::int
     return gathered;
 }
 
-inline std::vector<double>
+// `activation` is x (float) or its documented A8 quantization q * scale (double).
+template <class Value>
+std::vector<double>
 projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
-                  std::int32_t output_rows, const std::vector<float>& activation,
+                  std::int32_t output_rows, const std::vector<Value>& activation,
                   std::int32_t hidden, std::int32_t tokens, std::int32_t sample_count = 7) {
     std::vector<double> expected;
     const std::vector<std::int32_t> selected = sampled_rows(output_rows, sample_count);
@@ -166,7 +168,7 @@ projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t wei
             decoded[column] = quantized_weight::logical_weight_fp64(
                 weight, weight_row_offset + local_row, column);
         for (std::int32_t token = 0; token < tokens; ++token) {
-            const float* input = activation.data() + static_cast<std::size_t>(token) * hidden;
+            const Value* input = activation.data() + static_cast<std::size_t>(token) * hidden;
             double sum         = 0.0;
             for (std::int32_t column = 0; column < hidden; ++column)
                 sum += decoded[column] * static_cast<double>(input[column]);

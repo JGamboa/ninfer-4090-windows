@@ -784,10 +784,10 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                                    query, key, value, z, stream);
 }
 
-} // namespace
-
-void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+void dispatch_paired(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                     Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena* workspace,
+                     cudaStream_t stream) {
+    validate_policy(policy);
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
@@ -802,7 +802,33 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
 
-    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+    detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, policy, workspace,
+                                     stream);
+}
+
+} // namespace
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    dispatch_paired(x, qk_weight, value_z_weight, qkv, z, LinearPolicy::A16Only, nullptr, stream);
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                    cudaStream_t stream) {
+    dispatch_paired(x, qk_weight, value_z_weight, qkv, z, policy, &workspace, stream);
+}
+
+std::size_t gdn_input_proj_workspace_capacity_bytes(QType qk_qtype, QType value_z_qtype,
+                                                    std::int32_t input_rows, LinearPolicy policy,
+                                                    std::int32_t min_tokens,
+                                                    std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (qk_qtype != QType::Q4_G64_FP16 || value_z_qtype != QType::Q5_G64_FP16 ||
+        input_rows != 5120) {
+        throw std::invalid_argument("gdn_input_proj workspace: unsupported paired profile");
+    }
+    return detail::q4_q5_gdn_input_capacity_workspace_bytes(policy, min_tokens, max_tokens);
 }
 
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,

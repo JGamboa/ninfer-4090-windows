@@ -144,7 +144,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const auto second = single(inputs.last<2>());
     require(first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16,
             "input projection: paired native form requires Q4 and Q5");
-    return PairedProjectionWeights{first.weight, second.weight};
+    return PairedProjectionWeights{first.weight, second.weight, common_policy(inputs)};
 }
 
 } // namespace
@@ -202,7 +202,7 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,
             "GDN control requires BF16 weights");
-    return PairedProjectionWeights{first.weight, second.weight};
+    return PairedProjectionWeights{first.weight, second.weight, common_policy(inputs)};
 }
 
 SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,

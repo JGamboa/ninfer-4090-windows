@@ -3,6 +3,7 @@
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "ninfer/ops/linear_add.h"
+#include "ops/a8_g64_reference.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -139,7 +140,7 @@ std::vector<std::uint16_t> make_residual(std::int32_t n, std::int32_t t, std::ui
 std::vector<double> linear_add_oracle(std::int32_t n, std::int32_t k,
                                       std::span<const std::int32_t> oracle_rows,
                                       std::span<const float> oracle_weight,
-                                      const std::vector<std::uint16_t>& activation,
+                                      const std::vector<double>& activation,
                                       const std::vector<std::uint16_t>& residual,
                                       std::span<const std::int32_t> columns) {
     const std::int32_t oracle_n = static_cast<std::int32_t>(oracle_rows.size());
@@ -151,11 +152,10 @@ std::vector<double> linear_add_oracle(std::int32_t n, std::int32_t k,
             double sum = 0.0;
             const float* weight_row =
                 oracle_weight.data() + static_cast<std::size_t>(oracle_row) * k;
-            const std::uint16_t* activation_column =
+            const double* activation_column =
                 activation.data() + static_cast<std::size_t>(token) * k;
             for (std::int32_t column = 0; column < k; ++column) {
-                sum += static_cast<double>(weight_row[column]) *
-                       static_cast<double>(test::bf16_to_f32(activation_column[column]));
+                sum += static_cast<double>(weight_row[column]) * activation_column[column];
             }
             const std::int32_t physical_row = oracle_rows[static_cast<std::size_t>(oracle_row)];
             // This is the complete fused formula. There is deliberately no private projection
@@ -315,12 +315,36 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     const QType qtype                      = qtype_for(format);
     const HostWeight host_weight           = make_weight(format, shape);
     const std::vector<float> oracle_weight = materialize_weight_rows(host_weight, oracle_rows);
-    const std::vector<std::uint16_t> activation =
-        make_activation(shape.k, maximum_t, shape.seed + 1U);
+    if (shape.a8 && format != WeightFormat::Q5G64F16S) {
+        throw std::invalid_argument("linear_add test: the A8 profile is registered for Q5 only");
+    }
+    std::vector<std::uint16_t> activation = make_activation(shape.k, maximum_t, shape.seed + 1U);
+    if (shape.a8) {
+        // Mixed signs, and one 16x outlier per 64-column group (a power of two, so still exact),
+        // so that the quantization step is coarse against the other values of the group.
+        for (std::size_t index = 0; index < activation.size(); ++index) {
+            if (((index * 2654435761U) >> 7) & 1U) { activation[index] ^= 0x8000U; }
+            if (index % 64 == (index / 64) % 61) {
+                activation[index] = test::f32_to_bf16(16.0F * test::bf16_to_f32(activation[index]));
+            }
+        }
+    }
     const std::vector<std::uint16_t> residual = make_residual(shape.n, maximum_t, shape.seed + 2U);
     const std::vector<std::int32_t> all_columns = all_indices(maximum_t);
-    const std::vector<double> full_reference    = linear_add_oracle(
-        shape.n, shape.k, oracle_rows, oracle_weight, activation, residual, all_columns);
+    std::vector<double> activation_values(activation.size());
+    for (std::size_t index = 0; index < activation.size(); ++index) {
+        activation_values[index] = static_cast<double>(test::bf16_to_f32(activation[index]));
+    }
+    const std::vector<double> full_reference = linear_add_oracle(
+        shape.n, shape.k, oracle_rows, oracle_weight, activation_values, residual, all_columns);
+    const std::vector<double> a8_reference =
+        shape.a8 && maximum_t >= kA8G64MinTokens
+            ? linear_add_oracle(shape.n, shape.k, oracle_rows, oracle_weight,
+                                test::a8_g64_dequantized(activation, shape.k, maximum_t),
+                                residual, all_columns)
+            : std::vector<double>{};
+    const ops::LinearPolicy policy =
+        shape.a8 ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only;
 
     test::GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
@@ -330,7 +354,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     const Weight weight = make_device_weight_view(host_weight, device_weight.data());
 
     const std::size_t workspace_bytes =
-        ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, 1, maximum_t);
+        ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, policy, 1, maximum_t);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures              = 0;
@@ -347,6 +371,11 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
 
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) + "] T=" + std::to_string(t);
+        // A Q5 permission of A8 or more quantizes from kA8G64MinTokens on.
+        const bool permission_quantizes =
+            format == WeightFormat::Q5G64F16S && t >= kA8G64MinTokens;
+        const std::vector<double>& reference =
+            shape.a8 && permission_quantizes ? a8_reference : full_reference;
         const auto verify_result = [&] {
             failures += output.verify_guards(case_label.c_str());
             const std::vector<std::int32_t> columns = all_indices(t);
@@ -356,12 +385,12 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             failures +=
                 compare_output(case_label, actual.selected,
                                std::span<const double>(
-                                   full_reference.data(),
+                                   reference.data(),
                                    checked_elements(static_cast<std::int32_t>(oracle_rows.size()),
                                                     t, "reference")));
         };
         try {
-            ops::linear_add(input, weight, residual_out, workspace, nullptr);
+            ops::linear_add(input, weight, residual_out, policy, workspace, nullptr);
             test::cuda_check(cudaDeviceSynchronize(), "synchronize linear_add");
             verify_result();
             if ((t == 128 && format == WeightFormat::Q5G64F16S) ||
@@ -372,8 +401,12 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 cudaGraphExec_t executable;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
                 CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-                ops::linear_add(input, weight, residual_out, ops::LinearPolicy::AllowA4, workspace,
-                                stream);
+                // An A16 case captures a permission that keeps A16 at this width.
+                ops::linear_add(input, weight, residual_out,
+                                shape.a8                ? policy
+                                : permission_quantizes ? ops::LinearPolicy::A16Only
+                                                       : ops::LinearPolicy::AllowA4,
+                                workspace, stream);
                 CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
                 CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
                 for (int replay = 0; replay < 3; ++replay) {
@@ -406,11 +439,14 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
                 CUDA_CHECK(cudaGraphExecDestroy(executable));
                 CUDA_CHECK(cudaGraphDestroy(graph));
                 CUDA_CHECK(cudaStreamDestroy(stream));
-                output.copy_from_host(residual.data(), output.bytes());
-                ops::linear_add(input, weight, residual_out, ops::LinearPolicy::AllowA8, workspace,
-                                nullptr);
-                test::cuda_check(cudaDeviceSynchronize(), "synchronize permissive A16 linear_add");
-                verify_result();
+                if (!shape.a8 && !permission_quantizes) {
+                    output.copy_from_host(residual.data(), output.bytes());
+                    ops::linear_add(input, weight, residual_out, ops::LinearPolicy::AllowA8,
+                                    workspace, nullptr);
+                    test::cuda_check(cudaDeviceSynchronize(),
+                                     "synchronize permissive A16 linear_add");
+                    verify_result();
+                }
             }
         } catch (const std::exception& error) {
             std::cerr << case_label << ": unexpected exception: " << error.what() << '\n';
@@ -418,7 +454,7 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
             continue;
         }
         const std::size_t exact_workspace =
-            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, t, t);
+            ops::linear_add_workspace_capacity_bytes(qtype, shape.n, shape.k, policy, t, t);
         if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
             std::cerr << case_label << ": exact workspace query/execution high-water mismatch\n";
             ++failures;

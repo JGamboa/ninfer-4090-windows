@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/common/rowsplit_tall_a8_mma.cuh"
 #include "ops/common/rowsplit_tall_mma.cuh"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q5/q5_rowsplit_gemm_mma.cuh"
@@ -89,20 +90,49 @@ void q5_linear_add_mma_r64_c32_s4_launch(const Tensor& x, const Weight& w, Tenso
     launch_route<MmaR64C32S4Schedule>(x, w, residual_out, stream);
 }
 
-void q5_linear_add_mma_pipelined_r128_c64_launch(const Tensor& x, const Weight& w,
-                                                 Tensor& residual_out, cudaStream_t stream) {
+namespace {
+
+rowsplit_tall::ResidualQ5Problem residual_problem(const Weight& w, Tensor& residual_out,
+                                                  std::int32_t k) {
     const std::int32_t rows = residual_out.ne[0];
     if (w.qtype != QType::Q5_G64_FP16 || rows != w.n || rows % rowsplit_tall::kRows != 0 ||
-        w.padded_shape[1] != w.k || w.k != x.ne[0] || w.k % rowsplit_tall::kStepK != 0) {
+        w.padded_shape[1] != w.k || w.k != k || w.k % rowsplit_tall::kStepK != 0) {
         throw std::invalid_argument("q5 linear_add: pipelined GEMM shape is unsupported");
     }
-    const rowsplit_tall::ResidualQ5Problem problem{
-        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(residual_out.data),
-        rows};
-    rowsplit_tall::launch<kTallTokens>(problem, rows / rowsplit_tall::kRows,
+    return {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
+            static_cast<const std::uint8_t*>(w.scales),
+            static_cast<__nv_bfloat16*>(residual_out.data), rows};
+}
+
+} // namespace
+
+void q5_linear_add_mma_pipelined_r128_c64_launch(const Tensor& x, const Weight& w,
+                                                 Tensor& residual_out, cudaStream_t stream) {
+    const auto problem = residual_problem(w, residual_out, x.ne[0]);
+    rowsplit_tall::launch<kTallTokens>(problem, problem.rows / rowsplit_tall::kRows,
                                        static_cast<const __nv_bfloat16*>(x.data), x.ne[0], x.ne[1],
                                        stream);
+}
+
+void q5_linear_add_a8_mma_pipelined_r128_c64_launch(const A8G64Activation& x, const Weight& w,
+                                                    Tensor& residual_out, cudaStream_t stream) {
+    const auto problem            = residual_problem(w, residual_out, x.q.ne[0]);
+    const std::int32_t row_blocks = problem.rows / rowsplit_tall::kRows;
+    const std::int32_t tokens     = x.q.ne[1];
+    // The 5120-row weights have only 40 row blocks, so the token tile sets the number of
+    // one-per-SM waves. A 128-token CTA costs ~1.55x a 64-token one (measured at k = 17408 and
+    // 6144, T = 256..4096): take it when its waves cost less, e.g. from T = 640 on and at 256.
+    const auto waves = [&](std::int32_t tile) {
+        const std::int64_t ctas = static_cast<std::int64_t>(row_blocks) * div_up(tokens, tile);
+        return (ctas + device_sm_count() - 1) / device_sm_count();
+    };
+    const auto* qx      = static_cast<const std::int8_t*>(x.q.data);
+    const auto* x_scale = static_cast<const float*>(x.scale.data);
+    if (static_cast<double>(waves(128)) * 1.55 < static_cast<double>(waves(64))) {
+        rowsplit_tall_a8::launch<128>(problem, row_blocks, qx, x_scale, x.q.ne[0], tokens, stream);
+    } else {
+        rowsplit_tall_a8::launch<64>(problem, row_blocks, qx, x_scale, x.q.ne[0], tokens, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail

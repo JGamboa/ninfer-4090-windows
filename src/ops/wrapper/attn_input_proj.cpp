@@ -187,6 +187,27 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
+void dispatch_paired(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                     Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
+                     cudaStream_t stream) {
+    validate_policy(policy);
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t cols        = x.ne[1];
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
+    require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
+
+    detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                      policy, workspace, stream);
+}
+
 } // namespace
 
 std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -243,20 +264,28 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
-    const std::int32_t cols        = x.ne[1];
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(q, kQRows, cols, "q");
-    require_matrix(gate, kQRows, cols, "gate");
-    require_matrix(k, kKvRows, cols, "k");
-    require_matrix(v, kKvRows, cols, "v");
-    require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
-    require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
+    dispatch_paired(x, query_key_weight, gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,
+                    nullptr, stream);
+}
 
-    detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                      stream);
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    dispatch_paired(x, query_key_weight, gate_value_weight, q, gate, k, v, policy, &workspace,
+                    stream);
+}
+
+std::size_t attn_input_proj_workspace_capacity_bytes(QType query_key_qtype,
+                                                     QType gate_value_qtype,
+                                                     std::int32_t input_rows, LinearPolicy policy,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (query_key_qtype != QType::Q4_G64_FP16 || gate_value_qtype != QType::Q5_G64_FP16 ||
+        input_rows != 5120) {
+        throw std::invalid_argument("attn_input_proj workspace: unsupported paired profile");
+    }
+    return detail::q4_q5_attn_input_capacity_workspace_bytes(policy, min_tokens, max_tokens);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

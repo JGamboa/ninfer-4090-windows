@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/a8_g64_reference.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -34,6 +35,9 @@ namespace {
 constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute) {
     switch (activation_compute) {
     case ActivationCompute::A16:
+    // The oracle applies the documented quantization, so only FP32 accumulation and the BF16
+    // output rounding remain, as for A16.
+    case ActivationCompute::A8G64:
         return {3.3e-3, 5.0e-3, 6.3e-3};
     case ActivationCompute::A8:
         // Both independently A8-quantized projections feed the nonlinear product, so this profile
@@ -66,7 +70,36 @@ std::uint64_t mix64(std::uint64_t value) {
     return value ^ (value >> 31);
 }
 
+// Every token dense, so the A8 quantization acts on every group: magnitudes vary by token and
+// group, some groups are all zero and each token has one large outlier in its group.
+std::vector<std::uint16_t> make_dense_activation(const Profile& profile, std::int32_t tokens) {
+    std::vector<std::uint16_t> activation(
+        checked_elements(profile.input_rows, tokens, "activation size"), 0);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const std::int32_t outlier =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(token) * 977 + 13) %
+                                      profile.input_rows);
+        for (std::int32_t column = 0; column < profile.input_rows; ++column) {
+            const std::int32_t group = column / 64;
+            if ((token * 5 + group * 3) % 29 == 0) { continue; }
+            const std::uint64_t mixed =
+                mix64((static_cast<std::uint64_t>(profile.seed) << 40) ^
+                      (static_cast<std::uint64_t>(token) << 20) ^ static_cast<std::uint32_t>(column));
+            const int numerator = static_cast<int>((mixed >> 40) % 255U) - 127;
+            const float magnitude =
+                1.0e-3F * static_cast<float>(1 + (token * 7 + group * 11) % 9) /
+                (column == outlier ? 0.025F : 1.0F);
+            activation[static_cast<std::size_t>(token) * profile.input_rows + column] =
+                test::f32_to_bf16(static_cast<float>(numerator) / 127.0F * magnitude);
+        }
+    }
+    return activation;
+}
+
 std::vector<std::uint16_t> make_activation(const Profile& profile, std::int32_t tokens) {
+    if (profile.activation_compute == ActivationCompute::A8G64) {
+        return make_dense_activation(profile, tokens);
+    }
     std::vector<std::uint16_t> activation(
         checked_elements(profile.input_rows, tokens, "activation size"), 0);
 
@@ -113,19 +146,28 @@ struct ActiveValue {
 };
 
 std::vector<std::vector<ActiveValue>>
-index_nonzero_activations(const std::vector<std::uint16_t>& activation, std::int32_t input_rows,
+index_nonzero_activations(const std::vector<double>& activation, std::int32_t input_rows,
                           std::int32_t tokens) {
     std::vector<std::vector<ActiveValue>> by_column(static_cast<std::size_t>(input_rows));
     for (std::int32_t token = 0; token < tokens; ++token) {
         for (std::int32_t column = 0; column < input_rows; ++column) {
-            const std::uint16_t bits =
-                activation[static_cast<std::size_t>(token) * input_rows + column];
-            if ((bits & 0x7fffU) == 0U) { continue; }
-            by_column[static_cast<std::size_t>(column)].push_back(
-                {token, static_cast<double>(test::bf16_to_f32(bits))});
+            const double value = activation[static_cast<std::size_t>(token) * input_rows + column];
+            if (value == 0.0) { continue; }
+            by_column[static_cast<std::size_t>(column)].push_back({token, value});
         }
     }
     return by_column;
+}
+
+// The activation the Op multiplies: x itself, or its documented A8 quantization.
+std::vector<double> oracle_activation(const std::vector<std::uint16_t>& activation,
+                                      std::int32_t input_rows, std::int32_t tokens, bool a8) {
+    if (a8) { return test::a8_g64_dequantized(activation, input_rows, tokens); }
+    std::vector<double> values(activation.size());
+    for (std::size_t index = 0; index < activation.size(); ++index) {
+        values[index] = static_cast<double>(test::bf16_to_f32(activation[index]));
+    }
+    return values;
 }
 
 double silu_fp64(double value) {
@@ -136,7 +178,7 @@ double silu_fp64(double value) {
 
 std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                                               const quantized_weight::PackedWeight& weight,
-                                              const std::vector<std::uint16_t>& activation,
+                                              const std::vector<double>& activation,
                                               std::int32_t tokens) {
     const auto active_by_column = index_nonzero_activations(activation, profile.input_rows, tokens);
     std::vector<double> output(checked_elements(profile.output_rows, tokens, "oracle output size"));
@@ -238,7 +280,9 @@ void validate_profile(const Profile& profile) {
          profile.activation_compute != ActivationCompute::A4) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8) ||
-        (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {
+        (q4 && profile.activation_compute != ActivationCompute::A16 &&
+         profile.activation_compute != ActivationCompute::A8G64) ||
+        (!nvfp4 && !fp8 && !q4 && profile.activation_compute != ActivationCompute::A16)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
 }
@@ -275,16 +319,28 @@ int run_profile(std::string_view label, const Profile& profile,
     quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
         profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
     const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
-    const std::vector<double> reference =
-        linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens);
+    const bool a8g64  = profile.activation_compute == ActivationCompute::A8G64;
+    const auto oracle = [&](const std::vector<std::uint16_t>& bits, bool quantized) {
+        return linear_swiglu_oracle_fp64(
+            profile, host_weight,
+            oracle_activation(bits, profile.input_rows, maximum_tokens, quantized),
+            maximum_tokens);
+    };
+    const bool any_a16 = !a8g64 || token_cases.front() < kA8G64MinTokens;
+    const bool any_a8  = a8g64 && maximum_tokens >= kA8G64MinTokens;
+    std::vector<double> reference;
+    std::vector<double> reference_a8;
+    if (any_a16) { reference = oracle(host_activation, false); }
+    if (any_a8) { reference_a8 = oracle(host_activation, true); }
     std::vector<std::uint16_t> negative_activation;
     std::vector<double> negative_reference;
+    std::vector<double> negative_reference_a8;
     std::optional<DeviceContext> graph_context;
     if (!graph_cases.empty()) {
         negative_activation = host_activation;
         for (auto& bits : negative_activation) bits ^= 0x8000;
-        negative_reference =
-            linear_swiglu_oracle_fp64(profile, host_weight, negative_activation, maximum_tokens);
+        if (any_a16) { negative_reference = oracle(negative_activation, false); }
+        if (any_a8) { negative_reference_a8 = oracle(negative_activation, true); }
         graph_context.emplace();
     }
 
@@ -299,8 +355,9 @@ int run_profile(std::string_view label, const Profile& profile,
     const ops::LinearPolicy policy =
         profile.activation_compute == ActivationCompute::A4
             ? ops::LinearPolicy::AllowA4
-            : (profile.activation_compute == ActivationCompute::A8 ? ops::LinearPolicy::AllowA8
-                                                                   : ops::LinearPolicy::A16Only);
+            : (profile.activation_compute == ActivationCompute::A8 || a8g64
+                   ? ops::LinearPolicy::AllowA8
+                   : ops::LinearPolicy::A16Only);
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
@@ -329,7 +386,9 @@ int run_profile(std::string_view label, const Profile& profile,
             }
             for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
                 const auto& input_bits = phase ? negative_activation : host_activation;
-                const auto& expected   = phase ? negative_reference : reference;
+                const bool quantized   = a8g64 && tokens >= kA8G64MinTokens;
+                const auto& expected   = quantized ? (phase ? negative_reference_a8 : reference_a8)
+                                                   : (phase ? negative_reference : reference);
                 if (replay)
                     device_activation.copy_from_host(input_bits.data(),
                                                      input_bits.size() * sizeof(std::uint16_t));

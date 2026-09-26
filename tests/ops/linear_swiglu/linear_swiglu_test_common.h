@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/tensor.h"
+#include "ops/a8_g64_reference.h"
 
 #include <cstdint>
 #include <span>
@@ -13,7 +14,13 @@ enum class ActivationCompute : std::uint8_t {
     A16,
     A8,
     A4,
+    // AllowA8 on a Q4/Q5 RowSplit weight: from kA8G64MinTokens on, the documented per-token
+    // 64-group int8 activation (tests/ops/a8_g64_reference.h), which the oracle models; below
+    // it, A16.
+    A8G64,
 };
+
+using test::kA8G64MinTokens;
 
 struct Profile {
     QType qtype;

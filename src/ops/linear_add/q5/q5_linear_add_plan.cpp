@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 
+#include "core/layout.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include <array>
@@ -74,6 +75,20 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
 static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
+// With an A8 permission, prefill widths from here on run the int8 GEMM; narrower extents
+// (decode and speculative verification) keep the A16 routes.
+constexpr std::int32_t kA8MinCols = 129;
+
+bool uses_a8(const Q5LinearAddProblem& problem) noexcept {
+    return allows_a8(problem.policy) && problem.cols >= kA8MinCols;
+}
+
+std::size_t a8_workspace_bytes(std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_a8_g64_activation(layout, k, cols);
+    return layout.peak_bytes(1);
+}
+
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
     for (const SupportSpec& support : kSupports) {
         if (problem.rows == support.rows && problem.k == support.k &&
@@ -110,9 +125,7 @@ void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& resi
 
     const Tensor x_tail = x.slice(1, wide, tail);
     Tensor out_tail     = residual_out.slice(1, wide, tail);
-    q5_linear_add_execute_plan(
-        q5_linear_add_resolve_plan({residual_out.ne[0], x.ne[0], w.padded_shape[1], x_tail.ne[1]}),
-        x_tail, w, out_tail, ws, stream);
+    q5_linear_add_dispatch(x_tail, w, out_tail, LinearPolicy::A16Only, ws, stream);
 }
 
 } // namespace
@@ -135,17 +148,29 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.pipelined.r128.c64.residual";
     case Q5LinearAddScheduleId::MmaResidualPipelinedR128C64Tail:
         return "linear_add.q5.mma.pipelined.r128.c64.residual.narrow_tail";
+    case Q5LinearAddScheduleId::A8MmaResidualPipelinedR128C64:
+        return "linear_add.q5.a8.mma.pipelined.r128.c64.residual";
     }
     return "linear_add.q5.unknown";
 }
 
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    switch (problem.policy) {
+    case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8:
+    case LinearPolicy::AllowA4:
+        return supported_shape(problem) && problem.cols >= 1;
+    }
+    return false;
 }
 
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
     if (!q5_linear_add_admits(problem)) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
+    }
+    if (uses_a8(problem)) {
+        return {Q5LinearAddScheduleId::A8MmaResidualPipelinedR128C64,
+                a8_workspace_bytes(problem.k, problem.cols)};
     }
 
     const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
@@ -158,26 +183,25 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
-                                                   std::int32_t padded_k, std::int32_t min_cols,
-                                                   std::int32_t max_cols) {
+                                                   std::int32_t padded_k, LinearPolicy policy,
+                                                   std::int32_t min_cols, std::int32_t max_cols) {
     if (min_cols <= 0 || max_cols < min_cols) {
         throw std::invalid_argument("q5 linear_add: invalid column interval");
     }
-    (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols});
-    (void)q5_linear_add_resolve_plan({rows, k, padded_k, max_cols});
-
-    return 0;
+    (void)q5_linear_add_resolve_plan({rows, k, padded_k, min_cols, policy});
+    // Only the A8 route has scratch, and it grows with the width.
+    return q5_linear_add_resolve_plan({rows, k, padded_k, max_cols, policy}).workspace_bytes;
 }
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
-    const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+                                Tensor& residual_out, LinearPolicy policy, WorkspaceArena& ws,
+                                cudaStream_t stream) {
+    const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1],
+                                     policy};
     const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
-    (void)ws;
-
     switch (plan.schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
@@ -203,15 +227,23 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::MmaResidualPipelinedR128C64Tail:
         launch_wide_with_narrow_tail(x, w, residual_out, ws, stream);
         return;
+    case Q5LinearAddScheduleId::A8MmaResidualPipelinedR128C64: {
+        auto scratch_scope        = ws.scope();
+        A8G64Activation quantized = allocate_a8_g64_activation(ws, problem.k, problem.cols);
+        a8_g64_quantize(x, quantized, stream);
+        q5_linear_add_a8_mma_pipelined_r128_c64_launch(quantized, w, residual_out, stream);
+        return;
+    }
     }
     throw std::logic_error("q5 linear_add: unknown schedule");
 }
 
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream) {
-    const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+                            LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
+    const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1],
+                                     policy};
     const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem);
-    q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream);
+    q5_linear_add_execute_plan(plan, x, w, residual_out, policy, ws, stream);
 }
 
 } // namespace ninfer::ops::detail

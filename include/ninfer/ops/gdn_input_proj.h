@@ -43,6 +43,19 @@ namespace ninfer::ops {
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream);
 
+// The paired Q4/Q5 form under the pair's common activation permission. With AllowA8, widths of
+// at least 129 columns quantize x per token and 64-column group to int8 (see
+// docs/maintainer/op-development.md, section 6.4) and take their
+// scratch from `workspace`; narrower widths are the A16 form.
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                    cudaStream_t stream);
+
+[[nodiscard]] std::size_t
+gdn_input_proj_workspace_capacity_bytes(QType qk_qtype, QType value_z_qtype,
+                                        std::int32_t input_rows, LinearPolicy policy,
+                                        std::int32_t min_tokens, std::int32_t max_tokens);
+
 /**
  * Single-parent GDN projection. Registered parent forms are:
  *

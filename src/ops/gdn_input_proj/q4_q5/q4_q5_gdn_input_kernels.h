@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/tensor.h"
+#include "ops/common/rowsplit_a8_quantize.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include <cuda_runtime.h>
@@ -12,6 +13,10 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream);
 
+// The pipelined grouped tile over an A8 activation (quantized x of the same K and T).
+void q4_q5_gdn_input_a8_grouped_mma_launch(const A8G64Activation& x, const Weight& qk_weight,
+                                           const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                                           cudaStream_t stream);
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                                         Q4Q5GdnInputScheduleId schedule, cudaStream_t stream);

@@ -32,6 +32,10 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
+// With an A8 permission, prefill widths from here on run the int8 GEMM; narrower extents
+// (decode and speculative verification) keep the A16 routes below.
+constexpr std::int32_t kA8MinCols = 129;
+
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
@@ -74,6 +78,16 @@ std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
     return layout.peak_bytes(1);
 }
 
+std::size_t a8_workspace_bytes(std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_a8_g64_activation(layout, k, cols);
+    return layout.peak_bytes(1);
+}
+
+bool uses_a8(const Q4LinearSwiGluProblem& problem) noexcept {
+    return allows_a8(problem.policy) && problem.cols >= kA8MinCols;
+}
+
 } // namespace
 
 const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept {
@@ -88,18 +102,30 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.q4.mma.folded_pipelined.r64.c128";
     case Q4LinearSwiGluScheduleId::MmaFoldedPipelinedR64C128Tail:
         return "linear_swiglu.q4.mma.folded_pipelined.r64.c128.narrow_tail";
+    case Q4LinearSwiGluScheduleId::A8MmaFoldedPipelinedR64C128:
+        return "linear_swiglu.q4.a8.mma.folded_pipelined.r64.c128";
     }
     return "linear_swiglu.q4.unknown";
 }
 
 bool q4_linear_swiglu_admits(const Q4LinearSwiGluProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    switch (problem.policy) {
+    case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8:
+    case LinearPolicy::AllowA4:
+        return supported_shape(problem) && problem.cols >= 1;
+    }
+    return false;
 }
 
 Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& problem) {
     if (!q4_linear_swiglu_admits(problem)) {
         throw std::invalid_argument(
             "q4 linear_swiglu: exact problem or column count is not admitted");
+    }
+    if (uses_a8(problem)) {
+        return {Q4LinearSwiGluScheduleId::A8MmaFoldedPipelinedR64C128,
+                a8_workspace_bytes(problem.k, problem.cols)};
     }
 
     for (const RouteSpec& route : kRoutes) {
@@ -117,6 +143,8 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
         case Q4LinearSwiGluScheduleId::Materialized:
             plan.workspace_bytes = materialized_workspace_bytes(problem.gate_up_rows, problem.cols);
             return plan;
+        case Q4LinearSwiGluScheduleId::A8MmaFoldedPipelinedR64C128:
+            break;
         }
     }
     throw std::logic_error("q4 linear_swiglu: admitted problem has no covering route");
@@ -124,28 +152,30 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
 
 std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
                                                       std::int32_t output_rows, std::int32_t k,
-                                                      std::int32_t padded_k, std::int32_t min_cols,
-                                                      std::int32_t max_cols) {
+                                                      std::int32_t padded_k, LinearPolicy policy,
+                                                      std::int32_t min_cols, std::int32_t max_cols) {
     if (min_cols <= 0 || max_cols < min_cols) {
         throw std::invalid_argument("q4 linear_swiglu: invalid column interval");
     }
-    (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, min_cols});
-    (void)q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, max_cols});
-
-    std::size_t maximum = 0;
+    const auto plan = [&](std::int32_t cols) {
+        return q4_linear_swiglu_resolve_plan({gate_up_rows, output_rows, k, padded_k, cols, policy});
+    };
+    (void)plan(min_cols);
+    // The A8 extent grows with the width, so its maximum is at max_cols.
+    std::size_t maximum = plan(max_cols).workspace_bytes;
     for (const RouteSpec& route : kRoutes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(maximum, q4_linear_swiglu_resolve_plan(
-                                        {gate_up_rows, output_rows, k, padded_k, endpoint})
-                                                            .workspace_bytes);
+        maximum                     = std::max(maximum, plan(endpoint).workspace_bytes);
     }
     return maximum;
 }
 
 void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,
-                                   Tensor& out, WorkspaceArena& ws, cudaStream_t stream) {
-    const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+                                   Tensor& out, LinearPolicy policy, WorkspaceArena& ws,
+                                   cudaStream_t stream) {
+    const Q4LinearSwiGluProblem problem{w.n,     out.ne[0], x.ne[0], w.padded_shape[1],
+                                        x.ne[1], policy};
     const Q4LinearSwiGluPlan resolved = q4_linear_swiglu_resolve_plan(problem);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q4 linear_swiglu: plan does not match the exact problem");
@@ -172,15 +202,23 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
     case Q4LinearSwiGluScheduleId::MmaFoldedPipelinedR64C128Tail:
         q4_linear_swiglu_mma_folded_pipelined_r64_c128_tail_launch(x, w, out, stream);
         return;
+    case Q4LinearSwiGluScheduleId::A8MmaFoldedPipelinedR64C128: {
+        auto scratch_scope        = ws.scope();
+        A8G64Activation quantized = allocate_a8_g64_activation(ws, problem.k, problem.cols);
+        a8_g64_quantize(x, quantized, stream);
+        q4_linear_swiglu_a8_mma_folded_pipelined_r64_c128_launch(quantized, w, out, stream);
+        return;
+    }
     }
     throw std::logic_error("q4 linear_swiglu: unknown schedule");
 }
 
-void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                               cudaStream_t stream) {
-    const Q4LinearSwiGluProblem problem{w.n, out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
+void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                               WorkspaceArena& ws, cudaStream_t stream) {
+    const Q4LinearSwiGluProblem problem{w.n,     out.ne[0], x.ne[0], w.padded_shape[1],
+                                        x.ne[1], policy};
     const Q4LinearSwiGluPlan plan = q4_linear_swiglu_resolve_plan(problem);
-    q4_linear_swiglu_execute_plan(plan, x, w, out, ws, stream);
+    q4_linear_swiglu_execute_plan(plan, x, w, out, policy, ws, stream);
 }
 
 } // namespace ninfer::ops::detail

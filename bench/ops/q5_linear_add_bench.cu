@@ -45,6 +45,7 @@ struct Options {
     int repeat                = kDefaultRepeat;
     bool graph                = false;
     bool profile              = false;
+    ops::LinearPolicy policy  = ops::LinearPolicy::A16Only;
     std::uint64_t flush_bytes = kDefaultFlushMiB << 20;
     std::string csv_out;
 };
@@ -76,6 +77,7 @@ void usage(const char* argv0) {
                 "  --repeat N         Measured samples per point (default %d).\n"
                 "  --execution MODE   eager (default) or graph; time one complete public Op.\n"
                 "  --flush-mib N      L2 eviction buffer size (default %zu MiB).\n"
+                "  --policy a16|a8    Weight permission; a8 admits the A8 prefill route.\n"
                 "  --csv-out PATH     Write all measurement rows as CSV.\n"
                 "  --profile          Report the public shape and workspace query for one T.\n",
                 argv0, kDefaultWarmup, kDefaultRepeat, kDefaultFlushMiB);
@@ -110,6 +112,12 @@ Options parse_options(int argc, char** argv) {
             options.flush_bytes =
                 static_cast<std::uint64_t>(std::stoll(std::string(next("--flush-mib value"))))
                 << 20;
+        } else if (argument == "--policy") {
+            const std::string mode(next("--policy value"));
+            if (mode != "a16" && mode != "a8") {
+                throw std::invalid_argument("--policy must be a16 or a8");
+            }
+            options.policy = mode == "a8" ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only;
         } else if (argument == "--csv-out") {
             options.csv_out = std::string(next("--csv-out value"));
         } else if (argument == "--profile") {
@@ -173,7 +181,7 @@ int main(int argc, char** argv) {
             QType::Q5_G64_FP16, kRows, options.hidden, options.hidden, {0x31, 0xa5, 0x3c00});
 
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::Q5_G64_FP16, kRows, options.hidden, min_t, max_t);
+            QType::Q5_G64_FP16, kRows, options.hidden, options.policy, min_t, max_t);
         // The A16 routes report a zero-capacity profile, and the arena type rejects a zero-byte
         // allocation, so the owning arena is non-empty here. Every row still reports how many of
         // those bytes the public Op actually consumes.
@@ -184,13 +192,13 @@ int main(int argc, char** argv) {
             Tensor x(input.p, DType::BF16, {options.hidden, tokens});
             Tensor out(residual.p, DType::BF16, {kRows, tokens});
             workspace.reset();
-            ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear_add(x, packed.weight, out, options.policy, workspace, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::printf("profile op=linear_add qtype=q5_g64_fp16 rows=%d k=%d T=%d "
                         "workspace_sweep=%zu workspace_exact=%zu workspace_used=%zu\n",
                         kRows, options.hidden, tokens, workspace_capacity,
                         ops::linear_add_workspace_capacity_bytes(
-                            QType::Q5_G64_FP16, kRows, options.hidden, ops::LinearPolicy::A16Only,
+                            QType::Q5_G64_FP16, kRows, options.hidden, options.policy,
                             tokens, tokens),
                         workspace.used());
             CUDA_CHECK(cudaStreamDestroy(stream));
@@ -215,7 +223,7 @@ int main(int argc, char** argv) {
                                                          cudaMemcpyDeviceToDevice, prepare_stream));
             };
             const auto body = [&](cudaStream_t launch_stream) {
-                ops::linear_add(x, packed.weight, out, ops::LinearPolicy::A16Only, workspace,
+                ops::linear_add(x, packed.weight, out, options.policy, workspace,
                                 launch_stream);
             };
 
@@ -247,7 +255,7 @@ int main(int argc, char** argv) {
             row.projection_flops      = 2.0 * static_cast<double>(kRows) * options.hidden * tokens;
             row.workspace_sweep_bytes = workspace_capacity;
             row.workspace_exact_bytes = ops::linear_add_workspace_capacity_bytes(
-                QType::Q5_G64_FP16, kRows, options.hidden, ops::LinearPolicy::A16Only, tokens,
+                QType::Q5_G64_FP16, kRows, options.hidden, options.policy, tokens,
                 tokens);
             row.workspace_used_bytes = workspace_used;
             const double seconds     = timing.median_us * 1.0e-6;

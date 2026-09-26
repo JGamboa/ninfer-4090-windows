@@ -19,3 +19,7 @@ ninfer_add_op_test(ninfer_linear_swiglu_nvfp4_test
 ninfer_add_op_test(ninfer_linear_swiglu_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8.cpp"
   LIBRARIES ninfer_linear_swiglu_test_support)
+
+ninfer_add_op_test(ninfer_linear_swiglu_q4_a8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a8.cpp"
+  LIBRARIES ninfer_linear_swiglu_test_support)

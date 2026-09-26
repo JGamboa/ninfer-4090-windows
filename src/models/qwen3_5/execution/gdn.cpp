@@ -18,7 +18,9 @@ std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std:
         return ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, single->policy,
                                                             first, last);
     }
-    return 0;
+    const auto& pair = std::get<ops::PairedProjectionWeights>(parameters.projection);
+    return ops::gdn_input_proj_workspace_capacity_bytes(pair.first.qtype, pair.second.qtype,
+                                                        pair.first.k, pair.policy, first, last);
 }
 
 std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
@@ -61,7 +63,8 @@ std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const Gd
 void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tensor& qkv, Tensor& z,
                     WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, stream);
+        ops::gdn_input_proj(hidden, pair->first, pair->second, qkv, z, pair->policy, workspace,
+                            stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj(hidden, single.weight, qkv, z, single.policy, workspace, stream);

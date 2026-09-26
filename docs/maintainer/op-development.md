@@ -443,6 +443,25 @@ Different production routes use different criteria only when their arithmetic or
 profiles differ materially. Widening a criterion requires a numerical reason and requalification
 of its complete affected domain; one failing implementation is not sufficient justification.
 
+### 6.4 Documented activation quantization: Q4/Q5 A8
+
+The Q4/Q5 RowSplit prefill GEMMs (`linear_swiglu` Q4, `linear_add` Q5, the paired Q4/Q5
+`gdn_input_proj` and `attn_input_proj`) have an A8 profile whose activation quantization is part of
+the Op contract rather than a private choice. When every use of the weight grants `AllowA8` and the
+width is at least 129 columns, the Op computes, for each token and 64-column group of `x` (aligned
+with the weights' 64-value groups):
+
+- `amax = max |x|`, `scale = amax / 127`, `q = rint(x * (127 / amax))` clamped to `[-127, 127]`,
+  in IEEE FP32 with round-to-nearest-even; an all-zero group has scale 0 and codes 0;
+- the output from `sum_g (w_scale_g * scale_g) * sum(c * q)`, the weight codes `c` taken exactly.
+
+Narrower widths (decode, MTP and DFlash2 verification, batched decode) keep the A16 routes, and
+`A16Only` weights never quantize. The oracle of this profile applies exactly that quantization to
+the represented activation (`tests/ops/a8_g64_reference.h`) and multiplies it with the independently
+decoded weights in FP64, so the profile keeps its family's A16 criterion: only FP32 accumulation and
+the output rounding remain. Its suites cover both sides of the 129-column boundary, one and several
+token tiles, a partial last tile and captured replays.
+
 ## 7. Performance evidence
 
 An Op microbenchmark measures the public semantic operation at an exact shape, format, layout,

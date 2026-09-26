@@ -29,6 +29,9 @@ struct ShapeCase {
     // tail that is resolved through the same route table: the harness then probes every route
     // start again one whole wave later, which is where the tail lands on it.
     std::int32_t composite_offset = 0;
+    // Q5 only: every call grants AllowA8, and the oracle applies the documented A8 activation
+    // quantization from kA8G64MinTokens on (tests/ops/a8_g64_reference.h).
+    bool a8 = false;
 };
 
 bool cuda_available();

@@ -5,6 +5,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/common/rowsplit_tall_a8_mma.cuh"
 #include "ops/common/rowsplit_tall_mma.cuh"
 #include "ops/common/token_slices.h"
 
@@ -53,26 +54,36 @@ void launch_route(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     });
 }
 
-void launch_tall(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+rowsplit_tall::SwiGluQ4Problem folded_problem(const Weight& weight, Tensor& out, std::int32_t k) {
     const std::int32_t intermediate = out.ne[0];
-    const std::int32_t k            = x.ne[0];
     if (intermediate % 64 != 0 || k % 64 != 0 || weight.padded_shape[1] != k) {
         throw std::invalid_argument("q4 linear_swiglu: pipelined GEMM shape is unsupported");
     }
-    const rowsplit_tall::SwiGluQ4Problem problem{
-        static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
-        intermediate};
-    rowsplit_tall::launch<kTallTokens>(problem, intermediate / 64,
-                                       static_cast<const __nv_bfloat16*>(x.data), k, x.ne[1],
-                                       stream);
+    return {static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
+            intermediate};
 }
 
 } // namespace
 
+void q4_linear_swiglu_a8_mma_folded_pipelined_r64_c128_launch(const A8G64Activation& x,
+                                                              const Weight& weight, Tensor& out,
+                                                              cudaStream_t stream) {
+    const std::int32_t k = x.q.ne[0];
+    const auto problem   = folded_problem(weight, out, k);
+    rowsplit_tall_a8::launch<kTallTokens>(problem, problem.intermediate / 64,
+                                          static_cast<const std::int8_t*>(x.q.data),
+                                          static_cast<const float*>(x.scale.data), k, x.q.ne[1],
+                                          stream);
+}
+
 void q4_linear_swiglu_mma_folded_pipelined_r64_c128_launch(const Tensor& x, const Weight& weight,
                                                            Tensor& out, cudaStream_t stream) {
-    launch_tall(x, weight, out, stream);
+    const std::int32_t k = x.ne[0];
+    const auto problem   = folded_problem(weight, out, k);
+    rowsplit_tall::launch<kTallTokens>(problem, problem.intermediate / 64,
+                                       static_cast<const __nv_bfloat16*>(x.data), k, x.ne[1],
+                                       stream);
 }
 
 void q4_linear_swiglu_mma_folded_pipelined_r64_c128_tail_launch(const Tensor& x,

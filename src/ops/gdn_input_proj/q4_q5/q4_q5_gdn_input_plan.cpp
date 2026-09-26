@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
+#include "core/layout.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include <array>
@@ -43,6 +44,16 @@ constexpr bool catalog_is_closed() noexcept {
 
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
 
+// With an A8 permission, prefill widths from here on run the int8 GEMM; narrower extents
+// (decode and speculative verification) keep the A16 routes.
+constexpr std::int32_t kA8MinCols = 129;
+
+std::size_t a8_workspace_bytes(std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_a8_g64_activation(layout, k, cols);
+    return layout.peak_bytes(1);
+}
+
 bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
     return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
            problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
@@ -60,6 +71,8 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.r32.c64.s4";
     case Q4Q5GdnInputScheduleId::GroupedMixedPipelinedR128C128:
         return "gdn_input_proj.q4_q5.grouped_mixed.mma.pipelined.r128.c128";
+    case Q4Q5GdnInputScheduleId::A8GroupedMixedPipelinedR128C128:
+        return "gdn_input_proj.q4_q5.a8.grouped_mixed.mma.pipelined.r128.c128";
     }
     return "gdn_input_proj.q4_q5.unknown";
 }
@@ -75,13 +88,23 @@ const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedu
 }
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    switch (problem.policy) {
+    case LinearPolicy::A16Only:
+    case LinearPolicy::AllowA8:
+    case LinearPolicy::AllowA4:
+        return supported_shape(problem) && problem.cols >= 1;
+    }
+    return false;
 }
 
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem) {
     if (!q4_q5_gdn_input_admits(problem)) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input: exact problem or column count is not admitted");
+    }
+    if (allows_a8(problem.policy) && problem.cols >= kA8MinCols) {
+        return {Q4Q5GdnInputScheduleId::A8GroupedMixedPipelinedR128C128,
+                a8_workspace_bytes(problem.input_rows, problem.cols)};
     }
 
     for (const RouteSpec& route : kRoutes) {
@@ -110,14 +133,28 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
     }
 }
 
+std::size_t q4_q5_gdn_input_capacity_workspace_bytes(LinearPolicy policy, std::int32_t min_cols,
+                                                     std::int32_t max_cols) {
+    if (min_cols <= 0 || max_cols < min_cols) {
+        throw std::invalid_argument("Q4/Q5 GDN input: invalid column interval");
+    }
+    const auto plan = [&](std::int32_t cols) {
+        return q4_q5_gdn_input_resolve_plan({5120, 4096, 12288, 10240, 6144, 5120, cols, policy});
+    };
+    (void)plan(min_cols);
+    // Only the A8 route has scratch, and it grows with the width.
+    return plan(max_cols).workspace_bytes;
+}
+
 void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
                                   const Weight& qk_weight, const Weight& value_z_weight,
-                                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+                                  Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena* ws,
+                                  cudaStream_t stream) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
-                                      x.ne[1]};
+                                      x.ne[1],   policy};
     const Q4Q5GdnInputPlan resolved = q4_q5_gdn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule) {
+    if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("Q4/Q5 GDN input: plan does not match exact problem");
     }
 
@@ -134,18 +171,28 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, plan.schedule,
                                            stream);
         return;
+    case Q4Q5GdnInputScheduleId::A8GroupedMixedPipelinedR128C128: {
+        if (ws == nullptr) {
+            throw std::invalid_argument("Q4/Q5 GDN input: the A8 route requires a workspace");
+        }
+        auto scratch_scope        = ws->scope();
+        A8G64Activation quantized = allocate_a8_g64_activation(*ws, problem.input_rows, problem.cols);
+        a8_g64_quantize(x, quantized, stream);
+        q4_q5_gdn_input_a8_grouped_mma_launch(quantized, qk_weight, value_z_weight, qkv, z, stream);
+        return;
+    }
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");
 }
 
 void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
                               const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                              cudaStream_t stream) {
+                              LinearPolicy policy, WorkspaceArena* ws, cudaStream_t stream) {
     const Q4Q5GdnInputProblem problem{x.ne[0],   qk_weight.n, value_z_weight.n,
                                       qkv.ne[0], z.ne[0],     qk_weight.padded_shape[1],
-                                      x.ne[1]};
+                                      x.ne[1],   policy};
     const Q4Q5GdnInputPlan plan = q4_q5_gdn_input_resolve_plan(problem);
-    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream);
+    q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, policy, ws, stream);
 }
 
 } // namespace ninfer::ops::detail

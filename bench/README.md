@@ -477,7 +477,12 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
   --format nvfp4 --nvfp4-policy a4 --tokens 1024 --cache cold --profile
 ./build/bench/ninfer_gdn_input_proj_bench \
   --format fp8 --fp8-policy a8 --tokens 1,2,3,4,5,6,7,8 --cache cold
+./build/bench/ninfer_gdn_input_proj_bench \
+  --format q4q5 --q4q5-policy a8 --tokens 512,1024,2048 --cache cold
 ```
+
+`--q4q5-policy a8` grants the Q4/Q5 pair `AllowA8`, which runs the A8 prefill route from 129
+columns on (default `a16`).
 
 ## GDN input projection/convolution Snapshot/Record Op benchmark
 
@@ -732,7 +737,11 @@ queries workspace capacity for the requested aggregate interval.
 cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
 ./build/bench/ninfer_q4_linear_swiglu_bench \
   --t-sweep 1,2,4,8,16,24,32,40,48 --warmup 10 --repeat 50
+./build/bench/ninfer_q4_linear_swiglu_bench --policy a8 --t-sweep 512,1024,2048
 ```
+
+`--policy a8` grants the weight `AllowA8`, which runs the A8 prefill route from 129 columns on
+(default `a16`).
 
 ## NVFP4 LinearSwiGLU Op benchmark
 
@@ -775,7 +784,11 @@ cmake --build build --parallel --target ninfer_q5_linear_add_bench
   --k 6144 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
 ./build/bench/ninfer_q5_linear_add_bench \
   --k 17408 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
+./build/bench/ninfer_q5_linear_add_bench --k 17408 --policy a8 --t-sweep 512,1024,2048
 ```
+
+`--policy a8` grants the weight `AllowA8`, which runs the A8 prefill route from 129 columns on
+(default `a16`).
 
 ## BF16 LinearAdd Op benchmark
 
@@ -872,7 +885,12 @@ cmake --build build -j --target ninfer_attn_input_proj_bench
 ./build/bench/ninfer_attn_input_proj_bench \
   --format q8-dflash2-qkv --tokens 8,16,32,53,54,64,65,96,128,1024 \
   --execution graph --cache cold --warmup 10 --repeat 50
+./build/bench/ninfer_attn_input_proj_bench \
+  --format q4q5 --q4q5-policy a8 --tokens 512,1024,2048 --cache cold
 ```
+
+`--q4q5-policy a8` grants the Q4/Q5 pair `AllowA8`, which runs the A8 prefill route from 129
+columns on (default `a16`).
 
 The stateful GDN projection/convolution/snapshot contract remains in its own public Op benchmark;
 it is not a mode of Attention input projection. End-to-end target measurement uses `ninfer_bench`.

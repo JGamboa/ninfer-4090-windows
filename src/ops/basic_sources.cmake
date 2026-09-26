@@ -1,5 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/common/rowsplit_a8_quantize.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"

@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/arena.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -19,6 +20,7 @@ enum class Q5LinearAddScheduleId {
     MmaResidualR64C32S4,
     MmaResidualPipelinedR128C64,
     MmaResidualPipelinedR128C64Tail,
+    A8MmaResidualPipelinedR128C64,
 };
 
 struct Q5LinearAddProblem {
@@ -26,6 +28,7 @@ struct Q5LinearAddProblem {
     std::int32_t k;
     std::int32_t padded_k;
     std::int32_t cols;
+    LinearPolicy policy = LinearPolicy::A16Only;
 };
 
 struct Q5LinearAddPlan {
@@ -39,12 +42,13 @@ bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept;
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem);
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
-                                                   std::int32_t padded_k, std::int32_t min_cols,
-                                                   std::int32_t max_cols);
+                                                   std::int32_t padded_k, LinearPolicy policy,
+                                                   std::int32_t min_cols, std::int32_t max_cols);
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream);
+                                Tensor& residual_out, LinearPolicy policy, WorkspaceArena& ws,
+                                cudaStream_t stream);
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream);
+                            LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

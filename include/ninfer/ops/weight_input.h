@@ -22,8 +22,10 @@ struct SingleProjectionWeight {
     LinearPolicy policy = LinearPolicy::A16Only;
 };
 
+// Two parents fed by one activation; `policy` is the intersection of all their uses.
 struct PairedProjectionWeights {
     Weight first, second;
+    LinearPolicy policy = LinearPolicy::A16Only;
 };
 
 using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;

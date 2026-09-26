@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
+#include "ops/common/rowsplit_tall_a8_mma.cuh"
 #include "ops/common/rowsplit_tall_mma.cuh"
 #include "ops/common/token_slices.h"
 
@@ -79,11 +80,12 @@ void launch_grouped(const Tensor& x, const Weight& qk_weight, const Weight& valu
     });
 }
 
-void launch_tall(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                 Tensor& qkv, Tensor& z, cudaStream_t stream) {
+// Q/K rows, then V into qkv after them, then Z; 128 row blocks in all.
+rowsplit_tall::GroupedProblem tall_problem(const Weight& qk_weight, const Weight& value_z_weight,
+                                           Tensor& qkv, Tensor& z) {
     constexpr std::int32_t kValueRows = 6144;
     auto* qkv_out                     = static_cast<__nv_bfloat16*>(qkv.data);
-    rowsplit_tall::GroupedProblem problem{{
+    return rowsplit_tall::GroupedProblem{{
         rowsplit_tall::grouped_job(qk_weight, 0, qk_weight.n, qkv_out, qkv.ne[0], 0),
         rowsplit_tall::grouped_job(value_z_weight, 0, kValueRows, qkv_out, qkv.ne[0],
                                    qk_weight.n),
@@ -91,13 +93,30 @@ void launch_tall(const Tensor& x, const Weight& qk_weight, const Weight& value_z
                                    static_cast<__nv_bfloat16*>(z.data), z.ne[0], 0),
         {},
     }};
-    const std::int32_t blocks =
-        problem.jobs[0].blocks + problem.jobs[1].blocks + problem.jobs[2].blocks;
-    rowsplit_tall::launch<128>(problem, blocks, static_cast<const __nv_bfloat16*>(x.data),
-                               x.ne[0], x.ne[1], stream);
+}
+
+std::int32_t row_blocks(const rowsplit_tall::GroupedProblem& problem) {
+    return problem.jobs[0].blocks + problem.jobs[1].blocks + problem.jobs[2].blocks;
+}
+
+void launch_tall(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                 Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    const auto problem = tall_problem(qk_weight, value_z_weight, qkv, z);
+    rowsplit_tall::launch<128>(problem, row_blocks(problem),
+                               static_cast<const __nv_bfloat16*>(x.data), x.ne[0], x.ne[1], stream);
 }
 
 } // namespace
+
+void q4_q5_gdn_input_a8_grouped_mma_launch(const A8G64Activation& x, const Weight& qk_weight,
+                                           const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                                           cudaStream_t stream) {
+    const auto problem = tall_problem(qk_weight, value_z_weight, qkv, z);
+    rowsplit_tall_a8::launch<128>(problem, row_blocks(problem),
+                                  static_cast<const std::int8_t*>(x.q.data),
+                                  static_cast<const float*>(x.scale.data), x.q.ne[0], x.q.ne[1],
+                                  stream);
+}
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
