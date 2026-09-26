@@ -4,10 +4,16 @@ A C++20/CUDA inference engine specialized for **one NVIDIA GeForce RTX 4090** (`
 and run natively on **Windows 11** (MSVC + CUDA; no WSL, no Docker). It serves two 27B models of
 the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP server:
 
-| Model | Artifact | Size | Decode (MTP) | Best case |
-|---|---|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **188 tok/s** | **532 tok/s** (MTP + n-gram, edit-style prompts) |
-| **Qwen3.8-27B** (official NInfer groupwise Q4/Q5, text + vision) | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram), **211 tok/s** (DFlash2, code) |
+| Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
+|---|---|---:|---:|---:|---:|
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **188 tok/s** | **532 tok/s** (MTP + n-gram) | 4,500 tok/s |
+| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,008 tok/s** |
+| **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 107 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
+
+Both Qwen3.8 files hold the same weights, byte for byte; the int8-prefill file lets prompt
+processing run on int8 tensor cores (1.6-1.8x faster, same decode, same quality within noise).
+For reference, the official llama.cpp prefills a Qwen3.8-27B Q4_K_S GGUF at 2,729 tok/s
+(`pp2048`) on the same card.
 
 Every figure in this README was measured on the same RTX 4090 under Windows unless it says
 otherwise; the conditions are next to each table. Both models run the full 262K-token context on
@@ -61,7 +67,10 @@ CUDA `bin` directory on `PATH`. Build details and the Windows-specific changes a
 :: Ternary Bonsai 2 27B: text + vision + MTP head (6.4 GiB)
 hf download jgamboa/Ternary-Bonsai-2-27B-NInfer-4090 bonsai2_27b_vl_mtp_q4q5.ninfer --local-dir E:\LLM
 
-:: Qwen3.8-27B: text + vision + MTP + DFlash2 (19.0 GiB)
+:: Qwen3.8-27B with int8 prefill: text + vision + MTP + DFlash2 (19.0 GiB)
+hf download jgamboa/Qwen3.8-27B-NInfer-4090 qwen3_8_27b_a8.ninfer --local-dir E:\LLM
+
+:: or the official Qwen3.8-27B artifact (same weights, BF16 prefill)
 hf download neroued/Qwen3.8-27B-NInfer qwen3_8_27b.ninfer --local-dir E:\LLM
 ```
 
@@ -76,7 +85,7 @@ build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
   --prompt "Write a Python function that merges two sorted lists." ^
   --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 2 --lm-head-draft
 
-build\apps\ninfer.exe E:\LLM\qwen3_8_27b.ninfer ^
+build\apps\ninfer.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
   --prompt "Write a Python function that merges two sorted lists." ^
   --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain
 ```
@@ -101,7 +110,7 @@ build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
 Qwen3.8-27B, 100K context, three concurrent requests:
 
 ```bat
-build\apps\ninfer-serve.exe E:\LLM\qwen3_8_27b.ninfer ^
+build\apps\ninfer-serve.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
   --host 127.0.0.1 --port 8080 --model-id qwen3.8-27b ^
   --max-context 100000 --kv-capacity 100000 --kv-dtype rk4v4-e8 --max-concurrency 3 ^
   --max-pending-requests 10 --pending-timeout-ms 600000 --prefill-chunk 1408 ^
@@ -394,7 +403,9 @@ python -m tools.convert --model E:\LLM\my-qwen38-finetune --recipe qwen3_8_27b ^
 Use NInfer's `qwen3_8.jinja` template: it adds developer and mid-conversation system messages
 and tool-result handling that agent clients need.
 
-**Qwen3.8 int8 prefill artifact.** The `qwen3_8_27b_a8` recipe copies an existing
+**Qwen3.8 int8 prefill artifact.** A ready-made file is on
+[jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090). To
+build it yourself: the `qwen3_8_27b_a8` recipe copies an existing
 `qwen3_8_27b.ninfer` word for word and only grants int8 activations to the prefill GEMMs. It needs
 a configuration directory (the Qwen3.8 `config.json` and tokenizer/template files) and takes about
 four minutes on the CPU:
