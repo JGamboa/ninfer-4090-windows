@@ -914,3 +914,96 @@ NInfer leads at 128K, where attention weighs more. The weights differ slightly (
 NInfer's Q4/Q5 mix), as do the KV formats (q8_0 against int8 with group-64 scales). The earlier
 comparison in [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md) was measured on another
 4090 under Linux before the prefill work of 2026-09-25/26.
+
+## A8 prefill GEMMs for Qwen3.8 (`83feb4c8`, `aa520f3f`, 2026-09-26)
+
+The four Q4/Q5 prefill GEMM families (gate+up SwiGLU, `linear_add` down/o_proj/out_proj, GDN
+in_proj, attention qkvg) have an int8 route for artifacts whose recipe grants `AllowA8` on their
+inputs. From 129 columns on, the activation is quantized per token and 64-column group (aligned
+with the weight groups: `scale = amax / 127`, `q = rint(x * 127 / amax)`, IEEE FP32) and the
+stored Q4/Q5 codes are used exactly as int8 operands of m16n8k32 s8 MMAs; each group's int32 dot
+starts at `0x4B400000` (one exact FADD) and `w_scale * a_scale` is applied in FP32 per group. The
+kernel (`src/ops/common/rowsplit_tall_a8_mma.cuh`) keeps the pipelined, ping-pong structure of the
+A16 tall kernel. Narrower widths (decode, MTP/DFlash2 verification) and `A16Only` artifacts keep
+the exact A16 routes. The contract is in `docs/maintainer/op-development.md` section 6.4.
+
+Artifact: `E:\LLM\qwen3_8_27b_a8.ninfer`, converted with the new `qwen3_8_27b_a8` recipe from the
+existing artifact (no BF16 checkpoint), 212 s on the CPU:
+
+```powershell
+.venv\Scripts\python.exe -m tools.convert --model <config dir> --recipe qwen3_8_27b_a8 `
+  --source reference=E:\LLM\qwen3_8_27b.ninfer --source dflash2=E:\LLM\dflash2-src `
+  --components text,vision,mtp,dflash2 --name qwen3.8-27b --device cpu `
+  --out E:\LLM\qwen3_8_27b_a8.ninfer
+```
+
+The config dir holds the Qwen3.8 `config.json` (the one of `E:\LLM\bonsai2-27b-vl`; its text and
+vision fields equal the artifact's) and the six resource files. All 1184 bound objects, the
+components and the resources are byte-identical to `qwen3_8_27b.ninfer`; only the 512 Uses of the
+granted projections became `AllowA8` (Q/K/gate/V/output of 16 attention layers, Q/K/V/Z/output of
+48 GDN layers, gate/up/down of 64 MLPs: 80 + 240 + 192).
+
+**Quality** (all measured):
+
+| Check | A16 (`qwen3_8_27b`) | A8 (`qwen3_8_27b_a8`) |
+|---|---|---|
+| Quick perplexity, bf16 KV, overall | 4.800742 | 4.794439 (-0.13 %) |
+| chinese_reference | 6.799864 | 6.777985 |
+| english_long_form | 7.179659 | 7.181949 (+0.03 %) |
+| english_reference | 6.442797 | 6.429567 |
+| ninfer_code | 1.673776 | 1.673295 |
+| NIAH 8K / 64K / 128K, rk4v4-e8 (ORCHID=493817) | exact | exact (all 6 runs) |
+| tools/eval, thinking off, launcher flags (MTP 3 + n-gram) | 45/45 | 45/45 |
+
+The `qwen3_8_27b` perplexity with the new binaries is 4.800742, identical to the baseline. The
+six-prompt regression has prompts shorter than 129 tokens, so it runs A16 and its text is
+identical (md5) for both artifacts. With six prompts of 188-452 tokens
+(`examples/cli/messages/scenario_translation_{en_zh,zh_en,markdown}`,
+`reasoning_jacobian_counterexample_3d`, `long_decode_aime26_{01,15}`; MTP 3, int8 KV, greedy, 512
+new tokens) two outputs are identical and four diverge: at word 11 of 70 (a synonymous Chinese
+phrasing), word 3 of 373 (a period after a heading), word 76 of 248 (one Chinese character) and
+word 152 of 228 (`P_x` against `\partial P / \partial x`). MTP acceptance 76.4 % (A16) against
+76.1 % (A8).
+
+**Op benches** (cold L2, median us, A16 -> A8, two alternated rounds agree within 3 %):
+
+| Family | T = 512 | T = 1024 | T = 2048 |
+|---|---|---|---|
+| gate+up 34816 x 5120 | 1332 -> 661 | 2507 -> 1227 | 4780 -> 2432 |
+| down 5120 x 17408 | 742 -> 493 | 1207 -> 768 | 2392 -> 1296 |
+| o_proj / out_proj 5120 x 6144 | 274 -> 189 | 438 -> 296 | 858 -> 492 |
+| GDN in_proj 16384 x 5120 | 604 -> 281-290 | 1194 -> 532-556 | 2377 -> 1041-1089 |
+| qkvg 14336 x 5120 | 574-600 -> 285 | 993-1041 -> 485-488 | 1979-2077 -> 953 |
+
+The quantization kernel takes 18 us at T = 1024, K = 5120 (ncu, 89 % of DRAM peak). The 5120-row
+Q5 weights pick 64- or 128-token tiles by one-per-SM wave cost (40 row blocks): 128-token tiles
+alone were 8 % slower at T = 512 and 25 % faster at T = 2048.
+
+**Nsight Compute, gate+up, T = 1024, 2.6 GHz:** 2.50 -> 1.26 ms; tensor pipe active 43.0 % (HMMA)
+-> 43.0 % (IMMA); issue slots busy 14.5 -> 35.2 %; IPC 0.58 -> 1.41; DRAM read 137 -> 112 MB;
+234 registers, 34.8 KB shared memory, one CTA per SM. Top stall reasons (warp samples): math-pipe
+throttle, wait, selected, barrier.
+
+**End to end** (CLI NIAH, rk4v4-e8, `--prefill-chunk 1024`, MTP 3, `--no-thinking`, alternated;
+64K twice in each order, 128K once; `build_qwen_a16` for A16):
+
+| Prompt | A16 | A8 |
+|---|---|---|
+| `long_niah_8k` | 2.9 / 2.9 s (2.67K tok/s) | 1.6 / 1.6 s (4.7K tok/s, -45 %) |
+| `long_niah_64k` | 27.5 / 27.4 s | 17.1 / 17.1 s (-38 %) |
+| `long_niah_128k` | 64.0 s | 43.3 s (-32 %) |
+
+`ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8` (alternated twice): pp512 2,539 / 2,543 ->
+4,476 / 4,493 tok/s (+76 %), pp2048 2,789 / 2,760 -> 5,024 / 5,022 tok/s (+81 %); tg128 52.0 in
+both. llama.cpp measured 2,756 / 2,729 tok/s on this machine. Decode is unchanged: the six-prompt
+MTP 3 regression gives 23.7 ms per round and identical text for both artifacts and binaries, and
+Bonsai (MTP 2) gives identical text on the old and new binaries.
+
+Measured, not adopted: a lower A8 threshold. A8 is already faster from ~48 columns on (gate+up
+406 us against 458-517 us at T = 48-128; GDN in_proj ties until ~80), but widths of 65-128 also
+occur in batched speculative verification, which stays A16 by design.
+
+Remaining headroom (estimated): the tensor pipe is still idle 57 % of the time; the next levers
+are 128-K steps (half the barriers, needs a second int32 accumulator set), quantizing the SwiGLU
+output inside the gate+up epilogue (saves the 17408-wide quantization pass and a BF16 round trip,
+~7 % of the down projection), and fusing RMSNorm into the quantization.
