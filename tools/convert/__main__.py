@@ -49,6 +49,9 @@ class SourceInputs(Mapping):
             )
         return self._sources[name]
 
+    def __contains__(self, name):
+        return name in self._sources or name in self._paths
+
     def __iter__(self):
         return iter(dict.fromkeys((*self._sources, *self._paths)))
 

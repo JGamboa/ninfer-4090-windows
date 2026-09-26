@@ -102,6 +102,86 @@ def qwen3_8_27b(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8)
 
 
+# The inputs of the dense text layers' Q4/Q5 GEMMs. With AllowA8 their prefill widths may run the
+# int8 tensor-core GEMMs (per-token 64-group activation quantization); decode stays A16.
+_PREFILL_A8 = (
+    "/attention/query",
+    "/attention/key",
+    "/attention/gate",
+    "/attention/value",
+    "/attention/output",
+    "/gdn/query",
+    "/gdn/key",
+    "/gdn/value",
+    "/gdn/z",
+    "/gdn/output",
+    "/mlp/gate",
+    "/mlp/up",
+    "/mlp/down",
+)
+
+
+def _import_stored(model, recipe, reference: NInferArtifactStore) -> None:
+    """Take every parameter, the indexed proposal head and the resources from `reference`, an
+    artifact of the same recipe: grouped-integer parents as stored codes and scales
+    (`import_encoded`), direct values as stored. Formats, parents and sharing stay those the
+    recipe already selected; a format that differs from the stored one fails."""
+    stored = set(reference.parameters())
+    for name, parameter in list(model.parameters.items()):
+        if name in recipe.aliases:
+            continue
+        if name not in stored:
+            raise ValueError(f"reference artifact has no parameter {name}")
+        format = reference.stored_format(name)
+        if any(selection.format != format for selection in recipe.selections[name]):
+            raise ValueError(f"{name}: reference stores {format}, the recipe selects another format")
+        source = reference.parameter_source(name, parameter.shape)
+        model.parameters[name] = replace(parameter, source=source)
+        method = cast_direct if isinstance(get_format(format), DirectFormat) else import_encoded
+        recipe.assign(name, method=method, source=source)
+    proposal = reference.directory.components.get("text", {}).get("proposal")
+    if proposal is not None:
+        rows = proposal["rows"]
+        inputs = tuple(
+            component + "/final_hidden"
+            for component in ("mtp", "dflash", "dflash2")
+            if component in model.components
+        )
+        head = reference.parameter_source("proposal/head", (rows, model.config["hidden_size"]))
+        ids = reference.parameter_source("proposal/token_ids", (rows,))
+        model.components["text"]["proposal"] = dict(proposal)
+        model.add(Parameter("proposal/head", head.shape, head, inputs=inputs, residency="proposal"))
+        model.add(
+            Parameter(
+                "proposal/token_ids", (rows,), ids, direct_format="int32", residency="proposal"
+            )
+        )
+        recipe.add_parameter("proposal/head")
+        recipe.add_parameter("proposal/token_ids")
+        recipe.assign(
+            "proposal/head",
+            format=reference.stored_format("proposal/head"),
+            method=import_encoded,
+        )
+    for object_id in model.resources:
+        model.resources[object_id] = reference.read_object(object_id)
+
+
+def qwen3_8_27b_a8(model, recipe, sources):
+    """`qwen3_8_27b` with AllowA8 on the inputs of the text layers' Q4/Q5 GEMMs.
+
+    With a `reference` source (an existing `qwen3_8_27b` artifact) the weights, the indexed
+    proposal head and the resources are copied from its stored words instead of quantized from
+    the BF16 checkpoint; `--model` then supplies only the configuration. Do not pass
+    `--proposal` in that case."""
+    _dense_groupwise(model, recipe, Q8)
+    if "reference" in sources:
+        _import_stored(model, recipe, sources["reference"])
+    for name, parameter in model.parameters.items():
+        if name.startswith("text/layers/") and name.endswith(_PREFILL_A8):
+            recipe.assign(name, activation_policy="AllowA8")
+
+
 def qwen3_6_35b_a3b(model, recipe, sources):
     if "num_experts" not in model.config:
         raise ValueError("this official recipe requires Qwen3.5 MoE mathematics")
@@ -386,6 +466,7 @@ RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
+    "qwen3_8_27b_a8": qwen3_8_27b_a8,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "bonsai2_27b": bonsai2_27b,

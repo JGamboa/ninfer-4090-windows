@@ -54,6 +54,7 @@ The built-in recipes are ordinary Python functions in
 |---|---|---|
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
+| `qwen3_8_27b_a8` | `qwen3_8_27b` with `AllowA8` on the text layers' Q4/Q5 projection inputs | Optional `reference` |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
@@ -76,6 +77,32 @@ python3 -m tools.convert \
   --name qwen3.8-27b \
   --out models/qwen3_8_27b_nvfp4.ninfer
 ```
+
+`qwen3_8_27b_a8` stores the same representation as `qwen3_8_27b` and grants `AllowA8` to the
+inputs of the text layers' attention Q/K/gate/V and output, GDN Q/K/V/Z and output, and MLP
+gate/up/down projections. Their prefill widths (129 columns or more) then run int8 tensor-core
+GEMMs over a per-token, per-64-column int8 quantization of the activation
+([Op development](maintainer/op-development.md), section 6.4); decode is unchanged. This changes
+prefill numerics: on the quick perplexity corpus the result is 4.794439 against 4.800742 for
+`qwen3_8_27b`. Without a BF16 checkpoint, the recipe copies an existing `qwen3_8_27b` artifact
+word for word (weights, indexed proposal head and resources) through `--source reference=...`;
+`--model` then only supplies the configuration, and `--proposal` must be omitted:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B-config \
+  --recipe qwen3_8_27b_a8 \
+  --source reference=models/qwen3_8_27b.ninfer \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --name qwen3.8-27b \
+  --out models/qwen3_8_27b_a8.ninfer
+```
+
+The configuration directory holds the Qwen3.8 `config.json` and the frontend resource files
+(`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`,
+`preprocessor_config.json`, `video_preprocessor_config.json`); the recipe replaces the resources by
+the reference's bytes. The DFlash2 source supplies only its configuration here.
 
 MTP and Vision use the main source. DFlash and DFlash2 use the corresponding named source, supplied
 as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
