@@ -80,13 +80,23 @@ void launch_small_t(const QuantizedX& q, const Weight& w, int tokens,
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int WarpsN>
+template <int WarpsM, int WarpsN>
 void launch_gemm(const QuantizedX& q, const Weight& w, int tokens, const t5_a8::Outputs& outputs,
                  bool accumulate, cudaStream_t stream) {
-    using Config = t5_a8::GemmConfig<WarpsN>;
-    const dim3 grid(static_cast<unsigned>(w.n / t5_a8::kGemmRows),
+    using Config               = t5_a8::GemmConfig<WarpsM, WarpsN>;
+    constexpr std::size_t kSmem = t5_a8::gemm_shared_bytes<WarpsM, WarpsN>();
+    if constexpr (kSmem > 48 * 1024) {
+        static const bool opted_in = [] {
+            CUDA_CHECK(cudaFuncSetAttribute(t5_a8::gemm_kernel<WarpsM, WarpsN>,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(kSmem)));
+            return true;
+        }();
+        (void)opted_in;
+    }
+    const dim3 grid(static_cast<unsigned>(w.n / Config::kRows),
                     static_cast<unsigned>((tokens + Config::kTokens - 1) / Config::kTokens));
-    t5_a8::gemm_kernel<WarpsN><<<grid, Config::kThreads, 0, stream>>>(
+    t5_a8::gemm_kernel<WarpsM, WarpsN><<<grid, Config::kThreads, kSmem, stream>>>(
         static_cast<const std::uint8_t*>(q.q.data), static_cast<const float*>(q.scale.data),
         static_cast<const int*>(q.group_sum.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.k, tokens, outputs, accumulate);
@@ -99,12 +109,20 @@ void launch_gemm(const QuantizedX& q, const Weight& w, int tokens, const t5_a8::
 // replaces (o_proj 5120 x 6144 at T = 128: 80 CTAs, +14 %), while a long K still gains (down
 // 5120 x 17408, -3 %) and grids of at least one CTA per SM gain 25-30 % (design 9.1).
 bool use_small_gemm_tile(const Weight& w, int tokens) {
-    using Large = t5_a8::GemmConfig<4>;
-    if (tokens <= t5_a8::GemmConfig<2>::kTokens) return true;
+    using Large = t5_a8::GemmConfig<2, 4>;
+    if (tokens <= t5_a8::GemmConfig<2, 2>::kTokens) return true;
     constexpr int kLongK = 16384;
     const std::int64_t large_ctas =
-        std::int64_t(w.n / t5_a8::kGemmRows) * ((tokens + Large::kTokens - 1) / Large::kTokens);
+        std::int64_t(w.n / Large::kRows) * ((tokens + Large::kTokens - 1) / Large::kTokens);
     return large_ctas < device_sm_count() && w.k < kLongK;
+}
+
+// Weights of at least 8192 rows take 128 x 128 CTAs: each staged activation tile then serves 128
+// rows, halving the L2 activation reads per output (gate+up, GDN in_proj and attention qkvg:
+// -10 to -28 % at T = 128..2048). The 5120-row weights keep 64-row CTAs: 40 row blocks leave
+// the one-CTA-per-SM tile too few CTAs per wave (o_proj +8 % at T = 1024).
+bool use_tall_gemm_tile(const Weight& w) {
+    return w.n >= 8192 && w.n % t5_a8::GemmConfig<4, 4>::kRows == 0;
 }
 
 void require_input(const Tensor& x, const Weight& w, const char* what) {
@@ -156,7 +174,7 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
     case 4: launch_gemv<4>(q, w, packed, accumulate, stream); return;
     default: break;
     }
-    if (tokens <= kSmallTMaxTokens || w.n % t5_a8::kGemmRows != 0) {
+    if (tokens <= kSmallTMaxTokens || w.n % t5_a8::GemmConfig<2, 2>::kRows != 0) {
         switch ((std::min(tokens, kSmallTMaxTokens) + 7) / 8) {
         case 1: launch_small_t<1>(q, w, tokens, packed, accumulate, stream); break;
         case 2: launch_small_t<2>(q, w, tokens, packed, accumulate, stream); break;
@@ -164,9 +182,11 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
         default: launch_small_t<4>(q, w, tokens, packed, accumulate, stream); break;
         }
     } else if (use_small_gemm_tile(w, tokens)) {
-        launch_gemm<2>(q, w, tokens, packed, accumulate, stream);
+        launch_gemm<2, 2>(q, w, tokens, packed, accumulate, stream);
+    } else if (use_tall_gemm_tile(w)) {
+        launch_gemm<4, 4>(q, w, tokens, packed, accumulate, stream);
     } else {
-        launch_gemm<4>(q, w, tokens, packed, accumulate, stream);
+        launch_gemm<2, 4>(q, w, tokens, packed, accumulate, stream);
     }
 }
 

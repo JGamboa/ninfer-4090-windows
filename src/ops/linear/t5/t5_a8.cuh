@@ -380,27 +380,33 @@ __global__ void __launch_bounds__(kGemvThreads)
 }
 
 // ---------------------------------------------------------------------------------------------
-// int8 tensor-core GEMM for prefill: a CTA of 2 x WarpsN warps owns 64 rows x 32 WarpsN tokens,
-// warp (wm, wn) 32 x 32 with m16n8k32 s8 MMAs, one 128-column scale group per stage. The stage's
-// 64 rows x 2 units are decoded into 16 code words each of a single shared buffer, one unit per
-// thread (WarpsN = 2) or split between the two warp halves of the CTA (WarpsN = 4: bytes 0-7
-// in warps 0-3, bytes 8-12 in warps 4-7, so the decode never diverges within a warp); the next
+// int8 tensor-core GEMM for prefill: a CTA of WarpsM x WarpsN warps owns 32 WarpsM rows x
+// 32 WarpsN tokens, warp (wm, wn) 32 x 32 with m16n8k32 s8 MMAs, one 128-column scale group per
+// stage. The stage's rows x 2 units are decoded into 16 code words each of a single shared buffer,
+// one unit per thread (WarpsN = 2) or split between the two halves of the CTA's warps (WarpsN = 4:
+// bytes 0-7 in the first half, bytes 8-12 in the second, so the decode never diverges within a
+// warp); the next
 // stage's bytes are loaded before the MMAs and decoded after them. Code words and activations
 // are stored in 16-byte chunks XORed with the row (token) index, so both the A and B fragments
 // load with conflict-free `ldmatrix`. The activation and the token scales and sums are
 // double-buffered with cp.async.
 
-constexpr int kGemmRows  = 64;
-constexpr int kStageK    = 128;
+constexpr int kStageK = 128;
 
-template <int WarpsN>
+// A CTA of WarpsM x WarpsN warps owns 32 WarpsM weight rows and 32 WarpsN tokens; each warp
+// multiplies 32 rows by 32 tokens. More rows per CTA reuse each staged activation tile across
+// more rows: the activation re-reads from L2, not the MMAs, bound the 64-row tile (design 9.1).
+template <int WarpsM, int WarpsN>
 struct GemmConfig {
+    static_assert(WarpsM == 2 || WarpsM == 4);
     static_assert(WarpsN == 2 || WarpsN == 4);
+    static constexpr int kRows    = 32 * WarpsM;
     static constexpr int kTokens  = 32 * WarpsN;
-    static constexpr int kThreads = 64 * WarpsN;
+    static constexpr int kThreads = 32 * WarpsM * WarpsN;
     static constexpr int kParts   = WarpsN / 2; // decoding threads per (row, unit)
-    // 64-token CTAs keep three per SM (shared memory); 128-token CTAs two, at <= 128 registers.
-    static constexpr int kMinBlocks = WarpsN == 2 ? 3 : 2;
+    // At <= 128 registers: 64 x 64 CTAs fit three per SM (shared memory), 64 x 128 and 128 x 64
+    // two, and the 16-warp 128 x 128 CTA one.
+    static constexpr int kMinBlocks = 65536 / (kThreads * 128) < 3 ? 65536 / (kThreads * 128) : 3;
 };
 
 __device__ __forceinline__ int gemm_word(int row, int word) { return row * 32 + (word ^ ((row & 7) << 2)); }
@@ -482,26 +488,37 @@ __device__ __forceinline__ void decode_store_part(const std::uint32_t (&a)[4], i
     }
 }
 
-template <int WarpsN>
-__global__ void __launch_bounds__(GemmConfig<WarpsN>::kThreads, GemmConfig<WarpsN>::kMinBlocks)
+// Shared memory of one CTA: the double-buffered activation stages, then the code words.
+template <int WarpsM, int WarpsN>
+constexpr std::size_t gemm_shared_bytes() {
+    return 2 * sizeof(GemmStage<GemmConfig<WarpsM, WarpsN>::kTokens>) +
+           std::size_t(GemmConfig<WarpsM, WarpsN>::kRows) * 32 * sizeof(std::uint32_t);
+}
+
+template <int WarpsM, int WarpsN>
+__global__ void __launch_bounds__(GemmConfig<WarpsM, WarpsN>::kThreads,
+                                  GemmConfig<WarpsM, WarpsN>::kMinBlocks)
     gemm_kernel(const std::uint8_t* __restrict__ qx, const float* __restrict__ group_scale,
                 const int* __restrict__ group_sum, const std::uint8_t* __restrict__ codes,
                 const __half* __restrict__ scales, std::int64_t scale_row_halves, int k,
                 int tokens, Outputs outputs, bool accumulate) {
-    using Config             = GemmConfig<WarpsN>;
+    using Config             = GemmConfig<WarpsM, WarpsN>;
+    constexpr int kRows      = Config::kRows;
     constexpr int kTokens    = Config::kTokens;
     constexpr int kThreads   = Config::kThreads;
     constexpr int kParts     = Config::kParts;
-    __shared__ __align__(128) GemmStage<kTokens> stages[2];
-    __shared__ __align__(128) std::uint32_t code_words[kGemmRows * 32];
+    // Dynamic: the 128 x 128 tile needs more than the 48 KiB of static shared memory.
+    extern __shared__ __align__(128) std::uint8_t gemm_smem[];
+    auto* stages     = reinterpret_cast<GemmStage<kTokens>*>(gemm_smem);
+    auto* code_words = reinterpret_cast<std::uint32_t*>(gemm_smem + 2 * sizeof(GemmStage<kTokens>));
     const int tid    = static_cast<int>(threadIdx.x);
     const int warp   = tid >> 5;
     const int lane   = tid & 31;
     const int gid    = lane >> 2;
     const int lid    = lane & 3;
-    const int wm     = warp & 1;
-    const int wn     = warp >> 1;
-    const int row0   = static_cast<int>(blockIdx.x) * kGemmRows;
+    const int wm     = warp % WarpsM;
+    const int wn     = warp / WarpsM;
+    const int row0   = static_cast<int>(blockIdx.x) * kRows;
     const int token0 = static_cast<int>(blockIdx.y) * kTokens;
     const int live   = min(kTokens, tokens - token0);
     const int steps  = k / kStageK;
@@ -525,13 +542,14 @@ __global__ void __launch_bounds__(GemmConfig<WarpsN>::kThreads, GemmConfig<Warps
                                    chunk * 16,
                                token < live ? 16 : 0);
         }
-        // kThreads = 2 kTokens: the first half stages the scales, the second the sums.
+        // kThreads >= 2 kTokens: the first kTokens threads stage the scales, the next the sums.
+        static_assert(kThreads >= 2 * kTokens);
         const int token  = tid & (kTokens - 1);
         const int source = token < live ? token0 + token : token0;
         const std::int64_t index = std::int64_t(source) * (k / kStageK) + step;
         if (tid < kTokens) {
             cp_async_zfill<4>(&s.scale[token], group_scale + index, token < live ? 4 : 0);
-        } else {
+        } else if (tid < 2 * kTokens) {
             cp_async_zfill<4>(&s.sum[token], group_sum + index, token < live ? 4 : 0);
         }
     };

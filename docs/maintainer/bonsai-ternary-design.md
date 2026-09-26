@@ -2228,6 +2228,67 @@ Next steps, in order:
       - Adopted on 2026-09-25: `start-bonsai-server - ninfer.bat` adds `--ngram chain`, and both
         Qwen3.8 launchers move to MTP 3 + n-gram with CUDA graphs (backups
         `.bak-20260925-ngram`).
+21. Prefill attribution and the 128 x 128 t5 GEMM tile (measured 2026-09-25, RTX 4090 at 60 Hz,
+    `bonsai2_27b_vl_mtp_q4q5.ninfer`, rk4v4-e8 KV, server off).
+    - `--prefill-chunk` is not a lever. NIAH 8K, 64K and 128K ran at 1024, 2048 and 2688,
+      alternated twice: 8K 3.23-3.40K tok/s, 64K 2.59-2.78K, 128K 2.15-2.22K. The differences
+      are within the run-to-run spread, and 1024 is never worse. All answers are exact.
+    - Where the prefill goes (`nsys profile --trace=cuda,nvtx`, `long_niah_64k`,
+      `profiles/nsys/bonsai_prefill_64k_rk4`), share of 24.5 s of kernels:
+
+      | Family | Time | Share |
+      |---|---|---|
+      | t5 `gemm_kernel` | 17.00 s | 69.4 % |
+      | Prompt attention (`causal_attention_prompt_i8_kernel`) | 5.43 s | 22.2 % |
+      | A8 quantization | 0.94 s | 3.8 % |
+      | GDN chunked and conv/gating | 0.87 s | 3.6 % |
+
+      The t5 GEMM by shape (1024-token chunks): gate+up 1949 us per call (46 % of the GEMM
+      time), the 5120-row o_proj and down 697 us on average (33 %), GDN in_proj 905 us (16 %),
+      qkvg 779 us (5 %). At ~190 int8 TOPS it runs at about 29 % of the card's dense tensor
+      rate.
+    - Nsight Compute on the four shapes (`profiles/ncu/t5_gemm_prefill_1024`):
+      - L2 throughput is 51-73 % and the highest unit. Compute is 20-31 %, DRAM 14-27 % and the
+        issue slots 17-27 %.
+      - Occupancy is 2 CTAs of 8 warps per SM, limited by registers and shared memory.
+      - Each 64-row CTA stages the 128-token activation tile (16 KB per 128-column step) from L2
+        for 1.7 KB of code bytes, so the activations are re-read once per 64 rows: ~2.85 GB per
+        gate+up call.
+    - `gemm_kernel<WarpsM, WarpsN>` now takes the row tile as a parameter (32 WarpsM rows).
+      Shared memory is dynamic, with an opt-in above 48 KiB. Weights of at least 8192 rows run
+      the 16-warp 128 x 128 tile, one CTA per SM, where each staged activation tile serves 128
+      rows. The 5120-row weights keep the 64-row tiles. Arithmetic per output is unchanged
+      (same K order).
+    - `ninfer_t5_bench`, rotated route, us per call, base -> 128 x 128:
+
+      | Shape | T = 128 | T = 256 | T = 512 | T = 1024 | T = 2048 |
+      |---|---|---|---|---|---|
+      | gate+up 34816 x 5120 | 304 -> 283 | 561 -> 465 | 991 -> 851 | 1937 -> 1736 | 3794 -> 3457 |
+      | GDN in_proj 16384 x 5120 | 113 -> 97 | 272 -> 197 | 503 -> 405 | 922 -> 794 | 1805 -> 1657 |
+      | qkvg 14336 x 5120 | 105 -> 95 | 248 -> 193 | 420 -> 387 | 791 -> 680 | 1586 -> 1425 |
+
+      Rejected by the same bench:
+      - The 128 x 64 tile makes gate+up 13 % slower at T = 1024: the weights are decoded
+        twice as often per output.
+      - The 128 x 128 tile on the 5120-row shapes makes o_proj 8 % slower at T = 1024: 40 row
+        blocks give too few one-per-SM CTAs.
+    - Correctness:
+      - `ninfer_linear_t5_test` passes. It adds an 8192 x 2048 weight at T = 300 (three token
+        tiles, the last partial) and a residual case at T = 130, besides the existing T = 65/72
+        cases on the 128-row route.
+      - Quick perplexity (bf16 KV, `bonsai2_27b_vl.ninfer`) is 5.854904, identical to item 9.
+    - Prefill, CLI, base binary (`build_t5_base`) against new, alternated twice, NIAH answers all
+      exact:
+
+      | Prompt | Base | New |
+      |---|---|---|
+      | `long_niah_8k` | 3.24 / 3.32K tok/s | 3.50 / 3.50K tok/s (+5 to +8 %) |
+      | `long_niah_64k` | 24.0 / 24.0 s | 23.1 / 23.1 s (-3.8 %) |
+      | `long_niah_128k` | 59.8 / 59.7 s | 57.0 / 58.0 s (-3 to -5 %) |
+
+      The end-to-end gain is smaller than the kernel gain for two reasons: the 5120-row shapes
+      (a third of the GEMM time) are unchanged, and attention, GDN and quantization are ~30 % of
+      the prefill.
 
 ## Appendix: sources
 

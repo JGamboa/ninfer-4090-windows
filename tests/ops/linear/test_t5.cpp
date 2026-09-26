@@ -420,6 +420,11 @@ int main() {
         failures += linear_case(gemm, 64, 320, 40, false, ops::LinearPolicy::AllowA4);
         failures += linear_add_case(gemm, 70);
         failures += linear_add_case(gemm, 3);
+        // Weights of at least 8192 rows take the 16-warp 128 x 128 tile: three token tiles, the
+        // last partial, and a residual epilogue.
+        const Ternary tall(8192, 2048, 19u);
+        failures += linear_case(tall, 0, 8192, 300, false);
+        failures += linear_add_case(tall, 130);
     }
     // Bonsai shapes (N, K) at decode and MTP-verify widths: one lane (T = 1, 3, 4), and B
     // concurrent lanes packed as B x (draft + 1) columns (draft 2: 6, 9, 12, ..., 24; draft 3:
