@@ -1256,3 +1256,20 @@ integrated build: `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8` pp512 5
 tg128 54.7 tok/s; `long_niah_64k` (rk4v4-e8, MTP 3) 14.8 / 14.9 s against 16.0 / 16.2 s for the
 2026.09.27 release binary, alternated, answers exact. The same-weights llama.cpp session above ran
 about 10 % slower in absolute terms for both engines; its ratios stand.
+
+## The 4090 without a display (2026-09-27)
+
+The monitor now runs on the CPU's integrated graphics (UHD 770); the 4090 has no display and idles
+at 0 MiB in P8. Build `78479e72`, two identical sessions, Bonsai design notes section 9.1 item 32:
+
+| Measurement | Bonsai | Qwen3.8 A8 |
+|---|---:|---:|
+| Decode, MTP 2 / MTP 3, six prompts, greedy, thinking off | 217.9 tok/s | 120.2 tok/s |
+| `tg128` | 128.5-128.9 tok/s | 54.6 tok/s |
+| `pp512` / `pp2048` (int8 KV) | 5,800-5,893 / 6,108-6,113 tok/s | 5,307-5,312 / 5,730-5,765 tok/s |
+| `long_niah_64k` (rk4v4-e8, answer exact) | 14.4 s | 14.9 s |
+
+Prefill, `tg128` and the 64K prompt match the clean runs with the 4K60 dummy display attached
+(Qwen3.8 5,790 / 54.7 / 14.8 s above), so an idle dummy desktop cost nothing measurable. The MTP
+figures replace 193 / 105 tok/s from the slow session of the second integrated round, not a display
+gain.

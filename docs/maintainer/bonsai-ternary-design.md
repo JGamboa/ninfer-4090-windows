@@ -1141,9 +1141,9 @@ Next steps, in order:
 1. Done 2026-09-24 (section 9, "Draft-side experiments"): a 34816-row proposal head gains
    2.1 % on average but loses on Spanish prose, so the default stays 131072. The Q4/Q5 MTP
    layer that experiment could not start now has its routes (item 11); it awaits measurement.
-2. Measure decode with the monitor cable on the iGPU (motherboard output), the six prompts,
-   beside the 60 Hz figures of section 9. Expected: the ~2.2 ms of compositor stalls per round
-   disappear. Until then the display runs at 60 Hz.
+2. Done 2026-09-27 (item 32): with the monitor on the iGPU the 4090 is headless; Bonsai MTP 2
+   measures 217.9 tok/s (9.91 ms per round) on the six prompts. By then the 4090 drove only an
+   idle 4K60 dummy plug, which cost nothing measurable in prefill or tg128.
 3. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit with the
    cheaper t5 T = 4 round (0.86 of t2), or with an adaptive window.
 4. Prefill: recover the accepted t5 regression (pp512 -13 %) with a 64 x 128-token GEMM tile
@@ -2595,6 +2595,25 @@ Next steps, in order:
     - Against llama.cpp on the same machine with the same Qwen3.8 BF16 source (Q4_K_M GGUF):
       prefill 1.75-2.0x, decode without speculation 1.11-1.14x, with MTP 3 1.22-1.31x
       ([llama.cpp comparison](../llamacpp-comparison.md)).
+
+32. Absolute figures with the 4090 headless (`78479e72`, measured 2026-09-27). The monitor moved to
+    the i9-13900K's UHD 770 (`nvidia-smi` display_active Disabled, 0 MiB, P8 before each run); no
+    other GPU work. Two identical sessions; GPU during the busy samples: SM 2,695 MHz average (max
+    2,760), 374 W average (max 507), 61 C average (max 73).
+    - Decode, six prompts, MTP, greedy, thinking off, 512 tokens (the item-31 command), two rounds
+      per session: Bonsai MTP 2 217.8-217.9 tok/s (9.91 ms per round); Qwen3.8 A8 MTP 3 120.1-120.2
+      tok/s (22.51-22.53 ms).
+    - `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8`: Bonsai pp512 5,800-5,893, pp2048
+      6,108-6,113, tg128 128.5-128.9 tok/s; Qwen3.8 A8 pp512 5,307-5,312, pp2048 5,730-5,765, tg128
+      54.6 tok/s.
+    - `long_niah_64k` (rk4v4-e8, MTP, `--prefill-chunk 1024`): Bonsai 14.4 s, Qwen3.8 A8 14.9 s,
+      answers exact.
+    - Against the clean dummy-display runs (item 29 for Bonsai prefill, the Qwen3.8 rerun in
+      WINDOWS_PORT.md) prefill, tg128 and the 64K prompt are unchanged within noise, so the idle
+      4K60 dummy desktop cost nothing measurable there. The MTP figures are 13-14 % above item 31
+      because item 31 ran in a slow session (its tg128 was 114.2 / 47.7 against 128.7 / 54.6 here);
+      the Bonsai tg128 gain over item 29 (123.8 -> 128.7, +4 %) matches the item-30 decode fixes. An
+      MTP A/B with the dummy re-attached in one session was not run.
 
 ## Appendix: sources
 

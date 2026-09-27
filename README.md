@@ -6,9 +6,9 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **193 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
-| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,790 tok/s** |
-| **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 107 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **218 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **120 tok/s** | **289 tok/s** (MTP + n-gram) | **5,790 tok/s** |
+| **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
 The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
@@ -160,8 +160,9 @@ WebUI, the `openai` Python package) works with the same URL.
 ## Performance
 
 Conditions for every table: RTX 4090 at stock clocks, Core i9-13900K, Windows 11, driver 595.97,
-CUDA 13.4, greedy decoding unless noted. The same 4090 drives a 4K desktop at 60 Hz, which costs
-about 15 % of decode ([below](#when-the-4090-also-drives-the-display)).
+CUDA 13.4, greedy decoding unless noted. Since 2026-09-27 the monitor runs on the CPU's integrated
+graphics and the 4090 has no display; older rows say when the 4090 also drove the desktop, which
+costs up to 15-18 % of decode ([below](#when-the-4090-also-drives-the-display)).
 
 ### Ternary Bonsai 2 27B
 
@@ -170,13 +171,14 @@ machine:
 
 | Measurement | NInfer | Prism llama.cpp fork |
 |---|---:|---:|
-| Decode, no speculation (`tg128`) | **101 tok/s** | 77 tok/s |
-| Decode, MTP 2, mean of six mixed prompts | **193 tok/s** | — |
+| Decode, no speculation (`tg128`) | **129 tok/s** | — |
+| Decode, no speculation (`tg128`), 2026-09-24, monitor on the 4090 in both | **101 tok/s** | 77 tok/s |
+| Decode, MTP 2, mean of six mixed prompts, thinking off | **218 tok/s** | — |
 | Decode, MTP 2, prose / edit-style prompts | 167 / 250 tok/s | — |
 | Decode, MTP 2 + n-gram, edit-style prompts | **532 tok/s** | — |
 | Decode, three concurrent requests, aggregate | **360 tok/s** | — |
 | Prefill, `pp512` / `pp2048` | **5,793 / 6,027 tok/s** | 1,363 tok/s / — |
-| Prefill, 8K / 64K / 128K-token prompt (needle test, answer exact) | 1.3 s / 14.6 s / 37.4 s | — |
+| Prefill, 8K / 64K / 128K-token prompt (needle test, answer exact) | 1.3 s / 14.4 s / 37.4 s | — |
 | Perplexity, wikitext / code corpus | 8.087 / 1.895 | 8.178 / 1.899 |
 | Task quality, 45 deterministic tasks (`tools/eval`) | 43/45 | — |
 | Weights in VRAM (text / + vision) | 6.11 / 6.39 GiB | 5.53 GiB (text) |
@@ -185,17 +187,20 @@ machine:
   prompts (return a file, a JSON list or a document with a small change) restate their input.
 - Prism's model card says its PQ2_0 packing processes prompts faster than PTQ1_0, so part of the
   prefill gap is the file format.
-- The prefill rows were measured on 2026-09-27 (items 26-29); the decode rows and the Prism fork
-  comparison are from 2026-09-24/25, when the card also drove a real 4K monitor.
+- The `tg128`, six-prompt MTP 2 and 64K rows were measured on 2026-09-27 with the 4090 headless
+  (item 32); the other prefill rows on 2026-09-27 (items 26-29) with a 4K60 dummy display, which
+  measured the same. The Prism fork comparison, the prose / edit-style rows, n-gram and concurrent
+  decode are from 2026-09-24/25, when the card also drove a real 4K monitor.
 - Sources: [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md), section 9.1
-  (items 14-29).
+  (items 14-32).
 
 ### Qwen3.8-27B
 
 | Measurement | Result |
 |---|---:|
 | Decode, no speculation (`tg128`) | 54.7 tok/s |
-| Decode, MTP 3, mean of six mixed prompts, thinking on | 107 tok/s |
+| Decode, MTP 3, mean of six mixed prompts, thinking off | **120 tok/s** |
+| Decode, MTP 3, mean of six mixed prompts, thinking on (2026-09-25) | 107 tok/s |
 | Decode, MTP 3, code prompt, thinking off (server) | 149 tok/s |
 | Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
@@ -280,8 +285,9 @@ Requests and startup flags (`--temperature`, `--top-p`, ...) override them.
 If the RTX 4090 also drives your monitor, the Windows desktop compositor takes the GPU from CUDA on
 every frame. With a 3840x2160 desktop this cost 18 % of each MTP decode round at 120 Hz and 15 % at
 60 Hz. For the best decode speed, connect the monitor to the motherboard (integrated graphics) or
-another GPU; otherwise use 60 Hz and keep animated windows still while generating. Compare tok/s
-only between runs with the same display setup.
+another GPU; otherwise use 60 Hz and keep animated windows still while generating. A static
+desktop nobody uses (a dummy display plug at 4K60) cost nothing measurable in prefill or `tg128`.
+Compare tok/s only between runs with the same display setup.
 
 ## Benchmarking and validation
 
