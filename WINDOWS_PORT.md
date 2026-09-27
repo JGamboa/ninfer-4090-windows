@@ -1250,3 +1250,9 @@ checkpoint: llama.cpp `a894dae` with a Q4_K_M GGUF made here with `convert_hf_to
 | Decode, MTP 3, 30K-token document | 66.8 tok/s | 87.2 tok/s |
 
 Method and per-prompt figures: [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md).
+
+Clean rerun (2026-09-27, card cool and idle at 26 C, P8, no other work), Qwen3.8 A8 on the
+integrated build: `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8` pp512 5,339, pp2048 5,790,
+tg128 54.7 tok/s; `long_niah_64k` (rk4v4-e8, MTP 3) 14.8 / 14.9 s against 16.0 / 16.2 s for the
+2026.09.27 release binary, alternated, answers exact. The same-weights llama.cpp session above ran
+about 10 % slower in absolute terms for both engines; its ratios stand.

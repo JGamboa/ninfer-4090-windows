@@ -7,7 +7,7 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
 | **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **193 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
-| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,124 tok/s** |
+| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **107 tok/s** | **289 tok/s** (MTP + n-gram) | **5,790 tok/s** |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 107 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
@@ -194,15 +194,15 @@ machine:
 
 | Measurement | Result |
 |---|---:|
-| Decode, no speculation (`tg128`) | 47.0 tok/s (~95 % of the card's measured read bandwidth) |
+| Decode, no speculation (`tg128`) | 54.7 tok/s |
 | Decode, MTP 3, mean of six mixed prompts, thinking on | 107 tok/s |
 | Decode, MTP 3, code prompt, thinking off (server) | 149 tok/s |
 | Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
 | Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
-| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **4,777 / 5,124 tok/s** |
+| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **5,339 / 5,790 tok/s** |
 | Prefill, 8K / 64K / 128K-token prompt, official artifact (needle test, answer exact) | 2.9 s / 27.4-27.6 s / 64.0 s |
-| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.5 s / 16.5 s / 41.8 s** |
+| Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.5 s / 14.8 s / 41.8 s** |
 | Perplexity, quick four-corpus run, official / int8 artifact | 4.8007 / 4.7944 |
 | Task quality, 45 deterministic tasks (`tools/eval`) | 44/45 (2026-09-25); 45/45 on both artifacts (2026-09-26) |
 
@@ -223,8 +223,11 @@ KV and flash attention; NInfer int8-prefill artifact, int8 KV; measured 2026-09-
 | Decode, MTP 3 (six prompts) | 87.1 tok/s | **106.4 tok/s** | 1.22x |
 | Decode, MTP 3, 30K-token document | 66.8 tok/s | **87.2 tok/s** | 1.31x |
 
-Greedy, thinking off, 8-bit KV in both; every needle answer exact. Full method, per-prompt figures
-and the earlier comparisons: [docs/llamacpp-comparison.md](docs/llamacpp-comparison.md).
+Greedy, thinking off, 8-bit KV in both; every needle answer exact. Both engines ran in the same
+session, which was about 10 % slower in absolute terms than a cool, idle card: rerun alone later,
+the NInfer build measured `pp512` / `pp2048` 5,339 / 5,790 tok/s, `tg128` 54.7 tok/s and the 64K
+prompt in 14.8 s. Full method, per-prompt figures and the earlier comparisons:
+[docs/llamacpp-comparison.md](docs/llamacpp-comparison.md).
 
 ### Speculative decoding by workload
 
