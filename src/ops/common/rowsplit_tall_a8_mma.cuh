@@ -24,10 +24,12 @@
 // its integer and FP32 work. Tiles are ordered token-tile fastest, so the CTAs of one row block
 // run together and share its code bytes in L2.
 //
-// The grid holds one persistent CTA per SM, which walks the tiles tile, tile + gridDim.x, ...
+// A Persistent launch holds one CTA per SM, which walks the tiles tile, tile + gridDim.x, ...
 // (the order in which one-tile CTAs would start). Before a tile's epilogue, the CTA loads the
 // next tile's first code bytes and copies its first activation step into stage 0, and the
-// epilogue stages the outputs from stage 1 on, so that latency overlaps the epilogue.
+// epilogue stages the outputs from stage 1 on, so that latency overlaps the epilogue. The
+// folded SwiGLU and residual Q5 problems launch this way; the grouped projections measured
+// 2-3 % slower with it and keep one CTA per tile.
 
 #include "ops/common/rowsplit_tall_mma.cuh"
 
@@ -69,22 +71,28 @@ struct Config {
         float row[kStepGroups][kRows];
         float token[kStepGroups][Tokens];
     };
-    // A tile's epilogue stages its BF16 outputs from stage 1 on, while the CTA's next tile fills
-    // stage 0 and scale buffer 0; the scale buffers follow both.
-    static constexpr std::size_t kStagingOffset = sizeof(Stage);
+    // A tile's epilogue stages its BF16 outputs in the freed stages. A persistent CTA stages them
+    // from stage 1 on, while its next tile fills stage 0 and scale buffer 0, and places the
+    // scale buffers after both.
+    template <bool Persistent>
+    __host__ __device__ static constexpr std::size_t staging_offset() {
+        return Persistent ? sizeof(Stage) : 0;
+    }
     template <class Problem>
     __host__ __device__ static constexpr std::size_t staging_bytes() {
         return static_cast<std::size_t>(Tokens) * rowsplit_tall::kOutLd<Problem::kOutRows> *
                sizeof(__nv_bfloat16);
     }
-    template <class Problem>
+    template <class Problem, bool Persistent>
     __host__ __device__ static constexpr std::size_t scales_offset() {
-        constexpr std::size_t kEnd = kStagingOffset + staging_bytes<Problem>();
+        if constexpr (!Persistent) { return 2 * sizeof(Stage); }
+        constexpr std::size_t kEnd = staging_offset<true>() + staging_bytes<Problem>();
         return ((kEnd > 2 * sizeof(Stage) ? kEnd : 2 * sizeof(Stage)) + 127) / 128 * 128;
     }
-    template <class Problem>
+    template <class Problem, bool Persistent>
     static constexpr std::size_t shared_bytes() {
-        return scales_offset<Problem>() + 3 * sizeof(Scales);
+        return std::max(scales_offset<Problem, Persistent>() + 3 * sizeof(Scales),
+                        staging_offset<Persistent>() + staging_bytes<Problem>());
     }
 };
 
@@ -108,7 +116,7 @@ __device__ __forceinline__ unsigned with_q5_high(unsigned bytes, unsigned high) 
 template <class Problem>
 concept QuantizingProblem = requires { Problem::kQuantizesOutput; };
 
-template <int Tokens, class Problem>
+template <int Tokens, bool Persistent, class Problem>
 __global__ void __launch_bounds__(kThreads, 1)
     rowsplit_tall_a8_kernel(const std::int8_t* __restrict__ qx,
                             const float* __restrict__ x_scale, Problem problem, std::int32_t k,
@@ -120,7 +128,8 @@ __global__ void __launch_bounds__(kThreads, 1)
     constexpr int MT = Cfg::MT;
     extern __shared__ __align__(128) std::uint8_t tall_a8_smem[];
     Stage* stages  = reinterpret_cast<Stage*>(tall_a8_smem);
-    constexpr std::size_t kScalesOffset = Cfg::template scales_offset<Problem>();
+    constexpr std::size_t kScalesOffset = Cfg::template scales_offset<Problem, Persistent>();
+    constexpr std::size_t kStagingOffset = Cfg::template staging_offset<Persistent>();
     Scales* scales = reinterpret_cast<Scales*>(tall_a8_smem + kScalesOffset);
 
     const int tid       = static_cast<int>(threadIdx.x);
@@ -136,9 +145,9 @@ __global__ void __launch_bounds__(kThreads, 1)
 
     // The CTA's current tile; set_tile() points the decode and staging state at it.
     int tile = static_cast<int>(blockIdx.x);
-    int row_block, token0, live;
-    bool q5;
-    RowSource src;
+    int row_block = 0, token0 = 0, live = 0;
+    bool q5       = false;
+    RowSource src{};
 
     // Decode item: weight row tid / 2 of the tile, group tid % 2 of each step (its 32 code bytes
     // are the int8 chunks 4 (tid % 2) .. + 3 of the row).
@@ -213,7 +222,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     const int x_token = tid >> 3;
     std::uint32_t x_off[kXChunks];
     const int scale_token = tid % Tokens;
-    std::uint32_t scale_off;
+    std::uint32_t scale_off = 0;
     const auto set_tile = [&](int t) {
         row_block = t / token_tiles;
         token0    = t % token_tiles * Tokens;
@@ -373,20 +382,22 @@ __global__ void __launch_bounds__(kThreads, 1)
         const int out_token0    = token0;
         const int out_live      = live;
         tile += static_cast<int>(gridDim.x);
-        const bool more = tile < total_tiles;
-        if (more) {
-            set_tile(tile);
-            load(0);
-            issue_x(0, stages[0], scales[0]);
+        const bool more = Persistent && tile < total_tiles;
+        if constexpr (Persistent) {
+            if (more) {
+                set_tile(tile);
+                load(0);
+                issue_x(0, stages[0], scales[0]);
+            }
+            cp_commit();
         }
-        cp_commit();
 
         // Epilogue: the problem stages bf16 outputs as [token][row] in shared memory, then writes
         // 16-byte row chunks of each live token (a quantizing problem is called for every token, so
         // the lanes of a token can reduce across the chunks; it stores only the live ones).
         constexpr int kOutRows = Problem::kOutRows;
         constexpr int kLd      = rowsplit_tall::kOutLd<kOutRows>;
-        __nv_bfloat16* staged = reinterpret_cast<__nv_bfloat16*>(tall_a8_smem + Cfg::kStagingOffset);
+        __nv_bfloat16* staged = reinterpret_cast<__nv_bfloat16*>(tall_a8_smem + kStagingOffset);
         problem.template stage_outputs<MT>(acc, staged, kLd, wm * Cfg::kWarpRows, wn * 32, lane);
         __syncthreads();
         constexpr int kChunks = kOutRows / 8;
@@ -412,17 +423,18 @@ __global__ void __launch_bounds__(kThreads, 1)
 
 // Launches `row_blocks` 128-row blocks by ceil(tokens / Tokens) token tiles, token tile fastest,
 // over an activation quantized by rowsplit_a8_quantize for this `k` and `tokens`. The problem's
-// weights must have k == padded_k, a multiple of 128 (every Qwen3.8 projection input).
-template <int Tokens, class Problem>
+// weights must have k == padded_k, a multiple of 128 (every Qwen3.8 projection input). With
+// Persistent, one CTA per SM walks the tiles; otherwise each CTA runs one tile.
+template <int Tokens, bool Persistent, class Problem>
 void launch(const Problem& problem, std::int32_t row_blocks, const std::int8_t* qx,
             const float* x_scale, std::int32_t k, std::int32_t tokens, cudaStream_t stream) {
     if (k <= 0 || k % kStepK != 0 || tokens <= 0 ||
         static_cast<std::int64_t>(tokens) * k > static_cast<std::int64_t>(UINT32_MAX)) {
         throw std::invalid_argument("rowsplit A8 pipelined GEMM: unsupported k or width");
     }
-    constexpr std::size_t kSmem = Config<Tokens>::template shared_bytes<Problem>();
+    constexpr std::size_t kSmem = Config<Tokens>::template shared_bytes<Problem, Persistent>();
     static const bool opted_in  = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(rowsplit_tall_a8_kernel<Tokens, Problem>,
+        CUDA_CHECK(cudaFuncSetAttribute(rowsplit_tall_a8_kernel<Tokens, Persistent, Problem>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(kSmem)));
         return true;
@@ -433,10 +445,9 @@ void launch(const Problem& problem, std::int32_t row_blocks, const std::int8_t* 
     if (total_tiles > INT32_MAX) {
         throw std::invalid_argument("rowsplit A8 pipelined GEMM: too many tiles");
     }
-    // One persistent CTA per SM walks the tiles in launch order.
-    const unsigned grid =
-        static_cast<unsigned>(std::min<std::int64_t>(total_tiles, device_sm_count()));
-    rowsplit_tall_a8_kernel<Tokens, Problem><<<grid, kThreads, kSmem, stream>>>(
+    const unsigned grid = static_cast<unsigned>(
+        Persistent ? std::min<std::int64_t>(total_tiles, device_sm_count()) : total_tiles);
+    rowsplit_tall_a8_kernel<Tokens, Persistent, Problem><<<grid, kThreads, kSmem, stream>>>(
         qx, x_scale, problem, k, tokens, token_tiles, static_cast<std::int32_t>(total_tiles));
     CUDA_CHECK(cudaGetLastError());
 }

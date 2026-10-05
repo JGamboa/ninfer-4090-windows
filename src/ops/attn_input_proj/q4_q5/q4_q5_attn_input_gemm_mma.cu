@@ -166,9 +166,9 @@ void q4_q5_attn_input_a8_mixed_pipelined_r128_c128_launch(const A8G64Activation&
                                                           const Weight& w0, const Weight& w1,
                                                           Tensor& q, Tensor& g, Tensor& k,
                                                           Tensor& v, cudaStream_t stream) {
-    rowsplit_tall_a8::launch<128>(tall_problem(w0, w1, q, g, k, v), 14336 / 128,
-                                  static_cast<const std::int8_t*>(x.q.data),
-                                  static_cast<const float*>(x.scale.data), x.q.ne[0], x.q.ne[1],
-                                  stream);
+    rowsplit_tall_a8::launch<128, false>(tall_problem(w0, w1, q, g, k, v), 14336 / 128,
+                                         static_cast<const std::int8_t*>(x.q.data),
+                                         static_cast<const float*>(x.scale.data), x.q.ne[0],
+                                         x.q.ne[1], stream);
 }
 } // namespace ninfer::ops::detail

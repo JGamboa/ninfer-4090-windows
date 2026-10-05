@@ -112,10 +112,10 @@ void q4_q5_gdn_input_a8_grouped_mma_launch(const A8G64Activation& x, const Weigh
                                            const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                                            cudaStream_t stream) {
     const auto problem = tall_problem(qk_weight, value_z_weight, qkv, z);
-    rowsplit_tall_a8::launch<128>(problem, row_blocks(problem),
-                                  static_cast<const std::int8_t*>(x.q.data),
-                                  static_cast<const float*>(x.scale.data), x.q.ne[0], x.q.ne[1],
-                                  stream);
+    rowsplit_tall_a8::launch<128, false>(problem, row_blocks(problem),
+                                         static_cast<const std::int8_t*>(x.q.data),
+                                         static_cast<const float*>(x.scale.data), x.q.ne[0],
+                                         x.q.ne[1], stream);
 }
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
