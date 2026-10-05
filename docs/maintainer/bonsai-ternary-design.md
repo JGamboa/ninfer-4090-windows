@@ -2615,6 +2615,67 @@ Next steps, in order:
       the Bonsai tg128 gain over item 29 (123.8 -> 128.7, +4 %) matches the item-30 decode fixes. An
       MTP A/B with the dummy re-attached in one session was not run.
 
+34. Prefill round 3 (`b22c8845`, `869cb924`, measured 2026-10-05, RTX 4090 headless, CUDA 13.4,
+    driver 617.14; base `46e41f1b`). Nsight Compute was unavailable (ERR_NVGPUCTRPERM: the GPU
+    performance-counter permission is off again), so kernel questions were answered with timed
+    variants. The Qwen3.8 side, with its tables, is in WINDOWS_PORT.md, "Prefill round 3".
+    - Fresh profile (measured, nsys, base binaries, `--prefill-chunk 1024`, rk4v4-e8, MTP; share of
+      the prefill kernel time, GPU busy 98.5-99.1 %):
+
+      | Family | Bonsai 64K | Bonsai 8K | Qwen3.8 A8 64K | Qwen3.8 A8 8K |
+      |---|---:|---:|---:|---:|
+      | Projection GEMMs (t5 / A8 Q4-Q5) | 62.9 % | 80.5 % | 66.4 % | 83.8 % |
+      | Prompt attention | 26.4 % | 5.0 % | 25.8 % | 4.8 % |
+      | GDN chunked recurrence | 4.3 % | 5.7 % | 4.3 % | 5.5 % |
+      | Activation quantization | 3.5 % | 4.5 % | 0.6 % | 0.8 % |
+      | Norms, conv, other | 2.9 % | 4.3 % | 2.9 % | 5.1 % |
+
+      Bonsai quantization per call: SwiGLU input 55-66 us, RMSNorm input 19 us, plain K = 6144
+      14-16 us. The GDN gated RMSNorm takes 22.9 us per layer and chunk in both models.
+    - Not built, estimated from that profile: fusing the GDN gated RMSNorm with its out_proj
+      quantization saves at most the quantization pass, ~17 us x 48 layers per chunk for Bonsai
+      (51 ms of 14.05 s at 64K, 0.36 %) and ~6 us for Qwen3.8 (0.12 %).
+    - Adopted (Qwen3.8 only; the t5 GEMM is untouched): the A8 GEMM's folded SwiGLU and 128-token
+      residual Q5 tiles run one persistent CTA per SM that prepares its next tile's first step
+      during the epilogue. Op benches (cold L2, T = 1024 / 2048, measured): gate+up 975 -> 968 /
+      1934 -> 1909 us, down 688 -> 646 / 1163 -> 1092 us, o_proj/out_proj 267-279 -> 261 /
+      446-465 -> 435 us. End to end, alternated: Qwen3.8 pp2048 +2.2 %, `long_niah_64k` 15.0 /
+      14.9 -> 14.7 / 14.7 s; Bonsai pp512, pp2048 and `long_niah_64k` (14.3-14.4 s) unchanged.
+    - Checks: `ninfer_linear_t5_test` and the five A8 suites pass; quick perplexity bitwise equal
+      (Bonsai 5.854904, Qwen3.8 A8 4.794439; `report.json` identical apart from timings); greedy
+      MTP text (256 tokens, thinking off; three short prompts and a 1.1K-token one) identical on
+      base and new for both models; every NIAH answer exact.
+    - Measured, not adopted (A8 GEMM, cold L2, T = 1024 unless stated):
+      - 16 warps per CTA (32 x 32 warp tiles, four warps per scheduler, 128 registers): gate+up
+        1033 -> 1289 us, down 686 -> 776, GDN in_proj 543 -> 620 (+13 to +25 %).
+      - Applying each 16-row tile's FP32 update right after issuing the next tile's MMAs: +1 to
+        +7 % with the ping/pong offset, +17 to +30 % with all warps in the same order.
+      - Converting the int32 group sums with I2F instead of the magic-number FADD (all or half of
+        the outputs): 0 to +10 %.
+      - Mixed 128/64-token tiles in one launch (as item 26) chosen by a makespan model: the merged
+        kernel ran its 64-token tiles ~20 % slower (down T = 512 400 -> 490 us), no split beat the
+        pure 128-token tiles at T = 1024 (down 712 against 723-850 us), and `__noinline__` tile
+        bodies were 35 % slower.
+      - Persistent CTAs for the grouped problem (qkvg +2 %, GDN in_proj within noise) and the
+        64-token residual tiles (~+1 %).
+      - t5: multiplying by three with IADD instead of IMAD in the trit decode (60 fewer IMADs per
+        loop): within 0.5 % (noise).
+    - Where the A8 GEMM time goes (temporary variants with invalid outputs, gate+up T = 1024,
+      base 1021 us in that session): without MMAs 785 us, with a one-FADD update instead of
+      FMUL + FADD + FFMA 853 us, MMAs and staging only 811 us (66 % of the IMMA peak); in another
+      session, without the epilogue 940 against 975 us.
+      A probe of the same ldmatrix-fed 64 x 32 warp tiles reaches 682 TOPS with register
+      operands, 631 TOPS (92 %) with a one-FADD update and 486-489 TOPS (71 %) with the exact
+      per-group update in every schedule tried (sequential, ping/pong, per-tile pipelining, two
+      sum sets); dropping only the FMUL gives 571 TOPS. The exact update (three FP32 instructions
+      per output and 64-column group) therefore caps this arithmetic near 71 % of the IMMA peak;
+      the kernel is at ~52 %, the rest being decode, barriers, staging and the epilogue.
+    - Remaining headroom (estimated): the t5 GEMM's epilogue costs 4.6 % (gate+up), 3 % (GDN
+      in_proj), 2.3 % (qkvg) and < 2 % (5120-row weights) of those kernels at T = 1024
+      (measured by removing it); a persistent t5 GEMM would need a split epilogue, because the
+      FP32 staging uses all 67 KB of stage memory. Prompt attention (~26 % at 64K) and the GDN
+      state passing (2 %, 1.5 waves of 48 x 8 CTAs on 128 SMs) were not reworked this round.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
