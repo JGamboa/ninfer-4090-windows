@@ -1642,6 +1642,47 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     return failures;
 }
 
+// Agent clients resend every earlier image with each turn, so the scratchpad cap must bound one
+// item: a conversation whose images sum past vision_max_tokens stays admissible, while one item
+// over the cap is rejected before it reaches the encoder.
+int test_vision_max_tokens_bounds_each_item() {
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.max_context       = 65'536;
+    options.vision_max_tokens = 1'024;
+    const Frontend frontend   = make_frontend(resources(), options);
+
+    constexpr std::size_t kItems          = 4;
+    constexpr std::uint64_t kItemTokens   = 32 * 24;
+    const std::vector<std::uint8_t> bytes = block_ppm(1024, 768, 127);
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    for (std::size_t index = 0; index < kItems; ++index) {
+        ninfer::OwnedMedia media;
+        media.kind        = ninfer::MediaKind::Image;
+        media.bytes       = bytes;
+        media.media_type  = "image/x-portable-pixmap";
+        media.source_name = "history-" + std::to_string(index) + ".ppm";
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Media, .text = {}, .media = std::move(media)});
+    }
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data    = FrontendFactory::inspect(prepared);
+    int failures        = check(data.prepare.vision_tokens == kItems * kItemTokens &&
+                                    data.vision_items.size() == kItems,
+                                "vision_max_tokens capped the aggregate prompt instead of each item");
+
+    try {
+        (void)frontend.prepare(image_text_input(block_ppm(1280, 1024, 127), {}, "over-item.ppm"));
+        failures += check(false, "an item over vision_max_tokens was admitted");
+    } catch (const ninfer::RequestError& error) {
+        failures += check(error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded,
+                          "an item over vision_max_tokens used the wrong request-error kind");
+    }
+    return failures;
+}
+
 int test_multimodal_prompt_over_removed_32k_cap(const Frontend& frontend) {
     const std::string long_text(40'000, 'x');
     const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
@@ -2396,6 +2437,7 @@ int main() {
     failures += test_explicit_leading_instruction_cache_boundary();
     failures += test_automatic_private_anchor_opportunities();
     failures += test_media_admission_uses_aggregate_resources(frontend);
+    failures += test_vision_max_tokens_bounds_each_item();
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);

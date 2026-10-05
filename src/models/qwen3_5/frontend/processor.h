@@ -91,8 +91,12 @@ struct ProcessorOptions {
     std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
     int max_video_source_frames            = 100'000;
     double max_video_duration_seconds      = 600.0;
+    // Raw-patch and Vision-token budgets are aggregate per prompt; the item budgets bound one
+    // media item, which is what one Vision encode must hold.
     std::uint64_t max_raw_patches          = kMaximumPromptVisionRawPatches;
     std::uint64_t max_vision_tokens        = kMaximumPromptVisionTokens;
+    std::uint64_t max_item_raw_patches     = kMaximumVisionItemRawPatches;
+    std::uint64_t max_item_vision_tokens   = kMaximumVisionItemTokens;
     double video_fps                       = 2.0;
     int video_min_frames                   = 4;
     int video_max_frames                   = 768;

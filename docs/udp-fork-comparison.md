@@ -127,7 +127,12 @@ green 84/84 suite on their side. Disposition per group:
   (`fix(frontend)` follow-up commit), so the failure is a clean
   `media_budget_exceeded`. With the port, `rk4v4-e8` serves the full native
   262,144 context with `--vision` at 780 MiB slack - the 208K practical line and
-  the vision-against-context tradeoff are gone.
+  the vision-against-context tradeoff are gone. Correction: the Vision tower
+  encodes one item at a time, so `--vision-max-tokens` now bounds each item and
+  the aggregate prompt budget is back at `min(--max-context, 32768)` (port of
+  sergiuszm/ninfer-4090@328d9aa8). The aggregate wiring rejected agent
+  conversations after about ten screenshots, because clients send every earlier
+  image again with each turn.
 - **CUDA-graph allowance tightening (c85db47a): skipped.** They replace their old
   1 GiB SM86/SM89 per-lane padding with flat 64 MiB (ordinary) / 256-320 MiB (MTP)
   allowances. This branch already carries the per-topology-class accounting, which

@@ -592,16 +592,20 @@ public:
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
-        // The vision encode workspace is sized to vision_max_tokens; keep the processor
-        // budget in lockstep so oversized media fails as MediaBudgetExceeded before it
-        // reaches the encoder. Zero leaves the cap derived from max_context.
-        std::uint64_t vision_tokens =
+        const std::uint64_t vision_tokens =
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
-        if (options.vision_max_tokens > 0) {
-            vision_tokens = std::min<std::uint64_t>(vision_tokens, options.vision_max_tokens);
-        }
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        // The Vision tower encodes one item at a time into a workspace sized to
+        // vision_max_tokens, so that cap bounds each item, not the prompt. Earlier images in a
+        // conversation stay within the aggregate budget above. Zero keeps the registered
+        // single-item capacity.
+        std::uint64_t item_tokens = kMaximumVisionItemTokens;
+        if (options.vision_max_tokens > 0) {
+            item_tokens = std::min<std::uint64_t>(item_tokens, options.vision_max_tokens);
+        }
+        processor.max_item_vision_tokens = item_tokens;
+        processor.max_item_raw_patches   = item_tokens * kRawPatchesPerVisionToken;
         if (vision_enabled) {
             const std::uint64_t minimum_live =
                 processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);

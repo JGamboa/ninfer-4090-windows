@@ -25,9 +25,10 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
-    // Vision scratchpad token capacity. This fork keeps the legacy 32K scratchpad next to the
-    // full context, so the cap stays configurable. Zero derives the cap from max_context;
-    // production paths normalize an unset value to 8192 in planning/startup.cpp.
+    // Vision scratchpad token capacity, which bounds each media item (the tower encodes one item
+    // at a time). The aggregate prompt budget stays min(max_context, 32768). Zero keeps the
+    // registered single-item capacity; production paths normalize an unset value to 8192 in
+    // planning/startup.cpp.
     std::uint32_t vision_max_tokens = 0;
 };
 
