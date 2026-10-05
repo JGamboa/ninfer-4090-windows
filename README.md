@@ -6,8 +6,8 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **218 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
-| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **120 tok/s** | **289 tok/s** (MTP + n-gram) | **5,790 tok/s** |
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **227 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **120 tok/s** | **289 tok/s** (MTP + n-gram) | **5,860 tok/s** |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
@@ -171,9 +171,10 @@ machine:
 
 | Measurement | NInfer | Prism llama.cpp fork |
 |---|---:|---:|
-| Decode, no speculation (`tg128`) | **129 tok/s** | — |
+| Decode, no speculation (`tg128`) | **133 tok/s** | — |
 | Decode, no speculation (`tg128`), 2026-09-24, monitor on the 4090 in both | **101 tok/s** | 77 tok/s |
-| Decode, MTP 2, mean of six mixed prompts, thinking off | **218 tok/s** | — |
+| Decode, MTP 2, mean of six mixed prompts, thinking off | **227 tok/s** | — |
+| Decode, MTP 3, mean of six mixed prompts, thinking off | **229 tok/s** | — |
 | Decode, MTP 2, prose / edit-style prompts | 167 / 250 tok/s | — |
 | Decode, MTP 2 + n-gram, edit-style prompts | **532 tok/s** | — |
 | Decode, three concurrent requests, aggregate | **360 tok/s** | — |
@@ -187,12 +188,12 @@ machine:
   prompts (return a file, a JSON list or a document with a small change) restate their input.
 - Prism's model card says its PQ2_0 packing processes prompts faster than PTQ1_0, so part of the
   prefill gap is the file format.
-- The `tg128`, six-prompt MTP 2 and 64K rows were measured on 2026-09-27 with the 4090 headless
-  (item 32); the other prefill rows on 2026-09-27 (items 26-29) with a 4K60 dummy display, which
+- The `tg128`, six-prompt MTP 2/3 and 64K rows were measured on 2026-10-05 with the 4090
+  headless (items 32-35); the other prefill rows on 2026-09-27 (items 26-29) with a 4K60 dummy display, which
   measured the same. The Prism fork comparison, the prose / edit-style rows, n-gram and concurrent
   decode are from 2026-09-24/25, when the card also drove a real 4K monitor.
 - Sources: [Bonsai design notes](docs/maintainer/bonsai-ternary-design.md), section 9.1
-  (items 14-32).
+  (items 14-35).
 
 ### Qwen3.8-27B
 
@@ -205,7 +206,7 @@ machine:
 | Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
 | Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
-| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **5,339 / 5,790 tok/s** |
+| Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **5,340 / 5,830-5,890 tok/s** |
 | Prefill, 8K / 64K / 128K-token prompt, official artifact (needle test, answer exact) | 2.9 s / 27.4-27.6 s / 64.0 s |
 | Prefill, 8K / 64K / 128K-token prompt, int8 artifact (needle test, answer exact) | **1.5 s / 14.8 s / 41.8 s** |
 | Perplexity, quick four-corpus run, official / int8 artifact | 4.8007 / 4.7944 |

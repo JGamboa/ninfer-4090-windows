@@ -2771,6 +2771,29 @@ Next steps, in order:
       FP32 staging uses all 67 KB of stage memory. Prompt attention (~26 % at 64K) and the GDN
       state passing (2 %, 1.5 waves of 48 x 8 CTAs on 128 SMs) were not reworked this round.
 
+35. Items 33 and 34 together (merge `9db6f6a7`, measured 2026-10-05, RTX 4090 headless, no other
+    GPU work). Base: the 2026.10.04 release binaries (`46e41f1b`); the base `ninfer_bench` is the
+    2026-09-27 build (no kernel change since).
+    - Checks: `linear_t5`, `gated_delta_net`, `gated_delta_net_replay_record`, `gdn_replay_fold`,
+      `rmsnorm`, `softmax_attention`, `linear_swiglu_q4_a8`, `linear_add_q5_a8`,
+      `rmsnorm_swiglu_mlp_q4_q5`, `gdn_input_proj` and `attn_input_proj` pass. Quick perplexity is
+      bitwise equal (Bonsai 5.854904, Qwen3.8 A8 4.794439). Greedy text (stdout md5) is identical
+      on base and new for 24 runs: Bonsai MTP 2 and 3 and Qwen3.8 MTP 3, four prompts each (one of
+      ~1.1K tokens), with and without `--ngram chain`.
+    - Decode, six prompts, MTP, greedy, thinking off, 512 tokens, alternated (base, new, new,
+      base): Bonsai MTP 2 215.8 / 215.9 -> 226.8 / 226.8 tok/s (10.005 -> 9.523 ms per round,
+      -4.8 %); Bonsai MTP 3 210.0 / 210.0 -> 229.3 / 229.3 tok/s (11.388 -> 10.431 ms); Qwen3.8 MTP
+      3 118.2 / 118.2 -> 118.5 / 118.4 tok/s.
+    - `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8`, alternated: Bonsai tg128 127.4 / 127.5
+      -> 133.5 / 133.5 tok/s, pp512 / pp2048 unchanged within noise (5,762-5,835 / 6,089-6,090 ->
+      5,775-5,802 / 6,071-6,082); Qwen3.8 A8 pp2048 5,745 / 5,713 -> 5,825 / 5,891 tok/s, pp512
+      5,326 / 5,313 -> 5,334 / 5,348, tg128 53.7 both.
+    - NIAH prefill (rk4v4-e8, chunk 1024, MTP, alternated, all answers exact): Bonsai 8K 1.3 s and
+      64K 14.5-14.6 s on both; Qwen3.8 A8 8K 1.4 s on both, 64K 15.1 / 15.1 -> 14.9 / 14.9 s.
+    - With these changes Bonsai MTP 3 is faster than MTP 2 on the six prompts (229.3 against
+      226.8 tok/s); the launcher default stays MTP 2 until prose and server workloads are
+      re-measured (next step 3).
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf

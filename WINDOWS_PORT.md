@@ -1368,3 +1368,19 @@ exact per-group FP32 update (FMUL, FADD, FFMA per output and 64-column group), w
 schedule. The kernel runs at ~52 % of the IMMA peak, so up to ~1.35x remains in decode, barriers,
 staging and the epilogue, not in the MMA issue order. Prompt attention is a quarter of the prefill
 at 64K and was not reworked.
+
+## Third integrated round (merge `9db6f6a7`, 2026-10-05)
+
+The second decode-round pass and prefill round 3 were verified together against the 2026.10.04
+release binaries on the 4090 with no display (Bonsai design notes, section 9.1, item 35): eleven
+op suites pass, quick perplexity is bitwise equal, greedy text is identical on 24 runs (Bonsai MTP 2
+and 3, Qwen3.8 MTP 3, with and without n-gram), every needle answer exact. Measured, alternated:
+
+| Measurement | Base | New |
+|---|---:|---:|
+| Bonsai MTP 2, six prompts | 215.8 / 215.9 tok/s | 226.8 / 226.8 tok/s |
+| Bonsai MTP 3, six prompts | 210.0 / 210.0 tok/s | 229.3 / 229.3 tok/s |
+| Bonsai `tg128` | 127.4 / 127.5 tok/s | 133.5 / 133.5 tok/s |
+| Qwen3.8 A8 MTP 3, six prompts | 118.2 / 118.2 tok/s | 118.5 / 118.4 tok/s |
+| Qwen3.8 A8 `pp2048` | 5,745 / 5,713 tok/s | 5,825 / 5,891 tok/s |
+| Qwen3.8 A8 `long_niah_64k` | 15.1 / 15.1 s | 14.9 / 14.9 s |
