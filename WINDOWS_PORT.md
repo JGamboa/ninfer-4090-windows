@@ -1273,3 +1273,26 @@ Prefill, `tg128` and the 64K prompt match the clean runs with the 4K60 dummy dis
 (Qwen3.8 5,790 / 54.7 / 14.8 s above), so an idle dummy desktop cost nothing measurable. The MTP
 figures replace 193 / 105 tok/s from the slow session of the second integrated round, not a display
 gain.
+
+## Second decode-round pass (2026-10-05)
+
+Branch `perf/bonsai-decode-round2` (base `46e41f1b`), RTX 4090 headless, CUDA 13.4. The t5 GEMV
+changes (weight prefetch from the quantization, a GEMV-friendly activation layout, one row per
+half-warp for the tall weights, paired slice-sum loads) are Bonsai-only; details in the Bonsai
+design notes, section 9.1, item 33. The one shared change, `b7966e37`, stages the small-T BF16
+attention queries in 16-byte chunks (partial kernel 14.5 -> 11.6 us per call under nsys).
+
+Measured, six prompts, 512 tokens, greedy, thinking off, base and new alternated (base, new, new,
+base); text md5 and MTP rounds identical for every prompt; quick perplexity (bf16 KV) bitwise equal
+(Qwen3.8 A8 4.794438838878608, Bonsai 5.854903518575322):
+
+| Six prompts | Base | New |
+|---|---|---|
+| Qwen3.8 A8 MTP 3, tok/s (ms per round) | 118.3 / 118.2 (22.884) | 118.5 / 118.4 (22.841, -0.2 %) |
+| Qwen3.8 A8 MTP 3 + `--ngram chain`, two prompts | 96.8 tok/s (22.889) | 97.0 tok/s (22.854) |
+| Bonsai MTP 2, tok/s (ms per round) | 215.7 / 215.8 (10.009) | 226.7 / 226.7 (9.526, -4.8 %) |
+| Bonsai MTP 3, tok/s (ms per round) | 210.0 / 210.0 (11.389) | 229.2 / 229.3 (10.432, -8.4 %) |
+
+This session's base ran below item 32's 217.9 / 120.2 tok/s, so compare within the table. Qwen3.8's
+decode round has no t5 weights; its remaining headroom is the one listed in the decode round audit
+above.

@@ -59,11 +59,22 @@ __device__ __forceinline__ void store_row(OutputRow out, int token, float value,
     *p = __float2bfloat16_rn(accumulate ? value + __bfloat162float(*p) : value);
 }
 
+// Position of activation word `word` (columns 4 word .. 4 word + 3 of a token row) in the GEMV
+// layout: each run of 16 units (1024 columns) stores its 16-byte chunks chunk-major, [chunk
+// 0..3][unit 0..15], so the 16 lanes of a GEMV half-warp, which read the same chunk of 16
+// consecutive units, load 256 contiguous bytes instead of 16 chunks 64 bytes apart.
+__device__ __forceinline__ int gemv_word(int word) {
+    const int unit = word >> 4, chunk = (word >> 2) & 3;
+    return (unit >> 4) * 256 + chunk * 64 + (unit & 15) * 4 + (word & 3);
+}
+
 // One warp quantizes one (token, 128-column group); lane l holds columns 4 l .. 4 l + 3 in
-// `value` and writes activation word l. q = rint(x * 127 / amax), scale = amax / 127 (zero for
-// an all-zero group), then the sums of q per 32-column slice (eight lanes) and per group.
+// `value` and writes activation word l (natural order, or the GEMV layout above). q = rint(x *
+// 127 / amax), scale = amax / 127 (zero for an all-zero group), then the sums of q per 32-column
+// slice (eight lanes) and per group.
 __device__ __forceinline__ void quantize_group(const float (&value)[4], int lane, int token,
-                                               int group, int k, std::uint32_t* __restrict__ qx,
+                                               int group, int k, bool gemv_layout,
+                                               std::uint32_t* __restrict__ qx,
                                                float* __restrict__ group_scale,
                                                int* __restrict__ group_sum,
                                                int* __restrict__ slice_sum) {
@@ -84,7 +95,8 @@ __device__ __forceinline__ void quantize_group(const float (&value)[4], int lane
         sum += q;
     }
     const std::int64_t groups = k / 128;
-    qx[(std::int64_t(token) * k + group * 128) / 4 + lane] = word;
+    const int index = group * 32 + lane;
+    qx[std::int64_t(token) * (k / 4) + (gemv_layout ? gemv_word(index) : index)] = word;
 #pragma unroll
     for (int offset = 1; offset < 8; offset <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
     if ((lane & 7) == 0) slice_sum[std::int64_t(token) * (k / 32) + group * 4 + (lane >> 3)] = sum;
@@ -265,13 +277,38 @@ __device__ __forceinline__ void rotate_block(float (&value)[4],
     value[3]             = rotated.w * 0x1p-5f;
 }
 
-// Grid: (K / 1024, T) CTAs, or (1, T) with `whole_row` (token-state prologues only).
+// The leading code lines and scale lines of the weight that a decode-width quantization asks L2
+// for (prefetch.global.L2, one request per 128-byte line). The GEMV that follows reads them
+// first (CTAs start in row order), so DRAM streams its first rows while the quantization runs
+// instead of idling until the GEMV's first loads. Lines are counted from 128-byte-aligned bases.
+struct WeightPrefetch {
+    const char* codes;
+    const char* scales;
+    unsigned code_lines;
+    unsigned scale_lines;
+};
+
+// Grid: (K / 1024, T) CTAs, or (1, T) with `whole_row` (token-state prologues only). For the
+// GEMV (`gemv`, T <= 4) the activation words take the GEMV layout and one more row of gridDim.x
+// CTAs (blockIdx.y == tokens) only issues `prefetch` and exits.
 template <class Input, bool Rotate>
 __global__ void __launch_bounds__(kQuantizeThreads)
     quantize_kernel(Input input, const __nv_bfloat16* __restrict__ signs, int k, bool whole_row,
                     std::uint32_t* __restrict__ qx, float* __restrict__ group_scale,
-                    int* __restrict__ group_sum, int* __restrict__ slice_sum) {
+                    int* __restrict__ group_sum, int* __restrict__ slice_sum, int tokens, bool gemv,
+                    WeightPrefetch prefetch) {
     __shared__ __align__(16) float values[Rotate ? kQuantizeBlock : 1];
+    if (static_cast<int>(blockIdx.y) >= tokens) {
+        const unsigned threads = gridDim.x * blockDim.x;
+        const unsigned first   = blockIdx.x * blockDim.x + threadIdx.x;
+        for (unsigned line = first; line < prefetch.code_lines; line += threads) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch.codes + 128ull * line));
+        }
+        for (unsigned line = first; line < prefetch.scale_lines; line += threads) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch.scales + 128ull * line));
+        }
+        return;
+    }
     const int tid                   = static_cast<int>(threadIdx.x);
     const int token                 = static_cast<int>(blockIdx.y);
     const typename Input::Token state = input.prepare(k, token);
@@ -282,7 +319,7 @@ __global__ void __launch_bounds__(kQuantizeThreads)
         float value[4];
         input(k, token, column, state, value);
         if constexpr (Rotate) { rotate_block(value, signs + block * kQuantizeBlock, tid, values); }
-        quantize_group(value, tid & 31, token, column / 128, k, qx, group_scale, group_sum,
+        quantize_group(value, tid & 31, token, column / 128, k, gemv, qx, group_scale, group_sum,
                        slice_sum);
     }
 }
@@ -338,25 +375,23 @@ __device__ __forceinline__ void decode_unit(const std::uint32_t (&a)[4], std::ui
 }
 
 // ---------------------------------------------------------------------------------------------
-// dp4a GEMV for decode and single-lane MTP verification (T <= 4). A CTA of two warps owns eight
-// rows: each half-warp two rows, its 16 lanes striding the units (K / 64 is a multiple of 16, so
+// dp4a GEMV for decode and single-lane MTP verification (T <= 4). A CTA of two warps owns 4 R
+// rows: each half-warp R rows, its 16 lanes striding the units (K / 64 is a multiple of 16, so
 // no lane idles). Per unit and row: four streaming loads, the arithmetic decode, and one dp4a
-// per code word and token; the activation words of a unit are shared by both rows. The dp4a work
-// grows with T while the decode does not, so wider T takes the tensor-core small-T route below.
+// per code word and token; the activation words of a unit are shared by the R rows. A row's
+// arithmetic does not depend on R. The dp4a work grows with T while the decode does not, so
+// wider T takes the tensor-core small-T route below.
 
-constexpr int kGemvThreads     = 64;
-constexpr int kGemvRowsPerHalf = 2;
-constexpr int kGemvRowsPerCta  = kGemvThreads / 16 * kGemvRowsPerHalf;
-constexpr int kGemvMaxTokens   = 4;
+constexpr int kGemvThreads   = 64;
+constexpr int kGemvMaxTokens = 4;
 
-template <int Tile>
+template <int Tile, int R>
 __global__ void __launch_bounds__(kGemvThreads)
     gemv_kernel(const uint4* __restrict__ qx, const float* __restrict__ group_scale,
                 const int* __restrict__ slice_sum, const std::uint8_t* __restrict__ codes,
                 const __half* __restrict__ scales, std::int64_t scale_row_halves, int n, int k,
                 Outputs outputs, bool accumulate) {
     static_assert(Tile >= 1 && Tile <= kGemvMaxTokens);
-    constexpr int R = kGemvRowsPerHalf;
     const int warp  = static_cast<int>(threadIdx.x) / 32;
     const int lane  = static_cast<int>(threadIdx.x) % 32;
     const int hl    = lane & 15;
@@ -395,11 +430,12 @@ __global__ void __launch_bounds__(kGemvThreads)
         float step[Tile];
 #pragma unroll
         for (int t = 0; t < Tile; ++t) {
-            const uint4* row = qx + std::int64_t(t) * (k / 16) + std::int64_t(u) * 4;
+            // GEMV layout (gemv_word): chunk w of unit u at 16-unit run u / 16, chunk-major.
+            const uint4* row = qx + std::int64_t(t) * (k / 16) + (u >> 4) * 64 + (u & 15);
 #pragma unroll
-            for (int w = 0; w < 4; ++w) xs[t][w] = __ldg(row + w);
-            offset[t] = __ldg(slice_sum + std::int64_t(t) * slices + 2 * u) +
-                        __ldg(slice_sum + std::int64_t(t) * slices + 2 * u + 1);
+            for (int w = 0; w < 4; ++w) xs[t][w] = __ldg(row + 16 * w);
+            const int2 sums = __ldg(reinterpret_cast<const int2*>(slice_sum + std::int64_t(t) * slices) + u);
+            offset[t]       = sums.x + sums.y;
             step[t] = __ldg(group_scale + std::int64_t(t) * groups + (u >> 1));
         }
 #pragma unroll
