@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -27,6 +28,66 @@ bool ProgramImpl::shared_capture_matches(const CaptureOffer& offer,
            group.frontier == candidate.frontier &&
            group.identity->shortlist_key == candidate.identity->shortlist_key &&
            group.identity->prefix_equals(*candidate.identity);
+}
+
+ProgramImpl::CapturePrivateDropEffect
+ProgramImpl::capture_private_drop_effect(
+    const SequenceState& sequence, const CaptureGroup& group,
+    const LongAnchorCheckpoint* selected_anchor_replacement) const {
+    struct DroppedReference {
+        StateImageHandle state;
+        std::uint32_t count = 0;
+    };
+
+    std::array<DroppedReference, 2> drops{};
+    std::size_t drop_count = 0;
+    const auto add_drop    = [&](StateImageHandle state) {
+        for (std::size_t index = 0; index < drop_count; ++index) {
+            if (drops[index].state == state) {
+                ++drops[index].count;
+                return;
+            }
+        }
+        drops[drop_count++] = DroppedReference{.state = state, .count = 1};
+    };
+    if (group.rewrite && sequence.rewrite_state) { add_drop(*sequence.rewrite_state); }
+    if (selected_anchor_replacement != nullptr) { add_drop(selected_anchor_replacement->state); }
+
+    CapturePrivateDropEffect out;
+    const auto add_residency = [&](detail::PhysicalResources& target, StateImageHandle state) {
+        const StateReplicaResidency residency = state_store->residency(state);
+        if (residency == StateReplicaResidency::DeviceOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++target.device.state_slots;
+        }
+        if (residency == StateReplicaResidency::HostOnly ||
+            residency == StateReplicaResidency::Both) {
+            ++target.host.state_slots;
+        }
+    };
+    for (std::size_t index = 0; index < drop_count; ++index) {
+        const DroppedReference& drop = drops[index];
+        if (!state_store->valid(drop.state)) { continue; }
+        // Physical release happens only when these were the last checkpoint references and
+        // nothing pins the image (release_checkpoint_reference). Reference counts alone predict a
+        // release for a pinned image (the borrowed source of a pending Fork, a pending Host
+        // replica), so publication would observe a different effect than was reserved.
+        if (state_store->checkpoint_references(drop.state) == drop.count &&
+            state_store->can_release_after_checkpoint_references(drop.state, drop.count)) {
+            add_residency(out.freed, drop.state);
+        }
+        // Entitlement follows sequence_exclusive_state_resources: an exclusive image leaves it
+        // once the sequence drops all of its checkpoint references, unless a primary binding
+        // attributed to this sequence still holds it.
+        const bool primary = drop.state == sequence.state.write ||
+                             (drop.state == sequence.state.read && !sequence.state.borrows_read()) ||
+                             (sequence.reserved_state && *sequence.reserved_state == drop.state);
+        if (!primary && state_exclusive_to_sequence(sequence, drop.state) &&
+            owned_checkpoint_references(sequence, drop.state) == drop.count) {
+            add_residency(out.owned, drop.state);
+        }
+    }
+    return out;
 }
 
 CaptureAssessment
@@ -128,45 +189,11 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         }
     }
 
-    detail::PhysicalResources replaced_private;
+    CapturePrivateDropEffect private_drop;
     if (publish_private) {
-        struct DroppedReference {
-            StateImageHandle state;
-            std::uint32_t count = 0;
-        };
-
-        std::array<DroppedReference, 2> drops{};
-        std::size_t drop_count = 0;
-        const auto add_drop    = [&](StateImageHandle state) {
-            for (std::size_t index = 0; index < drop_count; ++index) {
-                if (drops[index].state == state) {
-                    ++drops[index].count;
-                    return;
-                }
-            }
-            drops[drop_count++] = DroppedReference{.state = state, .count = 1};
-        };
-        if (group.rewrite && sequence.rewrite_state) { add_drop(*sequence.rewrite_state); }
-        if (selected_anchor_replacement != nullptr) {
-            add_drop(selected_anchor_replacement->state);
-        }
-        for (std::size_t index = 0; index < drop_count; ++index) {
-            const DroppedReference& drop = drops[index];
-            if (!state_store->valid(drop.state) ||
-                state_store->checkpoint_references(drop.state) != drop.count) {
-                continue;
-            }
-            const StateReplicaResidency residency = state_store->residency(drop.state);
-            if (residency == StateReplicaResidency::DeviceOnly ||
-                residency == StateReplicaResidency::Both) {
-                ++replaced_private.device.state_slots;
-            }
-            if (residency == StateReplicaResidency::HostOnly ||
-                residency == StateReplicaResidency::Both) {
-                ++replaced_private.host.state_slots;
-            }
-        }
+        private_drop = capture_private_drop_effect(sequence, group, selected_anchor_replacement);
     }
+    const detail::PhysicalResources replaced_private = private_drop.freed;
     detail::PhysicalResources replaced_shared;
     if (publish_shared && replacement != nullptr) {
         replaced_shared =
@@ -217,7 +244,7 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         positive_resource_difference(assessment.implementation->demand.reservation_added,
                                      assessment.implementation->demand.reservation_credit);
     assessment.implementation->active_entitlement_delta.removed =
-        checked_resource_sum(active_removed, replaced_private);
+        checked_resource_sum(active_removed, private_drop.owned);
     if (publish_private && !publish_shared) {
         assessment.implementation->active_entitlement_delta.added = added;
     }
@@ -400,7 +427,8 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     transaction.active_entitlement_delta = assessment.implementation->active_entitlement_delta;
     transaction.capacity_preparation_removed =
         assessment.implementation->capacity_preparation_removed;
-    transaction.recycles_private_state = assessment.recycles_private_state;
+    transaction.active_exclusive_baseline = owner_exclusive_resources(sequence);
+    transaction.recycles_private_state    = assessment.recycles_private_state;
     transaction.state_placement        = assessment.state_placement;
     transaction.transfer_requirements  = assessment.transfer_requirements;
     if (pressure_details != nullptr) {
@@ -630,6 +658,92 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         }
     } else if (transaction.capacity_preparation_removed != detail::PhysicalResources{}) {
         throw std::logic_error("private-only capture has shared preparation resources");
+    }
+
+    // Every victim of this capture (pressure and shared replacement) has now been released, and
+    // the active sequence itself is still untouched. A released victim that co-owned an object
+    // with the active lineage -- typically a shared prefix whose StateImage is also one of this
+    // sequence's long anchors, or whose KV pages alias this sequence's prefix -- leaves that
+    // object exclusive to the active sequence. Admission credits this ownership transfer
+    // (PressureTargetProjection::active_entitlement_delta); the capture path must as well, or the
+    // request entitlement no longer matches owner_exclusive_resources and a later replacement of
+    // that object subtracts capacity the entitlement never held.
+    {
+        RequestControl& request                   = requests[transaction.lane];
+        const detail::PhysicalResources exclusive = owner_exclusive_resources(sequence);
+        const detail::PhysicalResources& baseline = transaction.active_exclusive_baseline;
+        if (exclusive.device.active_lanes < baseline.device.active_lanes ||
+            exclusive.device.state_slots < baseline.device.state_slots ||
+            exclusive.device.main_kv_pages < baseline.device.main_kv_pages ||
+            exclusive.device.backend_kv_pages < baseline.device.backend_kv_pages ||
+            exclusive.host.state_slots < baseline.host.state_slots ||
+            exclusive.host.kv_bytes < baseline.host.kv_bytes) {
+            throw std::logic_error(
+                "capture victim release reduced the active sequence's exclusive resources"
+                " (before: " +
+                describe_physical_resources(baseline) +
+                "; after: " + describe_physical_resources(exclusive) + ")");
+        }
+        const detail::PhysicalResources transferred =
+            checked_resource_difference(exclusive, baseline);
+        if (transferred != detail::PhysicalResources{}) {
+            request.active_resources = checked_resource_sum(request.active_resources, transferred);
+            // The primary binding is exclusive by construction, so a transferred StateImage is
+            // always an optional checkpoint of the lineage. KV pages are not optional resources.
+            detail::PhysicalResources optional_transfer;
+            optional_transfer.device.state_slots = transferred.device.state_slots;
+            optional_transfer.host.state_slots   = transferred.host.state_slots;
+            request.optional_resources =
+                checked_resource_sum(request.optional_resources, optional_transfer);
+        }
+        transaction.active_exclusive_baseline = exclusive;
+
+        // Re-derive the capture's own removals against the post-victim reference graph: a
+        // reference a victim released can turn a predicted retention into a release, and pages
+        // that became exclusive move into the shared snapshot.
+        const LongAnchorCheckpoint* selected_anchor = nullptr;
+        if (transaction.private_replacement &&
+            transaction.private_replacement->kind == runtime::CheckpointKind::LongAnchor) {
+            const auto anchor =
+                std::find_if(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                             [&](const LongAnchorCheckpoint& candidate) {
+                                 return candidate.frontier ==
+                                            transaction.private_replacement->frontier &&
+                                        candidate.ordinal ==
+                                            transaction.private_replacement->ordinal;
+                             });
+            if (anchor == sequence.long_anchors.end()) {
+                throw std::logic_error(
+                    "selected long-anchor replacement changed before preparation");
+            }
+            selected_anchor = &*anchor;
+        }
+        CapturePrivateDropEffect private_drop;
+        if (transaction.publish_private) {
+            private_drop =
+                capture_private_drop_effect(sequence, transaction.group, selected_anchor);
+        }
+        if (transaction.recycles_private_state && private_drop.freed.device.state_slots == 0) {
+            throw std::logic_error("recycled rewrite capture lost its Device state replacement");
+        }
+        detail::PhysicalResources active_removed;
+        if (transaction.publish_shared) {
+            if (!sequence.kv) { throw std::logic_error("capture source has no KV bundle"); }
+            active_removed.device.main_kv_pages =
+                text_kv_addresses->active_snapshot_shape(sequence.kv->text, sequence.text_kv_valid)
+                    .unique_full_pages;
+            if (sequence.kv->backend) {
+                active_removed.device.backend_kv_pages =
+                    backend_kv_addresses
+                        ->active_snapshot_shape(*sequence.kv->backend, backend_kv_valid(sequence))
+                        .unique_full_pages;
+            }
+        }
+        transaction.resource_delta.removed =
+            checked_resource_sum(transaction.capacity_preparation_removed, private_drop.freed);
+        transaction.active_entitlement_delta.removed =
+            checked_resource_sum(active_removed, private_drop.owned);
+        transaction.private_replacement_owned = private_drop.owned;
     }
 
     transaction.source_state = sequence.state.write;
@@ -885,7 +999,10 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
             sequence.rewrite_state.reset();
             sequence.rewrite_checkpoint        = {};
             sequence.rewrite_checkpoint_hidden = {};
-            removed.device.state_slots         = 1;
+            // Accumulate: `removed` already holds the shared replacement released at preparation.
+            detail::PhysicalResources recycled;
+            recycled.device.state_slots = 1;
+            removed                     = checked_resource_sum(removed, recycled);
         }
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
@@ -903,13 +1020,18 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         }
     }
     if (removed != transaction.resource_delta.removed) {
-        throw std::logic_error("active capture replacement effect changed after reservation");
+        throw std::logic_error(
+            "active capture replacement effect changed after reservation (actual: " +
+            describe_physical_resources(removed) +
+            "; reserved: " + describe_physical_resources(transaction.resource_delta.removed) +
+            ")");
     }
 
-    const detail::PhysicalResources private_replacement_removed =
-        checked_resource_difference(removed, transaction.capacity_preparation_removed);
-    request.optional_resources =
-        checked_resource_difference(request.optional_resources, private_replacement_removed);
+    (void)checked_resource_difference(removed, transaction.capacity_preparation_removed);
+    // Optional resources are the lineage's exclusive optional checkpoints: subtract what left that
+    // ownership, not what was physically released (a pinned image leaves one, not the other).
+    request.optional_resources = checked_resource_difference(
+        request.optional_resources, transaction.private_replacement_owned);
     if (transaction.publish_private && !transaction.publish_shared) {
         request.optional_resources =
             checked_resource_sum(request.optional_resources, transaction.resource_delta.added);
