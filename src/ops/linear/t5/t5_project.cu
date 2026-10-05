@@ -27,11 +27,27 @@ struct QuantizedX {
     Tensor q, scale, group_sum, slice_sum;
 };
 
+// Bytes of code rows that a decode-width quantization asks L2 for ahead of the GEMV
+// (t5_a8::WeightPrefetch). One MiB is what DRAM moves while the quantization runs: per MTP 2
+// round on the RTX 4090, 0.75 MiB saved 1.5 %, 1-1.5 MiB 1.9 %, 4 MiB 0.9 % (design 9.1 item 33).
+constexpr std::int64_t kGemvPrefetchBytes = std::int64_t(1) << 20;
+
+t5_a8::WeightPrefetch gemv_prefetch(const Weight& w) {
+    const std::int64_t row_bytes = std::int64_t(w.k / t5_a8::kUnitColumns) * t5_a8::kUnitBytes;
+    const std::int64_t rows =
+        std::min<std::int64_t>(w.n, std::max<std::int64_t>(1, kGemvPrefetchBytes / row_bytes));
+    // Line i starts at base + 128 i, inside the first `bytes` of the plane for every i counted.
+    const auto lines = [](std::int64_t bytes) { return static_cast<unsigned>((bytes + 127) / 128); };
+    return {static_cast<const char*>(w.qdata), static_cast<const char*>(w.scales),
+            lines(rows * row_bytes), lines(rows * w.scale_nb[1])};
+}
+
 // Quantizes the weight input of `input` (a t5_a8 prologue), rotated when the weight carries
-// input signs, in one kernel.
+// input signs, in one kernel. At GEMV widths the kernel also prefetches the weight's leading rows.
 template <class Input>
-QuantizedX quantize(const Input& input, int k, int tokens, const void* signs,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
+QuantizedX quantize(const Input& input, const Weight& w, int tokens, WorkspaceArena& workspace,
+                    cudaStream_t stream) {
+    const int k = w.k;
     QuantizedX result{workspace.alloc(DType::I8, {k, tokens}),
                       workspace.alloc(DType::FP32, {k / 128, tokens}),
                       workspace.alloc(DType::I32, {k / 128, tokens}),
@@ -40,19 +56,22 @@ QuantizedX quantize(const Input& input, int k, int tokens, const void* signs,
     auto* scale = static_cast<float*>(result.scale.data);
     auto* gsum  = static_cast<int*>(result.group_sum.data);
     auto* ssum  = static_cast<int*>(result.slice_sum.data);
-    const auto* sign = static_cast<const __nv_bfloat16*>(signs);
+    const auto* sign = static_cast<const __nv_bfloat16*>(w.input_signs);
     // A token-state prologue visits all blocks from one CTA per token once the tokens alone fill
     // the SMs (prefill); with fewer tokens each CTA prepares the state for its own block, so a
     // decode or verification quantization is not K / 1024 blocks in series.
     const bool whole_row = Input::kTokenState && tokens >= device_sm_count();
+    const bool prefetch  = tokens <= t5_a8::kGemvMaxTokens;
+    const t5_a8::WeightPrefetch lines =
+        prefetch ? gemv_prefetch(w) : t5_a8::WeightPrefetch{nullptr, nullptr, 0u, 0u};
     const dim3 grid(whole_row ? 1u : static_cast<unsigned>(k / t5_a8::kQuantizeBlock),
-                    static_cast<unsigned>(tokens));
+                    static_cast<unsigned>(tokens + (prefetch ? 1 : 0)));
     if (sign != nullptr) {
         t5_a8::quantize_kernel<Input, true><<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(
-            input, sign, k, whole_row, q, scale, gsum, ssum);
+            input, sign, k, whole_row, q, scale, gsum, ssum, tokens, lines);
     } else {
         t5_a8::quantize_kernel<Input, false><<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(
-            input, sign, k, whole_row, q, scale, gsum, ssum);
+            input, sign, k, whole_row, q, scale, gsum, ssum, tokens, lines);
     }
     CUDA_CHECK(cudaGetLastError());
     return result;
@@ -220,7 +239,7 @@ void project(const Input& input, int tokens, const Weight& w, std::span<Tensor* 
     }
 
     auto scope         = workspace->scope();
-    const QuantizedX q = quantize(input, w.k, tokens, w.input_signs, *workspace, stream);
+    const QuantizedX q = quantize(input, w, tokens, *workspace, stream);
     switch (tokens) {
     case 1: launch_gemv<1>(q, w, packed, accumulate, stream); return;
     case 2: launch_gemv<2>(q, w, packed, accumulate, stream); return;

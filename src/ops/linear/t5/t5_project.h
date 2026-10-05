@@ -25,8 +25,9 @@ namespace ninfer::ops::detail {
 // T = 32 (weights read once per 32 tokens, K split over the warps of a 16-row CTA), the int8 MMA
 // prefill GEMM beyond (or 32-token small-T tiles when N % 64 != 0). With
 // w.input_signs (a Prism weight stored in the rotated basis) x is the primal input and the
-// rotation is fused into the quantization. Graph-capturable: static grid per (N, T), no host
-// sync.
+// rotation is fused into the quantization. Through T = 4 the quantization kernel also asks L2 for
+// the weight's first MiB of code rows, which the GEMV reads first. Graph-capturable: static grid
+// per (N, T), no host sync.
 void t5_project(const Tensor& x, const Weight& w, std::span<Tensor* const> outputs,
                 bool accumulate, LinearPolicy policy, WorkspaceArena* workspace,
                 cudaStream_t stream);

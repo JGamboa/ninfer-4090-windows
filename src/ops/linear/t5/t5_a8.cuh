@@ -265,13 +265,37 @@ __device__ __forceinline__ void rotate_block(float (&value)[4],
     value[3]             = rotated.w * 0x1p-5f;
 }
 
-// Grid: (K / 1024, T) CTAs, or (1, T) with `whole_row` (token-state prologues only).
+// The leading code lines and scale lines of the weight that a decode-width quantization asks L2
+// for (prefetch.global.L2, one request per 128-byte line). The GEMV that follows reads them
+// first (CTAs start in row order), so DRAM streams its first rows while the quantization runs
+// instead of idling until the GEMV's first loads. Lines are counted from 128-byte-aligned bases.
+struct WeightPrefetch {
+    const char* codes;
+    const char* scales;
+    unsigned code_lines;
+    unsigned scale_lines;
+};
+
+// Grid: (K / 1024, T) CTAs, or (1, T) with `whole_row` (token-state prologues only), plus one
+// row of gridDim.x CTAs (blockIdx.y == tokens) that only issue `prefetch` and exit.
 template <class Input, bool Rotate>
 __global__ void __launch_bounds__(kQuantizeThreads)
     quantize_kernel(Input input, const __nv_bfloat16* __restrict__ signs, int k, bool whole_row,
                     std::uint32_t* __restrict__ qx, float* __restrict__ group_scale,
-                    int* __restrict__ group_sum, int* __restrict__ slice_sum) {
+                    int* __restrict__ group_sum, int* __restrict__ slice_sum, int tokens,
+                    WeightPrefetch prefetch) {
     __shared__ __align__(16) float values[Rotate ? kQuantizeBlock : 1];
+    if (static_cast<int>(blockIdx.y) >= tokens) {
+        const unsigned threads = gridDim.x * blockDim.x;
+        const unsigned first   = blockIdx.x * blockDim.x + threadIdx.x;
+        for (unsigned line = first; line < prefetch.code_lines; line += threads) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch.codes + 128ull * line));
+        }
+        for (unsigned line = first; line < prefetch.scale_lines; line += threads) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(prefetch.scales + 128ull * line));
+        }
+        return;
+    }
     const int tid                   = static_cast<int>(threadIdx.x);
     const int token                 = static_cast<int>(blockIdx.y);
     const typename Input::Token state = input.prepare(k, token);
