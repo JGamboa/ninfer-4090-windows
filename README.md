@@ -6,7 +6,7 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **227 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **229 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
 | **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **120 tok/s** | **289 tok/s** (MTP + n-gram) | **5,860 tok/s** |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
@@ -100,7 +100,7 @@ each download against the checksums on its model card.
 ```bat
 build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
   --prompt "Write a Python function that merges two sorted lists." ^
-  --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 2 --lm-head-draft
+  --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 3 --lm-head-draft
 
 build\apps\ninfer.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
   --prompt "Write a Python function that merges two sorted lists." ^
@@ -121,7 +121,7 @@ Ternary Bonsai 2 27B, full 262K context per request, three concurrent requests, 
 build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
   --host 127.0.0.1 --port 8080 --model-id bonsai-27b ^
   --max-context 262144 --kv-capacity auto --kv-dtype rk4v4-e8 --max-concurrency 3 ^
-  --spec mtp --draft-tokens 2 --lm-head-draft --ngram chain --vision
+  --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain --vision
 ```
 
 Qwen3.8-27B, 100K context, three concurrent requests:
@@ -247,7 +247,10 @@ Decode tok/s, KV `rk4v4-e8`:
 | Server, edit of a 7K-11K-token file, thinking on | 215 | **378** | — | **258** | 139 |
 
 CLI rows: one request, greedy, up to 1024 tokens. Server rows: `ninfer-serve` with the launcher
-flags above (three lanes, sampling and thinking defaults), one request at a time.
+flags above (three lanes, sampling and thinking defaults), one request at a time. Measured on
+2026-09-24/25 with the monitor on the 4090. The Bonsai default is now MTP 3; on the same CLI
+prompts (2026-10-05, 4090 headless) it gives 368 tok/s on edit-style prompts, 648 with n-gram and
+190-235 tok/s on prose.
 
 ## Choosing settings
 
@@ -256,7 +259,7 @@ not change; only the speed does.
 
 | Model | Recommended | When to change |
 |---|---|---|
-| Bonsai | `--spec mtp --draft-tokens 2 --lm-head-draft --ngram chain` | `--draft-tokens 3` is up to 18 % faster on code and math and about 10 % slower on prose |
+| Bonsai | `--spec mtp --draft-tokens 3 --lm-head-draft --ngram chain` | Default since 2026-10-05: against `--draft-tokens 2` it is 20 % faster on edit-style prompts (368 against 308 tok/s), 2-3 % faster with n-gram and between -2 % and +7 % on prose (CLI, greedy, thinking off, 4090 headless) |
 | Qwen3.8 | `--spec mtp --draft-tokens 3 --lm-head-draft --ngram chain` | `--spec dflash2 --draft-tokens 6` is faster on free-form prose (99 against 85 tok/s through the server); `--draft-tokens 12` peaks at 211 tok/s on code. DFlash2 loads 1.6 GiB more weights; with three lanes, `--no-cuda-graph` frees about 1.1 GiB of graph memory for about 4 % of decode speed |
 
 `--ngram chain` extends each MTP proposal with text copied from the context, so rounds that
@@ -301,7 +304,7 @@ effects cancel. All commands run from the repository root.
 ```bat
 build\bench\ninfer_bench.exe --weights E:\LLM\qwen3_8_27b.ninfer -p 512,2048 -n 128 -r 3 --kv-dtype int8
 build\bench\ninfer_bench.exe --weights E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer -n 128 -r 3 ^
-  --spec mtp --draft-tokens 2 --lm-head-draft
+  --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
 `-o json --output-file FILE` writes a machine-readable report; see [bench/README.md](bench/README.md).
@@ -320,7 +323,7 @@ build\apps\ninfer.exe E:\LLM\qwen3_8_27b.ninfer --prompt "Explain how a transfor
 ```bat
 build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer --messages examples\cli\messages\long_niah_64k.json ^
   --max-context 262144 --prefill-chunk 1024 --kv-dtype rk4v4-e8 --no-thinking --max-new 16 --greedy ^
-  --spec mtp --draft-tokens 2 --lm-head-draft
+  --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
 **Perplexity** (four corpora; `--quick` takes one stream per corpus, about two minutes):

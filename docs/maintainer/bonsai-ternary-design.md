@@ -1146,9 +1146,8 @@ Next steps, in order:
    measures 217.9 tok/s (9.91 ms per round) on the six prompts (226.7 tok/s after item 33, in a
    session whose base ran 215.8). By then the 4090 drove only an
    idle 4K60 dummy plug, which cost nothing measurable in prefill or tg128.
-3. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit with the
-   cheaper t5 T = 4 round (0.86 of t2), or with an adaptive window. Since item 33 the T = 4 GEMV
-   costs what T = 3 does and MTP 3 measures 229.3 against MTP 2's 226.7 tok/s on the six prompts.
+3. Done 2026-10-05 (item 36): the draft window default is now 3. An adaptive window remains an
+   option for low-acceptance prose.
 4. Prefill: recover the accepted t5 regression (pp512 -13 %) with a 64 x 128-token GEMM tile
    (half the weight reads and decode per token). The tensor-core route for T = 5..8 is item 13.
 
@@ -2793,6 +2792,28 @@ Next steps, in order:
     - With these changes Bonsai MTP 3 is faster than MTP 2 on the six prompts (229.3 against
       226.8 tok/s); the launcher default stays MTP 2 until prose and server workloads are
       re-measured (next step 3).
+
+36. Draft window 3 as the Bonsai default (measured 2026-10-05, `4fc80fac`, RTX 4090 headless).
+    CLI, greedy, thinking off, rk4v4-e8, up to 1024 tokens, four edit-style prompts (return a
+    Python module, a JSON list, a document and C++ functions with a small change) and two prose
+    prompts, two rounds with the configuration order reversed (the two rounds agree within 0.5 %):
+
+    | Configuration | Edit-style mean | Story | Transformer explanation |
+    |---|---:|---:|---:|
+    | MTP 2 | 308.3 / 307.9 tok/s | 193.0 / 192.9 | 219.2 / 219.1 |
+    | MTP 3 | 368.6 / 368.0 tok/s | 189.6 | 235.4 / 234.9 |
+    | MTP 2 + n-gram | 635.1 / 635.7 tok/s | 193.3 / 193.2 | 219.7 / 219.5 |
+    | MTP 3 + n-gram | 647.7 / 648.6 tok/s | 190.0 / 189.8 | 234.9 / 235.1 |
+
+    - Acceptance length on the edit-style prompts rises from 2.90-3.00 to 3.79-3.98 tokens per
+      round. On long prose the two windows do not produce the same greedy text (story 619 against
+      884 tokens, explanation 979 against 1024): T = 3 and T = 4 verification reduce in a different
+      order, so near-ties resolve differently; outputs are not comparable token for token there.
+    - `ninfer-serve` with the launcher configuration (262144 context, `--kv-capacity auto`,
+      rk4v4-e8, three lanes, `--ngram chain`, `--vision`) starts with MTP 3: the KV pool is 764,032
+      tokens against 766,720 with MTP 2 (graph allowance 608 against 558 MB); greedy requests
+      return the same JSON.
+    - The launchers and the README now use `--draft-tokens 3` for Bonsai; Qwen3.8 already did.
 
 ## Appendix: sources
 
