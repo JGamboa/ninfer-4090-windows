@@ -1956,6 +1956,118 @@ int exercise_shared_prefix_release_keeps_private_source(const char* artifact) {
     return failures == 0 ? 0 : 1;
 }
 
+// sergiuszm/ninfer-4090#9. An automatic private long anchor and a shared stable prefix captured
+// at the same message boundary co-own one StateImage. Under StateImage pressure that image is
+// demoted to Host, and the session's next turn consumes its private endpoint. Admission must count
+// only checkpoints exclusive to the sequence in the active entitlement; counting the co-owned
+// anchor over-reserved a Host StateImage: at one lane the next turn failed with bad_alloc from the
+// state reservation, and with more lanes start_request rejected the materialization
+// ("materialized sequence does not match its active entitlement") and the engine latched.
+int exercise_shared_anchor_entitlement_under_pressure(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                                   = artifact;
+    options.max_context                                     = 4096;
+    options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk        = 512;
+    options.kv_cache             = kv_cache_under_test();
+    options.speculative.backend  = ninfer::SpeculativeBackend::None;
+    options.max_concurrency      = 1;
+    options.max_pending_requests = 4;
+    // One checkpoint Device slot next to the active image forces Host demotion of the anchors.
+    options.context_cache.device_state_slots                = 1;
+    options.context_cache.host_state_slots                  = 8;
+    options.context_cache.host_kv_capacity_bytes            = 1ULL << 30;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 2;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(std::move(options));
+
+    std::string system_text;
+    for (std::uint32_t index = 0; index < 60; ++index) { system_text += "stable-system "; }
+    constexpr std::uint32_t kSessions = 2;
+    std::vector<std::vector<ninfer::ChatMessage>> history(kSessions);
+    for (std::vector<ninfer::ChatMessage>& messages : history) {
+        ninfer::ChatMessage sys;
+        sys.role = ninfer::ChatRole::System;
+        sys.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = system_text, .media = {}});
+        messages.push_back(std::move(sys));
+    }
+
+    const auto build = [&](std::uint32_t session) {
+        ninfer::PromptInput input;
+        input.messages                = history[session];
+        input.options.enable_thinking = false;
+        // The breakpoint before the newest message is also the deepest automatic anchor.
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = static_cast<std::uint32_t>(history[session].size() - 1U),
+            .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence            = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+        input.context_cache.automatic_private_anchors = 2;
+        input.context_cache.session_key = "anchor-session-" + std::to_string(session);
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return input;
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 16;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = true;
+
+    std::uint32_t endpoint_reuses = 0;
+    for (std::uint32_t round = 0; round < 6; ++round) {
+        for (std::uint32_t session = 0; session < kSessions; ++session) {
+            std::string text = "Session " + std::to_string(session) + " round " +
+                               std::to_string(round) + " tool result:";
+            for (std::uint32_t index = 0; index < 48; ++index) {
+                text += " item-" + std::to_string(session) + "-" + std::to_string(round) + "-" +
+                        std::to_string(index);
+            }
+            text += ". Reply with exactly the word OK.";
+            ninfer::ChatMessage user;
+            user.role = ninfer::ChatRole::User;
+            user.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+            history[session].push_back(std::move(user));
+            ninfer::GenerationResult result;
+            try {
+                result = engine.generate(engine.prepare(build(session)), request);
+            } catch (const std::exception& error) {
+                std::cerr << "r" << round << " s" << session << " threw: " << error.what()
+                          << "\n";
+                return 1;
+            }
+            if (!engine.is_available()) {
+                std::cerr << "engine became unavailable at r" << round << " s" << session << "\n";
+                return 1;
+            }
+            if (result.prefix_reuse_path == ninfer::PrefixReusePath::PrivateEndpoint) {
+                ++endpoint_reuses;
+            }
+            std::cerr << "r" << round << " s" << session
+                      << " path=" << static_cast<int>(result.prefix_reuse_path)
+                      << " reused=" << result.reused_prompt_tokens
+                      << " prompt=" << result.prompt.prompt_tokens << "\n";
+            ninfer::ChatMessage assistant;
+            assistant.role = ninfer::ChatRole::Assistant;
+            assistant.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = result.content, .media = {}});
+            history[session].push_back(std::move(assistant));
+        }
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cerr << "round " << round << ": shared_sel=" << stats.shared_stable_prefix_selections
+                  << " captures=" << stats.active_captures_completed
+                  << " dev_st=" << stats.device_state_occupied_slots
+                  << " host_st=" << stats.host_state_occupied_slots << "\n";
+    }
+    if (endpoint_reuses == 0) {
+        std::cerr << "no turn resumed from its private endpoint; the fixture lost its purpose\n";
+        return 1;
+    }
+    return 0;
+}
 int exercise_pressure_partial_spill_and_resume(const char* artifact) {
     constexpr std::uint32_t kLongPromptTokens  = 7683;
     constexpr std::uint32_t kLongOutputTokens  = 31;
@@ -2707,6 +2819,10 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_concurrent_resource_settlement(artifact); result != 0) {
         return result;
     }
+    if (const int result = exercise_shared_anchor_entitlement_under_pressure(artifact);
+        result != 0) {
+        return result;
+    }
     // Own Engine (and scope) per exercise: auto-save-on-eviction is a startup option.
     if (const int result = exercise_auto_save_evicted(artifact); result != 0) { return result; }
     if (const int result = exercise_auto_save_binding_is_per_session(artifact); result != 0) {
@@ -2743,6 +2859,8 @@ int main() {
         result = exercise_private_checkpoint_pressure_retention(artifact);
     } else if (scenario == "source-pressure-protection") {
         result = exercise_materialization_source_pressure_protection(artifact);
+    } else if (scenario == "shared-anchor-entitlement") {
+        result = exercise_shared_anchor_entitlement_under_pressure(artifact);
     } else if (scenario == "shared-replacement") {
         result = exercise_shared_replacement_and_full_capacity_reuse(artifact);
     } else if (scenario == "private-long-anchor") {
