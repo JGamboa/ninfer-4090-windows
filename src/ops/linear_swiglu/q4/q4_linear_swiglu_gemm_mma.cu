@@ -71,10 +71,10 @@ void q4_linear_swiglu_a8_mma_folded_pipelined_r64_c128_launch(const A8G64Activat
                                                               cudaStream_t stream) {
     const std::int32_t k = x.q.ne[0];
     const auto problem   = folded_problem(weight, out, k);
-    rowsplit_tall_a8::launch<kTallTokens>(problem, problem.intermediate / 64,
-                                          static_cast<const std::int8_t*>(x.q.data),
-                                          static_cast<const float*>(x.scale.data), k, x.q.ne[1],
-                                          stream);
+    rowsplit_tall_a8::launch<kTallTokens, true>(problem, problem.intermediate / 64,
+                                                static_cast<const std::int8_t*>(x.q.data),
+                                                static_cast<const float*>(x.scale.data), k,
+                                                x.q.ne[1], stream);
 }
 
 void q4_linear_swiglu_a8_quantized_mma_folded_pipelined_r64_c128_launch(const A8G64Activation& x,
@@ -92,10 +92,10 @@ void q4_linear_swiglu_a8_quantized_mma_folded_pipelined_r64_c128_launch(const A8
         (reinterpret_cast<std::uintptr_t>(out.q.data) & 15) != 0) {
         throw std::invalid_argument("q4 linear_swiglu: invalid quantized output");
     }
-    rowsplit_tall_a8::launch<kTallTokens>(problem, problem.folded.intermediate / 64,
-                                          static_cast<const std::int8_t*>(x.q.data),
-                                          static_cast<const float*>(x.scale.data), k, tokens,
-                                          stream);
+    rowsplit_tall_a8::launch<kTallTokens, true>(problem, problem.folded.intermediate / 64,
+                                                static_cast<const std::int8_t*>(x.q.data),
+                                                static_cast<const float*>(x.scale.data), k, tokens,
+                                                stream);
 }
 
 void q4_linear_swiglu_mma_folded_pipelined_r64_c128_launch(const Tensor& x, const Weight& weight,

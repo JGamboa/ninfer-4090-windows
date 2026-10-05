@@ -1296,3 +1296,75 @@ base); text md5 and MTP rounds identical for every prompt; quick perplexity (bf1
 This session's base ran below item 32's 217.9 / 120.2 tok/s, so compare within the table. Qwen3.8's
 decode round has no t5 weights; its remaining headroom is the one listed in the decode round audit
 above.
+
+## Prefill round 3: persistent A8 GEMM tiles (`b22c8845`, `869cb924`, 2026-10-05)
+
+RTX 4090 headless (display on the iGPU), CUDA 13.4, driver 617.14, base `46e41f1b`; the Bonsai
+side and the full list of rejected attempts are in the Bonsai design notes, section 9.1, item 34.
+Nsight Compute failed with ERR_NVGPUCTRPERM (the counter permission of 2026-09-24 is off again),
+and `nsys --capture-range=cudaProfilerApi` around `ninfer_bench --profile-measured` hung the bench
+process, so the profiles below are CLI runs.
+
+**Where Qwen3.8 A8 prefill goes** (measured, nsys of `ninfer.exe --messages long_niah_{8k,64k}`,
+rk4v4-e8, `--prefill-chunk 1024`, MTP 3; share of prefill kernel time, GPU busy 98.6-99.1 %):
+
+| Kernel family | 8K | 64K |
+|---|---:|---:|
+| A8 gate+up (folded SwiGLU, quantizing epilogue), 956-1015 us per call | 35.5 % | 28.2 % |
+| A8 residual Q5 (down, o_proj, out_proj), 439 us average | 30.9 % | 24.4 % |
+| A8 grouped (GDN in_proj, qkvg), 467-496 us | 17.3 % | 13.8 % |
+| Prompt attention (int8 / rk4v4-e8) | 4.8 % | 25.8 % |
+| GDN chunked recurrence | 5.5 % | 4.3 % |
+| A8 activation quantization | 0.8 % | 0.6 % |
+| Norms, conv, other | 5.1 % | 2.9 % |
+
+The GDN gated RMSNorm (22.9 us) plus its out_proj quantization (~6 us) is 0.8 % of the 64K
+prefill; fusing them would save at most the quantization pass (~0.12 %, estimated), so it was not
+built.
+
+**Change.** The pipelined A8 GEMM (`rowsplit_tall_a8_mma.cuh`) launches the folded SwiGLU and the
+128-token residual Q5 tiles as one persistent CTA per SM. Before a tile's epilogue the CTA loads
+its next tile's first code bytes and copies the first activation step into stage 0; the epilogue
+stages its outputs from stage 1 on. The grouped projections and the 64-token residual tiles keep
+one CTA per tile (persistent they measured 2 % and ~1 % slower). The per-output arithmetic is
+unchanged.
+
+Op benches (cold L2, median us, base, new, new, base, measured):
+
+| Family | T = 512 | T = 1024 | T = 2048 |
+|---|---|---|---|
+| gate+up 34816 x 5120 | 528 / 522 -> 528 / 527 | 975 / 974 -> 969 / 968 | 1934 / 1934 -> 1909 / 1909 |
+| down 5120 x 17408 | 400 / 400 -> 401 / 400 | 688 / 688 -> 646 / 645 | 1163 / 1163 -> 1094 / 1092 |
+| o_proj / out_proj 5120 x 6144 | 158 / 164 -> 164 / 164 | 267 / 279 -> 261 / 261 | 446 / 465 -> 435 / 435 |
+| GDN in_proj, qkvg | unchanged | unchanged | unchanged |
+
+The card switched between two clock states ~4 % apart during these sessions (the o_proj base
+pairs), so compare the same session only. The down gain also appears when the same code runs one
+CTA per tile, i.e. part of it comes from the new code generation rather than the overlap.
+
+End to end, base and new alternated (base, new, new, base), all answers exact:
+
+| Qwen3.8 A8 | Base | New |
+|---|---|---|
+| `ninfer_bench -p 512,2048 -n 128 -r 3 --kv-dtype int8` pp512 | 5,306 / 5,308 tok/s | 5,336 / 5,321 tok/s |
+| pp2048 | 5,783 / 5,789 tok/s | 5,920 / 5,907 tok/s (+2.2 %) |
+| tg128 | 53.7 / 53.6 tok/s | 53.6 / 53.7 tok/s |
+| `long_niah_8k` prefill (rk4v4-e8, chunk 1024, MTP 3) | 5.51 / 5.51K tok/s | 5.64 / 5.63K tok/s |
+| `long_niah_64k` | 15.0 / 14.9 s | 14.7 / 14.7 s (-1.7 %) |
+| `long_niah_128k` | 37.7 / 37.9 s | 37.2 / 37.3 s (-1.4 %) |
+
+Checks: the A8 suites (`linear_swiglu_q4_a8`, `linear_add_q5_a8`, `rmsnorm_swiglu_mlp_q4_q5`,
+`gdn_input_proj`, `attn_input_proj`) and `linear_t5` pass; quick perplexity (bf16 KV) is bitwise
+equal (4.794439 Qwen3.8 A8, 5.854904 Bonsai; the reports differ only in timings); greedy MTP text
+(256 tokens, thinking off; three short prompts and a 1.1K-token document summary) has the same md5
+on base and new for both models. Bonsai does not use this kernel: pp512 / pp2048 5,852 / 5,840 ->
+5,825 / 5,831 and 6,101 / 6,109 -> 6,112 / 6,111 tok/s, `long_niah_64k` 14.4 / 14.3 -> 14.4 /
+14.4 s.
+
+**Remaining headroom (estimated).** Timed variants of the gate+up kernel (outputs invalid) put
+the MMAs plus staging alone at 811 us and everything except the MMAs at 785 us of 1021 us; a probe
+of the same warp tiles reaches 92 % of the IMMA peak with a trivial update but only 71 % with the
+exact per-group FP32 update (FMUL, FADD, FFMA per output and 64-column group), whatever the
+schedule. The kernel runs at ~52 % of the IMMA peak, so up to ~1.35x remains in decode, barriers,
+staging and the epilogue, not in the MMA issue order. Prompt attention is a quarter of the prefill
+at 64K and was not reworked.

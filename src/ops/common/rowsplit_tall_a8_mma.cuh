@@ -21,8 +21,15 @@
 // multiply and apply the second; warps 4-7 first apply the previous step's second group (whose
 // scales are still in their buffer) and decode, then multiply and apply the first group and
 // multiply the second. Each SM sub-partition thus runs one warp's MMAs while the other warp does
-// its integer and FP32 work. Tiles are launched token-tile fastest, so the CTAs of one row block
+// its integer and FP32 work. Tiles are ordered token-tile fastest, so the CTAs of one row block
 // run together and share its code bytes in L2.
+//
+// A Persistent launch holds one CTA per SM, which walks the tiles tile, tile + gridDim.x, ...
+// (the order in which one-tile CTAs would start). Before a tile's epilogue, the CTA loads the
+// next tile's first code bytes and copies its first activation step into stage 0, and the
+// epilogue stages the outputs from stage 1 on, so that latency overlaps the epilogue. The
+// folded SwiGLU and residual Q5 problems launch this way; the grouped projections measured
+// 2-3 % slower with it and keep one CTA per tile.
 
 #include "ops/common/rowsplit_tall_mma.cuh"
 
@@ -64,13 +71,28 @@ struct Config {
         float row[kStepGroups][kRows];
         float token[kStepGroups][Tokens];
     };
-    static constexpr std::size_t kScalesOffset = 2 * sizeof(Stage);
-
+    // A tile's epilogue stages its BF16 outputs in the freed stages. A persistent CTA stages them
+    // from stage 1 on, while its next tile fills stage 0 and scale buffer 0, and places the
+    // scale buffers after both.
+    template <bool Persistent>
+    __host__ __device__ static constexpr std::size_t staging_offset() {
+        return Persistent ? sizeof(Stage) : 0;
+    }
     template <class Problem>
+    __host__ __device__ static constexpr std::size_t staging_bytes() {
+        return static_cast<std::size_t>(Tokens) * rowsplit_tall::kOutLd<Problem::kOutRows> *
+               sizeof(__nv_bfloat16);
+    }
+    template <class Problem, bool Persistent>
+    __host__ __device__ static constexpr std::size_t scales_offset() {
+        if constexpr (!Persistent) { return 2 * sizeof(Stage); }
+        constexpr std::size_t kEnd = staging_offset<true>() + staging_bytes<Problem>();
+        return ((kEnd > 2 * sizeof(Stage) ? kEnd : 2 * sizeof(Stage)) + 127) / 128 * 128;
+    }
+    template <class Problem, bool Persistent>
     static constexpr std::size_t shared_bytes() {
-        return std::max(kScalesOffset + 3 * sizeof(Scales),
-                        static_cast<std::size_t>(Tokens) *
-                            rowsplit_tall::kOutLd<Problem::kOutRows> * sizeof(__nv_bfloat16));
+        return std::max(scales_offset<Problem, Persistent>() + 3 * sizeof(Scales),
+                        staging_offset<Persistent>() + staging_bytes<Problem>());
     }
 };
 
@@ -94,18 +116,21 @@ __device__ __forceinline__ unsigned with_q5_high(unsigned bytes, unsigned high) 
 template <class Problem>
 concept QuantizingProblem = requires { Problem::kQuantizesOutput; };
 
-template <int Tokens, class Problem>
+template <int Tokens, bool Persistent, class Problem>
 __global__ void __launch_bounds__(kThreads, 1)
     rowsplit_tall_a8_kernel(const std::int8_t* __restrict__ qx,
                             const float* __restrict__ x_scale, Problem problem, std::int32_t k,
-                            std::int32_t tokens, std::int32_t token_tiles) {
+                            std::int32_t tokens, std::int32_t token_tiles,
+                            std::int32_t total_tiles) {
     using Cfg   = Config<Tokens>;
     using Stage  = typename Cfg::Stage;
     using Scales = typename Cfg::Scales;
     constexpr int MT = Cfg::MT;
     extern __shared__ __align__(128) std::uint8_t tall_a8_smem[];
     Stage* stages  = reinterpret_cast<Stage*>(tall_a8_smem);
-    Scales* scales = reinterpret_cast<Scales*>(tall_a8_smem + Cfg::kScalesOffset);
+    constexpr std::size_t kScalesOffset = Cfg::template scales_offset<Problem, Persistent>();
+    constexpr std::size_t kStagingOffset = Cfg::template staging_offset<Persistent>();
+    Scales* scales = reinterpret_cast<Scales*>(tall_a8_smem + kScalesOffset);
 
     const int tid       = static_cast<int>(threadIdx.x);
     const int warp      = tid >> 5;
@@ -115,19 +140,19 @@ __global__ void __launch_bounds__(kThreads, 1)
     const int wm        = warp % Cfg::kWarpsM;
     const int wn        = warp / Cfg::kWarpsM;
     const bool pong     = warp >= 4;
-    const int tile      = static_cast<int>(blockIdx.x);
-    const int row_block = tile / token_tiles;
-    const int token0    = tile % token_tiles * Tokens;
-    const int live      = min(Tokens, tokens - token0);
     const int groups    = k / kGroupK;
     const int steps     = k / kStepK;
+
+    // The CTA's current tile; set_tile() points the decode and staging state at it.
+    int tile = static_cast<int>(blockIdx.x);
+    int row_block = 0, token0 = 0, live = 0;
+    bool q5       = false;
+    RowSource src{};
 
     // Decode item: weight row tid / 2 of the tile, group tid % 2 of each step (its 32 code bytes
     // are the int8 chunks 4 (tid % 2) .. + 3 of the row).
     const int my_row      = tid >> 1;
     const int my_group    = tid & 1;
-    const bool q5         = problem.q5(row_block);
-    const RowSource src   = problem.source(row_block, my_row, 0, groups);
     uint4 raw[2]          = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
     uint2 raw_high        = make_uint2(0, 0);
     std::uint16_t raw_scale = 0;
@@ -196,15 +221,24 @@ __global__ void __launch_bounds__(kThreads, 1)
     // per-thread staging state to five registers.
     const int x_token = tid >> 3;
     std::uint32_t x_off[kXChunks];
+    const int scale_token = tid % Tokens;
+    std::uint32_t scale_off = 0;
+    const auto set_tile = [&](int t) {
+        row_block = t / token_tiles;
+        token0    = t % token_tiles * Tokens;
+        live      = min(Tokens, tokens - token0);
+        q5        = problem.q5(row_block);
+        src       = problem.source(row_block, my_row, 0, groups);
 #pragma unroll
-    for (int i = 0; i < kXChunks; ++i) {
-        const int token = x_token + i * kXStride;
-        x_off[i] = static_cast<std::uint32_t>(
-            static_cast<std::int64_t>(token < live ? token0 + token : token0) * k + (tid & 7) * 16);
-    }
-    const int scale_token         = tid % Tokens;
-    const std::uint32_t scale_off = static_cast<std::uint32_t>(
-        tid / Tokens * tokens + (scale_token < live ? token0 + scale_token : token0));
+        for (int i = 0; i < kXChunks; ++i) {
+            const int token = x_token + i * kXStride;
+            x_off[i]        = static_cast<std::uint32_t>(
+                static_cast<std::int64_t>(token < live ? token0 + token : token0) * k +
+                (tid & 7) * 16);
+        }
+        scale_off = static_cast<std::uint32_t>(
+            tid / Tokens * tokens + (scale_token < live ? token0 + scale_token : token0));
+    };
     const auto issue_x = [&](int step, Stage& s, Scales& sc) {
         const unsigned base = smem_addr(&s) + static_cast<unsigned>(offsetof(Stage, x)) +
                               swizzled(x_token, tid & 7);
@@ -268,14 +302,6 @@ __global__ void __launch_bounds__(kThreads, 1)
         }
     };
     float acc[MT][4][4];
-#pragma unroll
-    for (int mt = 0; mt < MT; ++mt) {
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-#pragma unroll
-            for (int e = 0; e < 4; ++e) { acc[mt][nt][e] = 0.0f; }
-        }
-    }
     // Fragment C: [0], [1] are row gid, tokens 2 lid and 2 lid + 1; [2], [3] are row gid + 8.
     // Applies the int32 sums of group `group` of the step whose scales are `sc`.
     const auto update = [&](const int (&g)[MT][4][4], const Scales& sc, int group) {
@@ -296,93 +322,133 @@ __global__ void __launch_bounds__(kThreads, 1)
         }
     };
 
+    // Tiles tile, tile + gridDim.x, ... of the CTA. A tile's first step is prepared while the
+    // previous tile's epilogue runs: its code bytes are loaded and its activation is copied into
+    // stage 0 and scale buffer 0 before the epilogue stages its outputs from stage 1 on.
+    set_tile(tile);
     load(0);
     decode(stages[0], scales[0]);
     if (steps > 1) { load(1); }
     issue_x(0, stages[0], scales[0]);
     cp_commit();
     int g[MT][4][4];
-    int ring = 0; // step % 3, the step's scale buffer
-    for (int step = 0; step < steps; ++step) {
-        const int ring_next = ring == 2 ? 0 : ring + 1;
-        const int ring_prev = ring == 0 ? 2 : ring - 1;
-        cp_wait<0>();
-        // Stage `step` is visible and every warp is done reading step - 1's tiles and step - 2's
-        // scales, whose buffers refill.
-        __syncthreads();
-        if (step + 1 < steps) { issue_x(step + 1, stages[(step + 1) & 1], scales[ring_next]); }
-        cp_commit();
-        const Stage& s   = stages[step & 1];
-        const Scales& sc = scales[ring];
-        const auto next  = [&] {
-            if (step + 1 < steps) {
-                decode(stages[(step + 1) & 1], scales[ring_next]);
-                if (step + 2 < steps) { load(step + 2); }
-            }
-        };
-        if (pong) {
-            if (step > 0) { update(g, scales[ring_prev], 1); }
-            next();
-            multiply(s, 0, g);
-            update(g, sc, 0);
-            multiply(s, 1, g);
-        } else {
-            multiply(s, 0, g);
-            next();
-            update(g, sc, 0);
-            multiply(s, 1, g);
-            update(g, sc, 1);
-        }
-        ring = ring_next;
-    }
-    if (pong) { update(g, scales[ring == 0 ? 2 : ring - 1], 1); }
-
-    // Epilogue: the problem stages bf16 outputs as [token][row] in shared memory, then writes
-    // 16-byte row chunks of each live token (a quantizing problem is called for every token, so
-    // the lanes of a token can reduce across the chunks; it stores only the live ones).
-    constexpr int kOutRows = Problem::kOutRows;
-    constexpr int kLd      = rowsplit_tall::kOutLd<kOutRows>;
-    __syncthreads();
-    __nv_bfloat16* staged = reinterpret_cast<__nv_bfloat16*>(tall_a8_smem);
-    problem.template stage_outputs<MT>(acc, staged, kLd, wm * Cfg::kWarpRows, wn * 32, lane);
-    __syncthreads();
-    constexpr int kChunks = kOutRows / 8;
+    for (;;) {
 #pragma unroll
-    for (int i = 0; i < Tokens * kChunks / kThreads; ++i) {
-        const int item   = tid + i * kThreads;
-        const int token  = item / kChunks;
-        const int chunk  = item % kChunks;
-        const uint4 data = *reinterpret_cast<const uint4*>(&staged[token * kLd + chunk * 8]);
-        if constexpr (QuantizingProblem<Problem>) {
-            problem.write_quantized(row_block, token0 + token, chunk * 8, data, token < live);
-        } else if (token < live) {
-            problem.write(row_block, token0 + token, chunk * 8, data);
+        for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) { acc[mt][nt][e] = 0.0f; }
+            }
         }
+        int ring = 0; // step % 3, the step's scale buffer
+        for (int step = 0; step < steps; ++step) {
+            const int ring_next = ring == 2 ? 0 : ring + 1;
+            const int ring_prev = ring == 0 ? 2 : ring - 1;
+            cp_wait<0>();
+            // Stage `step` is visible and every warp is done reading step - 1's tiles and step - 2's
+            // scales, whose buffers refill.
+            __syncthreads();
+            if (step + 1 < steps) { issue_x(step + 1, stages[(step + 1) & 1], scales[ring_next]); }
+            cp_commit();
+            const Stage& s   = stages[step & 1];
+            const Scales& sc = scales[ring];
+            const auto next  = [&] {
+                if (step + 1 < steps) {
+                    decode(stages[(step + 1) & 1], scales[ring_next]);
+                    if (step + 2 < steps) { load(step + 2); }
+                }
+            };
+            if (pong) {
+                if (step > 0) { update(g, scales[ring_prev], 1); }
+                next();
+                multiply(s, 0, g);
+                update(g, sc, 0);
+                multiply(s, 1, g);
+            } else {
+                multiply(s, 0, g);
+                next();
+                update(g, sc, 0);
+                multiply(s, 1, g);
+                update(g, sc, 1);
+            }
+            ring = ring_next;
+        }
+        if (pong) { update(g, scales[ring == 0 ? 2 : ring - 1], 1); }
+
+        // Every warp is done with the stages and scale buffers.
+        __syncthreads();
+        const int out_row_block = row_block;
+        const int out_token0    = token0;
+        const int out_live      = live;
+        tile += static_cast<int>(gridDim.x);
+        const bool more = Persistent && tile < total_tiles;
+        if constexpr (Persistent) {
+            if (more) {
+                set_tile(tile);
+                load(0);
+                issue_x(0, stages[0], scales[0]);
+            }
+            cp_commit();
+        }
+
+        // Epilogue: the problem stages bf16 outputs as [token][row] in shared memory, then writes
+        // 16-byte row chunks of each live token (a quantizing problem is called for every token, so
+        // the lanes of a token can reduce across the chunks; it stores only the live ones).
+        constexpr int kOutRows = Problem::kOutRows;
+        constexpr int kLd      = rowsplit_tall::kOutLd<kOutRows>;
+        __nv_bfloat16* staged = reinterpret_cast<__nv_bfloat16*>(tall_a8_smem + kStagingOffset);
+        problem.template stage_outputs<MT>(acc, staged, kLd, wm * Cfg::kWarpRows, wn * 32, lane);
+        __syncthreads();
+        constexpr int kChunks = kOutRows / 8;
+#pragma unroll
+        for (int i = 0; i < Tokens * kChunks / kThreads; ++i) {
+            const int item   = tid + i * kThreads;
+            const int token  = item / kChunks;
+            const int chunk  = item % kChunks;
+            const uint4 data = *reinterpret_cast<const uint4*>(&staged[token * kLd + chunk * 8]);
+            if constexpr (QuantizingProblem<Problem>) {
+                problem.write_quantized(out_row_block, out_token0 + token, chunk * 8, data,
+                                        token < out_live);
+            } else if (token < out_live) {
+                problem.write(out_row_block, out_token0 + token, chunk * 8, data);
+            }
+        }
+        if (!more) { break; }
+        // Stage 1, where the outputs were staged, refills only after the next tile's first barrier.
+        decode(stages[0], scales[0]);
+        if (steps > 1) { load(1); }
     }
 }
 
 // Launches `row_blocks` 128-row blocks by ceil(tokens / Tokens) token tiles, token tile fastest,
 // over an activation quantized by rowsplit_a8_quantize for this `k` and `tokens`. The problem's
-// weights must have k == padded_k, a multiple of 128 (every Qwen3.8 projection input).
-template <int Tokens, class Problem>
+// weights must have k == padded_k, a multiple of 128 (every Qwen3.8 projection input). With
+// Persistent, one CTA per SM walks the tiles; otherwise each CTA runs one tile.
+template <int Tokens, bool Persistent, class Problem>
 void launch(const Problem& problem, std::int32_t row_blocks, const std::int8_t* qx,
             const float* x_scale, std::int32_t k, std::int32_t tokens, cudaStream_t stream) {
     if (k <= 0 || k % kStepK != 0 || tokens <= 0 ||
         static_cast<std::int64_t>(tokens) * k > static_cast<std::int64_t>(UINT32_MAX)) {
         throw std::invalid_argument("rowsplit A8 pipelined GEMM: unsupported k or width");
     }
-    constexpr std::size_t kSmem = Config<Tokens>::template shared_bytes<Problem>();
+    constexpr std::size_t kSmem = Config<Tokens>::template shared_bytes<Problem, Persistent>();
     static const bool opted_in  = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(rowsplit_tall_a8_kernel<Tokens, Problem>,
+        CUDA_CHECK(cudaFuncSetAttribute(rowsplit_tall_a8_kernel<Tokens, Persistent, Problem>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(kSmem)));
         return true;
     }();
     (void)opted_in;
     const std::int32_t token_tiles = (tokens + Tokens - 1) / Tokens;
-    const unsigned grid = static_cast<unsigned>(static_cast<std::int64_t>(row_blocks) * token_tiles);
-    rowsplit_tall_a8_kernel<Tokens, Problem>
-        <<<grid, kThreads, kSmem, stream>>>(qx, x_scale, problem, k, tokens, token_tiles);
+    const std::int64_t total_tiles = static_cast<std::int64_t>(row_blocks) * token_tiles;
+    if (total_tiles > INT32_MAX) {
+        throw std::invalid_argument("rowsplit A8 pipelined GEMM: too many tiles");
+    }
+    const unsigned grid = static_cast<unsigned>(
+        Persistent ? std::min<std::int64_t>(total_tiles, device_sm_count()) : total_tiles);
+    rowsplit_tall_a8_kernel<Tokens, Persistent, Problem><<<grid, kThreads, kSmem, stream>>>(
+        qx, x_scale, problem, k, tokens, token_tiles, static_cast<std::int32_t>(total_tiles));
     CUDA_CHECK(cudaGetLastError());
 }
 

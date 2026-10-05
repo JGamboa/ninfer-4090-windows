@@ -128,10 +128,14 @@ void q5_linear_add_a8_mma_pipelined_r128_c64_launch(const A8G64Activation& x, co
     };
     const auto* qx      = static_cast<const std::int8_t*>(x.q.data);
     const auto* x_scale = static_cast<const float*>(x.scale.data);
+    // The 128-token tiles run persistent CTAs (6 % faster at T = 1024 and 2048); the 64-token
+    // tiles measured ~1 % faster as one CTA per tile.
     if (static_cast<double>(waves(128)) * 1.55 < static_cast<double>(waves(64))) {
-        rowsplit_tall_a8::launch<128>(problem, row_blocks, qx, x_scale, x.q.ne[0], tokens, stream);
+        rowsplit_tall_a8::launch<128, true>(problem, row_blocks, qx, x_scale, x.q.ne[0], tokens,
+                                            stream);
     } else {
-        rowsplit_tall_a8::launch<64>(problem, row_blocks, qx, x_scale, x.q.ne[0], tokens, stream);
+        rowsplit_tall_a8::launch<64, false>(problem, row_blocks, qx, x_scale, x.q.ne[0], tokens,
+                                            stream);
     }
 }
 
