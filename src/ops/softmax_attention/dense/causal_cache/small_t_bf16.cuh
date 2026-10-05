@@ -169,17 +169,18 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         __syncthreads();
     }
 
-    for (int idx = tid; idx < Br * D; idx += Threads) {
-        const int row = idx / D;
-        const int d   = idx - row * D;
+    // Q rows in 16-byte chunks (eight dimensions; the swizzle permutes whole chunks).
+    for (int chunk = tid; chunk < Br * (D / 8); chunk += Threads) {
+        const int row = chunk / (D / 8);
+        const int d   = (chunk - row * (D / 8)) * 8;
         int q_head    = 0;
         int token     = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-        __nv_bfloat16 value = __float2bfloat16(0.0f);
+        int4 value = make_int4(0, 0, 0, 0);
         if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
-            value = q[causal_q_index<Geometry>(q_head, d, token)];
+            value = load_vec<int4>(&q[causal_q_index<Geometry>(q_head, d, token)]);
         }
-        qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
+        store_vec(&qkv_s[row * D + causal_small_t_tc_swz(row, d)], value);
     }
     __syncthreads();
 
