@@ -434,8 +434,8 @@ __global__ void __launch_bounds__(kGemvThreads)
             const uint4* row = qx + std::int64_t(t) * (k / 16) + (u >> 4) * 64 + (u & 15);
 #pragma unroll
             for (int w = 0; w < 4; ++w) xs[t][w] = __ldg(row + 16 * w);
-            offset[t] = __ldg(slice_sum + std::int64_t(t) * slices + 2 * u) +
-                        __ldg(slice_sum + std::int64_t(t) * slices + 2 * u + 1);
+            const int2 sums = __ldg(reinterpret_cast<const int2*>(slice_sum + std::int64_t(t) * slices) + u);
+            offset[t]       = sums.x + sums.y;
             step[t] = __ldg(group_scale + std::int64_t(t) * groups + (u >> 1));
         }
 #pragma unroll
