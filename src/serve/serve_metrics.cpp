@@ -26,21 +26,6 @@ void append_counter(std::string& out, const char* name, double value) {
 
 } // namespace
 
-void ServeMetrics::begin_request(std::uint64_t id, int prompt_tokens) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    active_[id] = prompt_tokens > 0 ? prompt_tokens : 0;
-}
-
-void ServeMetrics::end_request(std::uint64_t id) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    active_.erase(id);
-}
-
-std::vector<std::pair<std::uint64_t, int>> ServeMetrics::active_snapshot() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return {active_.begin(), active_.end()};
-}
-
 void ServeMetrics::record(const GenerationOutcome& outcome) {
     const GenerationMetrics& m = outcome.metrics;
     const std::uint64_t cached = m.prefix_cache_hit_tokens;
@@ -85,7 +70,8 @@ std::vector<ServeMetrics::RecentRequest> ServeMetrics::recent_requests() const {
 std::string ServeMetrics::render_monitor(const MonitorContext& context,
                                          const ninfer::RuntimeStats& live,
                                          const ninfer::RuntimeStats& baseline,
-                                         const std::vector<ninfer::SlotState>& slots) const {
+                                         const std::vector<ninfer::SlotState>& slots,
+                                         std::size_t active_requests) const {
     const auto since = [](auto now, auto then) { return now > then ? now - then : decltype(now){}; };
     nlohmann::json slot_rows = nlohmann::json::array();
     for (std::size_t i = 0; i < slots.size(); ++i) {
@@ -123,7 +109,7 @@ std::string ServeMetrics::render_monitor(const MonitorContext& context,
           {"occupied_pages", live.device_main_kv_occupied_pages},
           {"host_occupied_bytes", live.host_kv_occupied_bytes}}},
         {"scheduler",
-         {{"in_flight", active_.size()},
+         {{"in_flight", active_requests},
           {"running", live.running_requests},
           {"prefilling", live.prefilling_requests},
           {"decode_ready", live.decode_ready_requests},
@@ -151,9 +137,10 @@ ServeMetrics::LastCompleted ServeMetrics::last_completed() const {
 }
 
 std::string ServeMetrics::render(std::uint32_t max_concurrency,
-                                 const ninfer::RuntimeStats& live) const {
+                                 const ninfer::RuntimeStats& live,
+                                 std::size_t active_requests) const {
     const std::lock_guard<std::mutex> lock(mutex_);
-    const std::uint64_t in_flight  = active_.size();
+    const std::uint64_t in_flight  = active_requests;
     const std::uint64_t processing = std::min<std::uint64_t>(in_flight, max_concurrency);
     std::string out;
     out.reserve(704);

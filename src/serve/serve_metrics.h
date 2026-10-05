@@ -18,9 +18,9 @@
 
 #include "serve/generation_service.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -29,19 +29,6 @@ namespace ninfer::serve {
 
 class ServeMetrics {
 public:
-    // In-flight bookkeeping, hooked on the request start/done/error log
-    // funnel. Entries are keyed by request id: end is idempotent and a
-    // request that errors after starting is removed the same way as one that
-    // completes, so no path can leak a permanently busy slot.
-    void begin_request(std::uint64_t id, int prompt_tokens);
-    void end_request(std::uint64_t id);
-
-    // Oldest-first (id order = FIFO arrival order) prompt sizes of in-flight
-    // requests, for /slots. The engine does not expose its own slot table;
-    // these are HTTP-layer queue positions, which coincide with engine state
-    // for the bounded-FIFO, no-preemption scheduler this server runs.
-    [[nodiscard]] std::vector<std::pair<std::uint64_t, int>> active_snapshot() const;
-
     // Accumulates one completed request. Called from the same funnel as the
     // request-done log line, so every protocol and both streaming modes count.
     void record(const GenerationOutcome& outcome);
@@ -87,19 +74,22 @@ public:
     // The GET /monitor/stats JSON body. `slots` are the retained-conversation cells of /slots
     // (at least one per lane). The Engine totals are reported relative to `baseline`, the stats
     // at attach, so the startup warmup generation does not count as served traffic.
+    // `active_requests` is the same request-lifetime count render() receives.
     [[nodiscard]] std::string render_monitor(const MonitorContext& context,
                                              const ninfer::RuntimeStats& live,
                                              const ninfer::RuntimeStats& baseline,
-                                             const std::vector<ninfer::SlotState>& slots) const;
+                                             const std::vector<ninfer::SlotState>& slots,
+                                             std::size_t active_requests) const;
 
-    // One complete Prometheus text body, without HTTP framing. In-flight
-    // requests are split into processing/deferred against `max_concurrency`,
-    // matching the FIFO scheduler's work-conserving behavior.
+    // One complete Prometheus text body, without HTTP framing. The supplied
+    // request-lifetime count begins before preparation/submission and survives
+    // through response release, so every accepted request remains visible.
     // `live` supplies the four llamacpp token/seconds counters from the Engine's per-unit
     // totals, so scrapers see rates advance during a request; the completion-based sums this
     // class accumulates back the ninfer: series and the idle slot display.
     [[nodiscard]] std::string render(std::uint32_t max_concurrency,
-                                     const ninfer::RuntimeStats& live) const;
+                                     const ninfer::RuntimeStats& live,
+                                     std::size_t active_requests) const;
 
 private:
     mutable std::mutex mutex_;
@@ -112,7 +102,6 @@ private:
     std::uint64_t ngram_accepted_tokens_total_       = 0;
     LastCompleted last_completed_;
     std::deque<RecentRequest> recent_; // newest first, at most kRecentRequests
-    std::map<std::uint64_t, int> active_;
 };
 
 } // namespace ninfer::serve

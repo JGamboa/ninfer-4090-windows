@@ -268,11 +268,6 @@ std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestL
 
 void HttpServer::record_request_start(const RequestLogContext& context) {
     request_jsonl_.write_request_start(context);
-    // Upstream dropped RequestLogContext::prompt_tokens, which this fork declared and read
-    // here but never assigned anywhere - so this argument has always been 0 and the
-    // Prometheus per-request prompt-token value has always been 0 with it. Passing 0
-    // explicitly keeps behaviour identical; fixing the metric is a separate change.
-    metrics_.begin_request(context.id, 0);
     operational_log_.request_start(context);
 }
 
@@ -284,7 +279,6 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);
-    metrics_.end_request(context.id);
     metrics_.record(outcome);
     operational_log_.request_done(context, outcome);
 }
@@ -293,7 +287,6 @@ void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
-    metrics_.end_request(context.id);
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
@@ -459,7 +452,8 @@ void HttpServer::register_routes() {
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency,
                                         service_ != nullptr ? service_->runtime_stats()
-                                                            : ninfer::RuntimeStats{}),
+                                                            : ninfer::RuntimeStats{},
+                                        service_ != nullptr ? service_->active_request_count() : 0),
                         "text/plain; version=0.0.4");
     });
     // Live monitor: a self-contained page polling the JSON snapshot below once per second.
@@ -476,7 +470,8 @@ void HttpServer::register_routes() {
         std::vector<ninfer::SlotState> slots = service_->slot_states();
         slots.resize(service_->slot_count());
         res.set_content(metrics_.render_monitor(monitor_context_, service_->runtime_stats(),
-                                                monitor_baseline_, slots),
+                                                monitor_baseline_, slots,
+                                                service_->active_request_count()),
                         "application/json");
     });
     // llama.cpp-shaped slot detail, read from the Engine's continuation catalog: one slot per

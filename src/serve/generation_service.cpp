@@ -307,6 +307,11 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
     }
 }
 
+std::size_t GenerationService::active_request_count() const {
+    const std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->active;
+}
+
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            GenerationConsumerMode consumer_mode,
                                            ninfer::GenerationObservationOptions observation,
