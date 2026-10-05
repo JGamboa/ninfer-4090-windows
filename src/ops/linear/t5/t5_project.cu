@@ -61,17 +61,18 @@ QuantizedX quantize(const Input& input, const Weight& w, int tokens, WorkspaceAr
     // the SMs (prefill); with fewer tokens each CTA prepares the state for its own block, so a
     // decode or verification quantization is not K / 1024 blocks in series.
     const bool whole_row = Input::kTokenState && tokens >= device_sm_count();
-    const bool prefetch  = tokens <= t5_a8::kGemvMaxTokens;
+    // The dp4a GEMV route (T <= 4) reads the GEMV activation layout and gets the prefetch row.
+    const bool gemv = tokens <= t5_a8::kGemvMaxTokens;
     const t5_a8::WeightPrefetch lines =
-        prefetch ? gemv_prefetch(w) : t5_a8::WeightPrefetch{nullptr, nullptr, 0u, 0u};
+        gemv ? gemv_prefetch(w) : t5_a8::WeightPrefetch{nullptr, nullptr, 0u, 0u};
     const dim3 grid(whole_row ? 1u : static_cast<unsigned>(k / t5_a8::kQuantizeBlock),
-                    static_cast<unsigned>(tokens + (prefetch ? 1 : 0)));
+                    static_cast<unsigned>(tokens + (gemv ? 1 : 0)));
     if (sign != nullptr) {
         t5_a8::quantize_kernel<Input, true><<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(
-            input, sign, k, whole_row, q, scale, gsum, ssum, tokens, lines);
+            input, sign, k, whole_row, q, scale, gsum, ssum, tokens, gemv, lines);
     } else {
         t5_a8::quantize_kernel<Input, false><<<grid, t5_a8::kQuantizeThreads, 0, stream>>>(
-            input, sign, k, whole_row, q, scale, gsum, ssum, tokens, lines);
+            input, sign, k, whole_row, q, scale, gsum, ssum, tokens, gemv, lines);
     }
     CUDA_CHECK(cudaGetLastError());
     return result;
