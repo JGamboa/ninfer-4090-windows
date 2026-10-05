@@ -1125,7 +1125,8 @@ ColdFusion fine-tune, not the Qwen3.8 base).
 ### 9.1 Current state and next steps (living; update in place)
 
 State: base-3 `t5_g128_fp16` conversion (`bonsai2_27b`: projections, head and token embedding,
-`AllowA8`), the A8 t5 route (rotation fused into the natural-order quantization, arithmetic
+`AllowA8`), the A8 t5 route (rotation fused into the quantization, natural order for the GEMMs
+and chunk-major per 1024-column run for the decode GEMV (item 33), arithmetic
 dp4a GEMV, shared-memory-decode prefill GEMM, embedding gather), Vision tower from Prism's
 mmproj, full MSVC build and test suite passing. t2 is gone from the C++ engine; the Python
 codec still accepts it until the other session's cleanup commit (slot2 packing,
@@ -1142,10 +1143,12 @@ Next steps, in order:
    2.1 % on average but loses on Spanish prose, so the default stays 131072. The Q4/Q5 MTP
    layer that experiment could not start now has its routes (item 11); it awaits measurement.
 2. Done 2026-09-27 (item 32): with the monitor on the iGPU the 4090 is headless; Bonsai MTP 2
-   measures 217.9 tok/s (9.91 ms per round) on the six prompts. By then the 4090 drove only an
+   measures 217.9 tok/s (9.91 ms per round) on the six prompts (226.7 tok/s after item 33, in a
+   session whose base ran 215.8). By then the 4090 drove only an
    idle 4K60 dummy plug, which cost nothing measurable in prefill or tg128.
 3. Draft window: 3 wins on code and math and loses on low-acceptance prose; revisit with the
-   cheaper t5 T = 4 round (0.86 of t2), or with an adaptive window.
+   cheaper t5 T = 4 round (0.86 of t2), or with an adaptive window. Since item 33 the T = 4 GEMV
+   costs what T = 3 does and MTP 3 measures 229.3 against MTP 2's 226.7 tok/s on the six prompts.
 4. Prefill: recover the accepted t5 regression (pp512 -13 %) with a 64 x 128-token GEMM tile
    (half the weight reads and decode per token). The tensor-core route for T = 5..8 is item 13.
 
@@ -2614,6 +2617,98 @@ Next steps, in order:
       because item 31 ran in a slow session (its tg128 was 114.2 / 47.7 against 128.7 / 54.6 here);
       the Bonsai tg128 gain over item 29 (123.8 -> 128.7, +4 %) matches the item-30 decode fixes. An
       MTP A/B with the dummy re-attached in one session was not run.
+
+33. Second decode-round pass (`0de4d1c9`, `2816cf51`, `2bd5ef2b`, `ac5d7178`, `b7966e37`, measured
+    2026-10-05, RTX 4090 headless (monitor on the iGPU), CUDA 13.4; base `46e41f1b`). Every A/B is
+    base, new, new, base in one session on the six prompts (MTP, greedy, thinking off, 512 tokens,
+    `--lm-head-draft`); this session's base ran 215.8 tok/s against item 32's 217.9, so compare
+    within the tables.
+    - Profile of the base round (measured, `nsys --cuda-graph-trace=node`,
+      `scenario_story_en_mystery`, 131 prompt tokens): 9.99 ms of kernels per MTP 2 round, the t5
+      GEMV 6.77 ms of it (gate+up 45.1 us, 5120-row o_proj/out_proj and down 18.0 us median over
+      both, in_proj 21.9, qkvg 19.9, LM head 296), quantization 0.45 ms (257 launches), GDN record
+      0.31 + fold 0.28, attention 0.31, gating 0.16. Without the profiler the same prompt runs
+      10.05 ms per round, so the host turnaround before the fold (85 us under nsys, whose graph
+      launch tracing also stretches the fold-to-next-round gap to ~0.5 ms) is almost entirely
+      hidden; the fold itself is the cost, not the host.
+    - `0de4d1c9`: at GEMV widths (T <= 4) the t5 quantization kernel gets one extra row of
+      gridDim.x CTAs that issue `prefetch.global.L2` for the weight's first MiB of code rows and
+      their scales; the GEMV starts its CTAs in row order and finds them in flight. Sizes swept
+      (MTP 2 tok/s, base 215.9): 0.75 MiB 219.2, 1 MiB 220.2, 1.5 MiB 220.1, 2 MiB 219.9, 4 MiB
+      219.0; one, two or four prefetch rows the same. Prefetching from the quantizing CTAs at
+      kernel start gave 219.5, at kernel end 217.1. Under nsys the GEMVs drop 1-1.4 us each and the
+      RMSNorm quantization grows 2.08 -> 2.69 us.
+    - `2816cf51`: the 16 lanes of a GEMV half-warp read chunk w of 16 consecutive units, 64 bytes
+      apart in the natural layout. At GEMV widths the quantization now writes each 1024-column run
+      chunk-major ([chunk 0..3][unit 0..15] of 16 bytes), so each activation load covers 256
+      contiguous bytes. `ninfer_t5_bench` (us, rot): T = 4 in_proj 27.9 -> 24.4, qkvg 26.9 ->
+      22.7, gate+up 50.6 -> 46.3, down 29.9 -> 26.8 (T = 4 now costs what T = 3 does); T = 3
+      gate+up 46.8 -> 46.0, down 27.1 -> 26.6.
+    - `2bd5ef2b`: with the activation loads contiguous, the weights of 8192 rows and more take one
+      row per half-warp (twice the warps): T = 3 in_proj 24.2 -> 23.7, qkvg 22.5 -> 21.4, gate+up
+      46.0 -> 45.3 us. The 5120-row weights keep two (one row: down 26.5 -> 28.6 us). The t5 test
+      adds a one-row view of 8193 rows at a row offset (partial last CTA), T = 1..4.
+    - `ac5d7178`: a unit's two adjacent slice sums load as one int2 (down T = 3 26.7 -> 26.2 us).
+    - `b7966e37` (both models): the small-T BF16 attention partial kernel staged its 64 x 256 query
+      tile one element per thread and iteration; it now stages 16-byte chunks (the swizzle permutes
+      whole chunks). nsys median 14.50 -> 11.58 us (8 splits), 15.14 -> 12.35 (32 splits).
+    - Per change, Bonsai MTP 2 (tok/s; ms per round):
+
+      | Change | Base | New |
+      |---|---|---|
+      | `0de4d1c9` prefetch | 215.9 / 215.8; 10.006 | 220.2 / 220.2; 9.808 |
+      | `2816cf51` GEMV activation layout | 220.3 / 220.2; 9.804 | 222.9 / 222.8; 9.691 |
+      | `2bd5ef2b` one row per half-warp | 222.8 / 222.8; 9.694 | 224.7 / 224.6; 9.614 |
+      | `ac5d7178` int2 slice sums | 224.6 / 224.6; 9.615 | 225.8 / 225.7; 9.566 |
+      | `b7966e37` query staging | 225.8 / 225.7; 9.566 | 226.8 / 226.8; 9.523 |
+
+    - Whole branch against `46e41f1b` (measured, alternated):
+
+      | Six prompts, 512 tokens | Base | New |
+      |---|---|---|
+      | Bonsai MTP 2, tok/s (ms per round) | 215.7 / 215.8 (10.009) | **226.7 / 226.7 (9.526, -4.8 %)** |
+      | Bonsai MTP 3, tok/s (ms per round) | 210.0 / 210.0 (11.389) | **229.2 / 229.3 (10.432, -8.4 %)** |
+      | Bonsai MTP 2 + `--ngram chain`, prompts 1 and 4 | 180.5 tok/s (10.006) | 189.6 tok/s (9.526) |
+      | Qwen3.8 A8 MTP 3, tok/s (ms per round) | 118.3 / 118.2 (22.884) | 118.5 / 118.4 (22.841, -0.2 %) |
+      | Qwen3.8 A8 MTP 3 + `--ngram chain`, prompts 1 and 4 | 96.8 tok/s (22.889) | 97.0 tok/s (22.854) |
+
+      With the cheaper T = 4 GEMV, MTP 3 now beats MTP 2 on the six-prompt mean (229.3 against
+      226.7 tok/s); the default draft window was not changed here (next step 3).
+    - Checks: `ninfer_linear_t5_test`, `ninfer_gated_delta_net_test`,
+      `ninfer_gated_delta_net_replay_record_test`, `ninfer_gdn_replay_fold_test`,
+      `ninfer_rmsnorm_test` and `ninfer_softmax_attention_test` pass. Quick perplexity (bf16 KV)
+      is bitwise equal to the base (total NLL identical): Bonsai 5.854903518575322, Qwen3.8 A8
+      4.794438838878608. Greedy stdout md5 and MTP rounds are identical to the base for every
+      prompt and run above (both models, MTP 2 and 3, with and without `--ngram chain`).
+    - Round after the branch (measured, nsys, same prompt): 9.52 ms of kernels; t5 GEMV 6.28 ms
+      (892 GB/s; LM head 292 us, 952 GB/s), quantization 0.51 ms, MTP draft 1.38 ms (proposal head
+      2 x 377 us at 945 GB/s), GDN record 0.31 + fold 0.28, attention 0.26, gating 0.16.
+    - Measured, not adopted (all exact, all slower or neutral):
+      - A per-CTA prefetch of the GEMV's own rows at kernel start: T = 3 in_proj 25.5 -> 30.5 us.
+      - Software-pipelined GEMV units (2-4 units in flight per lane, 161-207 registers): T = 3
+        gate+up 47.7 -> 53.2-59.4 us; after the layout change `#pragma unroll 2` (179-181
+        registers): gate+up 45.3 -> 47.6 us.
+      - Three or four rows per half-warp: no shape faster; one row for the 5120-row weights (above).
+      - A separate prefetch kernel after in_proj / before attention for all of out_proj / o_proj
+        (4-8 MiB, plain or `evict_last`): 217.5 against 220.1 tok/s. out_proj fell 9.6 -> 8.8 us
+        but the attention o_proj stayed 9.7 us with its weights prefetched 25 us earlier: the
+        5120-row GEMVs are latency-bound (6 units per lane at K = 6144, 10 warps per SM), not
+        DRAM-bound. Prefetching 4-16 MiB of gate+up there: 218.6-219.0 tok/s (gate+up -0.7 us).
+      - GDN record with two state rows per warp and eight warps per CTA: `ninfer_gdn_replay_bench`
+        record 12.3 -> 13.4-14.3 us.
+      - `gdn_norm_gating_27_simt` with one CTA per head (token tile 4): 3.33 -> 3.90 us; one token
+        per CTA: 3.36 us.
+    - Nsight Compute was not available (ERR_NVGPUCTRPERM: the GPU counter permission for all users
+      is off again); the GEMV conclusions rest on the bench and nsys sweeps above.
+    - Remaining headroom per MTP 2 round (estimated): the GDN fold (0.28 ms) folded into the next
+      round's record kernel, ~1.5-2 % net: it needs double-buffered replay records (the record
+      kernel would read round N's and write round N + 1's), the conv-history fold moved into the
+      next round's conv kernel, a per-lane deferred fold in the Program (rows that end, cancel or
+      snapshot still fold at once) and the graph launch, now hidden behind the fold, exposed; the
+      quantization launches (0.51 ms, ~2 us each, mostly latency); the 5120-row GEMVs (latency-bound,
+      ~1 us each to the tall shapes' rate); the remaining GEMV gap to the LM head's 952 GB/s
+      (~0.3 ms); `gdn_norm_gating` (3.3 us, latency-bound); the attention partial kernel's
+      unbuffered K/V staging (11.6 us per layer).
 
 ## Appendix: sources
 
