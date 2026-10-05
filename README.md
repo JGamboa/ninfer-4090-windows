@@ -6,7 +6,7 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **229 tok/s** | **532 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **229 tok/s** | **648 tok/s** (MTP + n-gram) | **6,027 tok/s** |
 | **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **120 tok/s** | **289 tok/s** (MTP + n-gram) | **5,860 tok/s** |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
@@ -176,7 +176,7 @@ machine:
 | Decode, MTP 2, mean of six mixed prompts, thinking off | **227 tok/s** | — |
 | Decode, MTP 3, mean of six mixed prompts, thinking off | **229 tok/s** | — |
 | Decode, MTP 2, prose / edit-style prompts | 167 / 250 tok/s | — |
-| Decode, MTP 2 + n-gram, edit-style prompts | **532 tok/s** | — |
+| Decode, MTP 3 + n-gram, edit-style prompts | **648 tok/s** | — |
 | Decode, three concurrent requests, aggregate | **360 tok/s** | — |
 | Prefill, `pp512` / `pp2048` | **5,793 / 6,027 tok/s** | 1,363 tok/s / — |
 | Prefill, 8K / 64K / 128K-token prompt (needle test, answer exact) | 1.3 s / 14.4 s / 37.4 s | — |
