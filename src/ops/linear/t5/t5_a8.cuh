@@ -375,25 +375,23 @@ __device__ __forceinline__ void decode_unit(const std::uint32_t (&a)[4], std::ui
 }
 
 // ---------------------------------------------------------------------------------------------
-// dp4a GEMV for decode and single-lane MTP verification (T <= 4). A CTA of two warps owns eight
-// rows: each half-warp two rows, its 16 lanes striding the units (K / 64 is a multiple of 16, so
+// dp4a GEMV for decode and single-lane MTP verification (T <= 4). A CTA of two warps owns 4 R
+// rows: each half-warp R rows, its 16 lanes striding the units (K / 64 is a multiple of 16, so
 // no lane idles). Per unit and row: four streaming loads, the arithmetic decode, and one dp4a
-// per code word and token; the activation words of a unit are shared by both rows. The dp4a work
-// grows with T while the decode does not, so wider T takes the tensor-core small-T route below.
+// per code word and token; the activation words of a unit are shared by the R rows. A row's
+// arithmetic does not depend on R. The dp4a work grows with T while the decode does not, so
+// wider T takes the tensor-core small-T route below.
 
-constexpr int kGemvThreads     = 64;
-constexpr int kGemvRowsPerHalf = 2;
-constexpr int kGemvRowsPerCta  = kGemvThreads / 16 * kGemvRowsPerHalf;
-constexpr int kGemvMaxTokens   = 4;
+constexpr int kGemvThreads   = 64;
+constexpr int kGemvMaxTokens = 4;
 
-template <int Tile>
+template <int Tile, int R>
 __global__ void __launch_bounds__(kGemvThreads)
     gemv_kernel(const uint4* __restrict__ qx, const float* __restrict__ group_scale,
                 const int* __restrict__ slice_sum, const std::uint8_t* __restrict__ codes,
                 const __half* __restrict__ scales, std::int64_t scale_row_halves, int n, int k,
                 Outputs outputs, bool accumulate) {
     static_assert(Tile >= 1 && Tile <= kGemvMaxTokens);
-    constexpr int R = kGemvRowsPerHalf;
     const int warp  = static_cast<int>(threadIdx.x) / 32;
     const int lane  = static_cast<int>(threadIdx.x) % 32;
     const int hl    = lane & 15;

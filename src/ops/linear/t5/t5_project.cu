@@ -78,16 +78,31 @@ QuantizedX quantize(const Input& input, const Weight& w, int tokens, WorkspaceAr
     return result;
 }
 
-template <int Tile>
-void launch_gemv(const QuantizedX& q, const Weight& w, const t5_a8::Outputs& outputs,
-                 bool accumulate, cudaStream_t stream) {
-    const unsigned grid =
-        static_cast<unsigned>((w.n + t5_a8::kGemvRowsPerCta - 1) / t5_a8::kGemvRowsPerCta);
-    t5_a8::gemv_kernel<Tile><<<grid, t5_a8::kGemvThreads, 0, stream>>>(
+template <int Tile, int R>
+void launch_gemv_rows(const QuantizedX& q, const Weight& w, const t5_a8::Outputs& outputs,
+                      bool accumulate, cudaStream_t stream) {
+    constexpr int rows_per_cta = t5_a8::kGemvThreads / 16 * R;
+    const unsigned grid        = static_cast<unsigned>((w.n + rows_per_cta - 1) / rows_per_cta);
+    t5_a8::gemv_kernel<Tile, R><<<grid, t5_a8::kGemvThreads, 0, stream>>>(
         static_cast<const uint4*>(q.q.data), static_cast<const float*>(q.scale.data),
         static_cast<const int*>(q.slice_sum.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const __half*>(w.scales), w.scale_nb[1] / 2, w.n, w.k, outputs, accumulate);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Rows per GEMV half-warp. The 5120-row weights (640 CTAs at two rows) keep two: at one row,
+// down ran 8 % slower at T = 3. The taller ones (14336 rows and up) take one, twice the warps,
+// 1-5 % faster at T = 3 (in_proj 24.2 -> 23.7 us, qkvg 22.5 -> 21.4, gate+up 46.0 -> 45.3).
+constexpr int kGemvOneRowMinRows = 8192;
+
+template <int Tile>
+void launch_gemv(const QuantizedX& q, const Weight& w, const t5_a8::Outputs& outputs,
+                 bool accumulate, cudaStream_t stream) {
+    if (w.n >= kGemvOneRowMinRows) {
+        launch_gemv_rows<Tile, 1>(q, w, outputs, accumulate, stream);
+    } else {
+        launch_gemv_rows<Tile, 2>(q, w, outputs, accumulate, stream);
+    }
 }
 
 template <int NTiles>

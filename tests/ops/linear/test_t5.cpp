@@ -456,6 +456,13 @@ int main() {
         }
     }
     {
+        // From 8192 rows the GEMV gives each half-warp one row instead of two: a row view of 8193
+        // rows at a row offset (a partial last CTA), T = 1..4, over three 1024-column runs of the
+        // GEMV activation layout, once under graph replay.
+        const Ternary one_row(8200, 3072, 23u);
+        for (std::int32_t t : {1, 2, 3, 4}) failures += linear_case(one_row, 5, 8193, t, t == 4);
+    }
+    {
         // The 5120-row weights at the GEMM boundaries, accumulating into a residual: the 64 x 64
         // tile at T = 64, then 64-token tiles of the 128-row kernel (two at T = 65 and 72, three at
         // T = 129), the last partial; mlp down at the longest K.
