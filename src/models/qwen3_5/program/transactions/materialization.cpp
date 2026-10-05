@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -2176,11 +2177,21 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         materialization_ledger_.clear();
         materialization_identity_.clear();
         materialization_prefix_digests_.clear();
-    } catch (const std::logic_error&) {
+    } catch (const std::logic_error& invariant) {
         // A per-request planning/state invariant (stale epoch, unmoved endpoint, entitlement
         // mismatch, ...): the lane is already unwound by start_request, so abort this one
         // request instead of tearing down the whole engine.
-        abort_transaction();
+        //
+        // The abort acknowledgements assert catalog state that start_request may already have
+        // consumed. If one of them throws, keep the original invariant visible instead of
+        // replacing it with the acknowledgement's message.
+        try {
+            abort_transaction();
+        } catch (const std::logic_error& acknowledgement) {
+            throw std::logic_error(std::string(invariant.what()) +
+                                   " (abort acknowledgement failed: " + acknowledgement.what() +
+                                   ")");
+        }
         return out;
     } catch (...) {
         release_materialization_staging(transaction);
