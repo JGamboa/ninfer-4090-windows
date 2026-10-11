@@ -254,8 +254,8 @@ int main() {
         with_reference.push_back(expected[*at]);
         std::vector<ninfer::TokenId> with_ngram = context;
         with_ngram.push_back(actual[*at]);
-        const float reference_logprob = scorer.score_tokens(with_reference, target).back();
-        const float ngram_logprob     = scorer.score_tokens(with_ngram, target).back();
+        const float reference_logprob = scorer.score_tokens(with_reference, target).logprobs.back();
+        const float ngram_logprob     = scorer.score_tokens(with_ngram, target).logprobs.back();
         const double gap =
             std::abs(static_cast<double>(reference_logprob) - static_cast<double>(ngram_logprob));
         const bool tie = gap <= kTieNats;

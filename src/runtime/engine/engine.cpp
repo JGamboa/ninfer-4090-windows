@@ -374,7 +374,8 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->active->frontend.tokenize_text(text);
 }
 
-std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+CausalScore Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                 CausalScoreCapture capture) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -389,18 +390,22 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     }
     PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
     const std::size_t expected = prompt.summary().prompt_tokens - first_target;
-    std::vector<float> result  = std::visit(
-        [&](auto& core) -> std::vector<float> {
+    CausalScore result         = std::visit(
+        [&](auto& core) -> CausalScore {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
-                return core->score(std::move(prompt.impl_->value), first_target);
+                return core->score(std::move(prompt.impl_->value), first_target, capture);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }
         },
         impl_->core);
-    if (result.size() != expected) {
-        throw std::logic_error("target Program returned an invalid causal score count");
+    if (result.logprobs.size() != expected ||
+        (capture.argmax ? result.argmax.size() != expected : !result.argmax.empty()) ||
+        (capture.hidden
+             ? result.hidden_size == 0 || result.hidden.size() != expected * result.hidden_size
+             : !result.hidden.empty())) {
+        throw std::logic_error("target Program returned an invalid causal score shape");
     }
     return result;
 }

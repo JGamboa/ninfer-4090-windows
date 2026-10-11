@@ -59,13 +59,15 @@ public:
     CausalScoreCore(const CausalScoreCore&)            = delete;
     CausalScoreCore& operator=(const CausalScoreCore&) = delete;
 
-    [[nodiscard]] std::vector<float> score(PreparedPrompt prompt, std::uint32_t first_target) {
+    [[nodiscard]] CausalScore score(PreparedPrompt prompt, std::uint32_t first_target,
+                                    CausalScoreCapture capture) {
         // One synchronous public call owns the sole job slot until its result is delivered.
         std::scoped_lock call_lock(call_mutex_);
-        auto job                               = std::make_unique<Job>();
-        job->prompt                            = std::move(prompt);
-        job->first_target                      = first_target;
-        std::future<std::vector<float>> result = job->promise.get_future();
+        auto job                        = std::make_unique<Job>();
+        job->prompt                     = std::move(prompt);
+        job->first_target               = first_target;
+        job->capture                    = capture;
+        std::future<CausalScore> result = job->promise.get_future();
         {
             std::lock_guard queue_lock(queue_mutex_);
             if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
@@ -120,7 +122,8 @@ private:
     struct Job {
         PreparedPrompt prompt;
         std::uint32_t first_target = 0;
-        std::promise<std::vector<float>> promise;
+        CausalScoreCapture capture;
+        std::promise<CausalScore> promise;
     };
 
     void worker_loop() noexcept {
@@ -136,11 +139,11 @@ private:
                 job = std::move(job_);
             }
             try {
-                std::vector<float> result;
+                CausalScore result;
                 {
                     std::scoped_lock lock(execution_mutex_);
-                    result =
-                        instance_.program->causal_score(std::move(job->prompt), job->first_target);
+                    result = instance_.program->causal_score(std::move(job->prompt),
+                                                             job->first_target, job->capture);
                 }
                 job->promise.set_value(std::move(result));
             } catch (...) {

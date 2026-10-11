@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
@@ -337,8 +338,8 @@ ProgramImpl::~ProgramImpl() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
-std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-                                             std::uint32_t first_target) {
+CausalScore ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                      CausalScoreCapture capture) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -380,8 +381,16 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         if (!released) { throw std::logic_error("causal score resources could not be released"); }
     };
 
-    std::vector<float> output;
-    output.reserve(token_count_size - first_target);
+    const std::size_t target_count = token_count_size - first_target;
+    const auto hidden_size =
+        static_cast<std::uint32_t>(parameters.model.config().text.hidden_size);
+    CausalScore output;
+    output.logprobs.reserve(target_count);
+    if (capture.argmax) { output.argmax.reserve(target_count); }
+    if (capture.hidden) {
+        output.hidden_size = hidden_size;
+        output.hidden.reserve(target_count * hidden_size);
+    }
     std::vector<TokenId> staged_targets;
     staged_targets.reserve(kCausalScoreTile);
     std::uint32_t staged_columns = 0;
@@ -419,9 +428,28 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                                               logprobs, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
                                                     cudaMemcpyDeviceToHost, device.stream));
+            if (capture.argmax) {
+                // target_logprobs has consumed target_ids on this stream; reuse it for the argmax.
+                ops::argmax(logits, target_ids,
+                            static_cast<std::int32_t>(
+                                parameters.model.resources().public_token_count),
+                            device.stream);
+                const std::size_t begin = output.argmax.size();
+                output.argmax.resize(begin + staged_columns);
+                CUDA_CHECK(cudaMemcpyAsync(output.argmax.data() + begin, target_ids.data,
+                                           target_ids.bytes(), cudaMemcpyDeviceToHost,
+                                           device.stream));
+            }
+            if (capture.hidden) {
+                // Each column of the [hidden_size, tile] staging tensor is one contiguous row.
+                const std::size_t begin = output.hidden.size();
+                output.hidden.resize(begin + std::size_t{staged_columns} * hidden_size);
+                CUDA_CHECK(cudaMemcpyAsync(output.hidden.data() + begin, hidden.data, hidden.bytes(),
+                                           cudaMemcpyDeviceToHost, device.stream));
+            }
             device.synchronize();
             const auto* host = static_cast<const float*>(score_logprobs_host->data());
-            output.insert(output.end(), host, host + staged_columns);
+            output.logprobs.insert(output.logprobs.end(), host, host + staged_columns);
             staged_targets.clear();
             staged_columns = 0;
             work.reset();
@@ -479,7 +507,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             }
         }
         flush();
-        if (output.size() != token_count_size - first_target) {
+        if (output.logprobs.size() != target_count) {
             throw std::logic_error("causal score produced the wrong number of logprobs");
         }
         cleanup();

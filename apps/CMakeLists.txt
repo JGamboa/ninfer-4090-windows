@@ -18,3 +18,7 @@ add_executable(ninfer-perplexity
 ninfer_internal_includes(ninfer-perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
+
+add_executable(ninfer-score-export score_export/main.cpp)
+ninfer_internal_includes(ninfer-score-export)
+target_link_libraries(ninfer-score-export PRIVATE ninfer_engine ninfer::json)

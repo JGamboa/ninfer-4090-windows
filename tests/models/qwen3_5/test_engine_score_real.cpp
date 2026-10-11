@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -42,9 +44,9 @@ int main() {
     }
     tokens.resize(1537);
 
-    const std::vector<float> all      = engine.score_tokens(tokens, 1);
-    const std::vector<float> suffix   = engine.score_tokens(tokens, 513);
-    const std::vector<float> repeated = engine.score_tokens(tokens, 513);
+    const std::vector<float> all      = engine.score_tokens(tokens, 1).logprobs;
+    const std::vector<float> suffix   = engine.score_tokens(tokens, 513).logprobs;
+    const std::vector<float> repeated = engine.score_tokens(tokens, 513).logprobs;
     if (all.size() != 1536 || suffix.size() != 1024 || repeated.size() != suffix.size()) {
         std::cerr << "causal scoring returned an invalid result shape\n";
         return 1;
@@ -62,6 +64,48 @@ int main() {
         }
         if (suffix[i] != repeated[i]) {
             std::cerr << "a repeated score window inherited prior State/KV\n";
+            return 1;
+        }
+    }
+
+    // Captured outputs. Capturing must not change the log-probabilities; the hidden rows of the
+    // suffix window are the full window's rows for the same predictors (both prefill from token
+    // 0 in the same chunks); a target replaced by its predictor's argmax is at least as likely
+    // as the original target under the same prefix.
+    const ninfer::CausalScoreCapture capture{.hidden = true, .argmax = true};
+    const ninfer::CausalScore full     = engine.score_tokens(tokens, 1, capture);
+    const ninfer::CausalScore tail     = engine.score_tokens(tokens, 513, capture);
+    const std::size_t width            = full.hidden_size;
+    if (full.logprobs != all || tail.logprobs != suffix || width == 0 ||
+        full.hidden.size() != all.size() * width || full.argmax.size() != all.size() ||
+        tail.hidden_size != width || tail.hidden.size() != suffix.size() * width ||
+        tail.argmax.size() != suffix.size()) {
+        std::cerr << "captured causal scoring changed log-probabilities or has a wrong shape\n";
+        return 1;
+    }
+    if (!std::equal(tail.hidden.begin(), tail.hidden.end(),
+                    full.hidden.begin() + static_cast<std::ptrdiff_t>(512 * width))) {
+        std::cerr << "suffix hidden rows differ from the full window's rows\n";
+        return 1;
+    }
+    for (const std::uint16_t bits : full.hidden) {
+        if ((bits & 0x7f80U) == 0x7f80U) {
+            std::cerr << "captured hidden state is not finite\n";
+            return 1;
+        }
+    }
+    for (const std::size_t target : {std::size_t{600}, std::size_t{1000}, std::size_t{1400}}) {
+        const ninfer::TokenId best = full.argmax[target - 1];
+        if (best < 0) {
+            std::cerr << "captured argmax is negative\n";
+            return 1;
+        }
+        std::vector<ninfer::TokenId> replaced = tokens;
+        replaced[target]                      = best;
+        const float best_logprob =
+            engine.score_tokens(replaced, static_cast<std::uint32_t>(target)).logprobs.front();
+        if (best_logprob < all[target - 1] - 1e-3F) {
+            std::cerr << "the captured argmax is less likely than the original target\n";
             return 1;
         }
     }

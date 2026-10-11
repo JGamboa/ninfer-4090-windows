@@ -224,6 +224,20 @@ struct EngineOptions {
     StartupObserver startup_observer;
 };
 
+// Optional per-target outputs of Engine::score_tokens beyond the log-probabilities. Both describe
+// the predictor of each scored target i, i.e. the model state after tokens[0..i).
+struct CausalScoreCapture {
+    bool hidden = false; // the final-norm hidden state the LM head and the MTP layer consume
+    bool argmax = false; // the model's argmax over the public vocabulary
+};
+
+struct CausalScore {
+    std::vector<float> logprobs;       // log p(tokens[i] | tokens[0..i)), one per target
+    std::vector<std::uint16_t> hidden; // BF16 bits, [targets, hidden_size] row-major, if captured
+    std::vector<TokenId> argmax;       // one per target, if captured
+    std::uint32_t hidden_size = 0;     // nonzero when hidden was captured
+};
+
 enum class SamplingMode : std::uint8_t {
     Thinking,
     NonThinking,

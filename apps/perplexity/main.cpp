@@ -291,7 +291,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             const Clock::time_point window_started = Clock::now();
             std::vector<float> logprobs;
             try {
-                logprobs = engine.score_tokens(std::move(input), window.first_target);
+                logprobs = engine.score_tokens(std::move(input), window.first_target).logprobs;
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
