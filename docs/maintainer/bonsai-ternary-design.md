@@ -2815,6 +2815,52 @@ Next steps, in order:
       return the same JSON.
     - The launchers and the README now use `--draft-tokens 3` for Bonsai; Qwen3.8 already did.
 
+37. MTP self-distillation (measured 2026-10-11, RTX 4090 headless, CUDA 13.4; pipeline in
+    [`tools/mtp_distill`](../../tools/mtp_distill/README.md)). Bonsai's MTP layer is Qwen3.8's,
+    trained against the unquantized model; it was retrained against Bonsai's own argmax.
+    - Export: `Engine::score_tokens` takes a `CausalScoreCapture` and returns, per target, the
+      final-norm hidden state (the MTP layer's input) and the model's argmax over the public
+      vocabulary; `ninfer-score-export` writes them for a JSONL of texts. Quick perplexity with
+      the capture-capable binary is unchanged (5.854903518, bf16 KV), and
+      `ninfer_qwen3_5_score_real_test` checks that capturing leaves the log-probabilities
+      unchanged, that suffix-window hidden rows equal the full window's bit for bit, and that
+      the argmax is at least as likely as the original target.
+    - PyTorch reproduction: `mtp_torch.py` ports the MTP layer; the embedding is the t5 table
+      decoded with `signs * H_1024(row)`. On six runtime greedy texts the PyTorch first-draft
+      accuracy over all answer columns is 73.0 % against the runtime's 66.5 % per round; per
+      prompt the two agree within 0-8 points (story 59.2 / 59.3 %), the gap being the
+      per-round sampling of positions just after a rejection.
+    - Data: 3,342 prompts (1,496 Magicoder code problems in ten languages, 1,000 English and 800
+      Spanish oasst2 prompts, 46 edit/JSON/math templates), answered by Bonsai through
+      `ninfer-serve` (model-card sampling, 30 % thinking): 2.98 M completion tokens in 2.0 h;
+      export 11 min, 3.49 M tokens, 33 GB.
+    - Training: three teacher-forced chained draft steps, loss weights 1 / 0.6 / 0.4, AdamW lr
+      1e-5 with cosine decay, one epoch (3,000 texts, 16 min), initialized from the Q8 MTP of
+      `qwen3_8_27b_a8.ninfer`. Held-out accuracy (342 texts, 351,649 columns), steps 1 / 2 / 3:
+      67.8 / 59.7 / 55.3 % -> 78.9 / 71.1 / 66.9 % (1,000 steps: 78.0 / 69.8 / 65.4 %). A
+      143 K-token pilot gave +6.4 % decode; chaining moved the pilot's step 1 / 2 / 3 from
+      80.6 / 69.7 / 62.6 % (step 1 only) to 80.2 / 70.8 / 65.3 %.
+    - Artifact: `patch_mtp` rewrote the 13 MTP objects of `bonsai2_27b_vl_mtp_q4q5.ninfer` in
+      their stored formats (re-encoding the original objects reproduces them byte for byte):
+      `E:\LLM\bonsai2_27b_vl_mtp_retrained.ninfer`.
+    - Runtime, alternated (original, retrained, retrained, original), rk4v4-e8, MTP 3,
+      `--lm-head-draft`:
+
+      | Workload | Original | Retrained |
+      |---|---:|---:|
+      | Six prompts, greedy, thinking off, 512 tokens | 225.6 / 225.5 tok/s | **252.1 / 252.2 tok/s** (+11.8 %) |
+      | Same, with `--ngram chain` | 226.0 / 225.8 tok/s | 251.3 / 251.3 tok/s (+11.2 %) |
+      | Four prompts x seeds 11, 22, model-card sampling, thinking on, 1024 tokens, n-gram | 190.7 / 190.4 tok/s | **220.5 / 220.4 tok/s** (+15.7 %) |
+      | JSON and document edits, MTP 3 + n-gram, greedy | 611 / 812 tok/s | 618 / 840 tok/s |
+
+      Six prompts greedy: 2.348 -> 2.620 tokens per round, position-1 acceptance 68.1 ->
+      75.8 %, draft acceptance 44.8 -> 54.0 %, 10.41 -> 10.39 ms per round; every prompt is
+      faster (Spanish summary 172 -> 212 tok/s). Edit-style answers are mostly n-gram drafts,
+      so a better MTP adds little there. The Python-module and C++ edit prompts of item 36 did
+      not run in this script (quoting of their source text), so that row has two prompts.
+    - Adopted: `start-bonsai-server - ninfer.bat` serves the retrained artifact. The published
+      Hugging Face artifact is unchanged.
+
 ## Appendix: sources
 
 - Model card and packings: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
