@@ -167,14 +167,14 @@ def _import_stored(model, recipe, reference: NInferArtifactStore) -> None:
         model.resources[object_id] = reference.read_object(object_id)
 
 
-def qwen3_8_27b_a8(model, recipe, sources):
-    """`qwen3_8_27b` with AllowA8 on the inputs of the text layers' Q4/Q5 GEMMs.
+def _dense_a8(model, recipe, sources, vocabulary):
+    """`_dense_groupwise` with AllowA8 on the inputs of the text layers' Q4/Q5 GEMMs.
 
-    With a `reference` source (an existing `qwen3_8_27b` artifact) the weights, the indexed
-    proposal head and the resources are copied from its stored words instead of quantized from
-    the BF16 checkpoint; `--model` then supplies only the configuration. Do not pass
-    `--proposal` in that case."""
-    _dense_groupwise(model, recipe, Q8)
+    With a `reference` source (an existing artifact of the same non-A8 recipe) the weights, the
+    indexed proposal head and the resources are copied from its stored words instead of
+    quantized from the BF16 checkpoint; `--model` then supplies only the configuration. Do not
+    pass `--proposal` in that case."""
+    _dense_groupwise(model, recipe, vocabulary)
     if "reference" in sources:
         _import_stored(model, recipe, sources["reference"])
     for name, parameter in model.parameters.items():
@@ -182,18 +182,31 @@ def qwen3_8_27b_a8(model, recipe, sources):
             recipe.assign(name, activation_policy="AllowA8")
 
 
-def qwen3_8_27b_a8_mtp_q4q5(model, recipe, sources):
-    """`qwen3_8_27b_a8` with the MTP layer's projections in the dense Q4/Q5 mix instead of Q8.
+def _mtp_layer_q4q5(model, recipe, sources):
+    """The MTP layer's projections in the dense Q4/Q5 mix instead of Q8.
 
-    With a `reference`, those projections are requantized from the reference's decoded values;
+    With a `reference`, they are requantized from the reference's decoded values;
     `mtp/input_projection` keeps its Q8 words. The draft runs the layer once per draft token, so
-    this cuts the bytes each round reads (design doc section 9.1)."""
-    qwen3_8_27b_a8(model, recipe, sources)
-    reference = sources.get("reference")
+    this cuts the bytes each round reads (WINDOWS_PORT.md, 2026-10-11)."""
+    reference = sources["reference"] if "reference" in sources else None
     for name, parameter in model.parameters.items():
         if parameter.projection and name.startswith("mtp/layers/"):
             source = None if reference is None else reference.parameter_source(name, parameter.shape)
             _assign(recipe, name, _mixed_format(name), source=source)
+
+
+def qwen3_8_27b_a8(model, recipe, sources):
+    _dense_a8(model, recipe, sources, Q8)
+
+
+def qwen3_8_27b_a8_mtp_q4q5(model, recipe, sources):
+    _dense_a8(model, recipe, sources, Q8)
+    _mtp_layer_q4q5(model, recipe, sources)
+
+
+def qwen3_6_27b_a8_mtp_q4q5(model, recipe, sources):
+    _dense_a8(model, recipe, sources, Q6)
+    _mtp_layer_q4q5(model, recipe, sources)
 
 
 def qwen3_6_35b_a3b(model, recipe, sources):
@@ -478,6 +491,7 @@ def _bonsai2_27b_mtp(layer):
 
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
+    "qwen3_6_27b_a8_mtp_q4q5": qwen3_6_27b_a8_mtp_q4q5,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_a8": qwen3_8_27b_a8,

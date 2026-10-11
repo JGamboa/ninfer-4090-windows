@@ -53,6 +53,7 @@ The built-in recipes are ordinary Python functions in
 | Recipe | Main representation choices | Additional source |
 |---|---|---|
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
+| `qwen3_6_27b_a8_mtp_q4q5` | `qwen3_6_27b` with `AllowA8` (as `qwen3_8_27b_a8`) and the MTP layer in the Q4/Q5 mix | Optional `reference` |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
 | `qwen3_8_27b_a8` | `qwen3_8_27b` with `AllowA8` on the text layers' Q4/Q5 projection inputs | Optional `reference` |
 | `qwen3_8_27b_a8_mtp_q4q5` | `qwen3_8_27b_a8` with the MTP layer's projections in the Q4/Q5 mix instead of Q8 | Optional `reference` |

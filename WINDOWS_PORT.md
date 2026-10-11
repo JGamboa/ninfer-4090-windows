@@ -1435,5 +1435,46 @@ new, new, base:
   ("Merges" / "Merge"). The base artifact alone also changes its greedy text between MTP 3,
   MTP 2 and no speculation on the same prompts, so this is the verification-order sensitivity
   already noted for Bonsai's draft window, not a change in the main model.
-- `tests/convert/test_qwen38_mtp_recipe.py` checks the requantization against the reference's
+- `tests/convert/test_qwen_mtp_recipe.py` checks the requantization against the reference's
   decoded values and that every other parameter is copied word for word.
+
+## Qwen3.6-27B (2026-10-11)
+
+`Qwen/Qwen3.6-27B` (revision `6a9e13bd`, Apache 2.0, the same architecture and MTP layout as
+Qwen3.8) converted from BF16 with the new `qwen3_6_27b_a8_mtp_q4q5` recipe: the official
+`qwen3_6_27b` representation (Q4/Q5 layers, Q6 embedding and output head; upstream measured
+AIME 2026 93.3 % and GPQA-Diamond 86.9 % with it on the RTX 5090), `AllowA8` prefill, and the
+MTP layer in the Q4/Q5 mix. No DFlash2 (its drafter is trained for Qwen3.8). 119 s on CUDA,
+17,317,444,864 bytes, 15.8 GiB of weights on the GPU:
+
+```powershell
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\qwen36-src --recipe qwen3_6_27b_a8_mtp_q4q5 `
+  --components text,vision,mtp --resource chat_template.jinja=tools/chat_templates/qwen3_6.jinja `
+  --proposal --name qwen3.6-27b --device cuda --out E:\LLM\qwen3_6_27b_a8_mtpq4q5.ninfer
+```
+
+Against `qwen3_8_27b_a8_mtpq4q5.ninfer` on the same binary (`62875ced`), RTX 4090 headless:
+
+| Measurement | Qwen3.6 | Qwen3.8 |
+|---|---:|---:|
+| Decode, six prompts, MTP 3, greedy, thinking off (q36, q38, q38, q36) | **125.8 / 125.7 tok/s** | 120.9 / 120.9 tok/s |
+| MTP acceptance / tokens per round | 58.3 % / 2.757 | 56.1 % / 2.685 |
+| `long_niah_8k` / `long_niah_64k` prefill (rk4v4-e8, chunk 1024) | 1.4 / 14.9 s, exact | 1.4 / 14.7 s, exact |
+| Quick perplexity, bf16 KV | 7.1294 | 4.7944 |
+| `tools.eval`, 45 tasks, thinking off | 43/45 | 44/45 |
+| Six hard problems, thinking on, sampled, 3 seeds, up to 20,000 tokens | 14/18, 204,307 tokens | 18/18, 62,059 tokens |
+
+- Perplexity by domain (Qwen3.6 / Qwen3.8): Chinese reference 26.51 / 6.78, English long form
+  6.80 / 7.18, English reference 7.63 / 6.43, NInfer code 1.85 / 1.67. Only the Chinese
+  reference domain is far apart, and Qwen3.6 is better on English long form, so the gap is a
+  model difference (most likely Qwen3.8 having seen that reference text), not a uniform
+  quantization loss.
+- `tools.eval`: both fail `json.order_total`; Qwen3.6 also fails `code.lru_cache`. Tool
+  calling, JSON, math, Spanish and the 4K-32K needles pass on both.
+- Hard problems (the Swift 1.5 protocol): Qwen3.6 thinks 3.3x longer; five runs hit the
+  20,000-token limit (all three `pairs` runs and two `mod7` runs; one `mod7` answer was already
+  in the reasoning). Decode with thinking ran at 149.7 tok/s. Mean tokens per problem
+  (Qwen3.6 / Qwen3.8): AIME #1 12,008 / 1,318, probability 6,916 / 1,177, pairs 20,000 (limit) /
+  11,600, zebra 3,376 / 2,916, mod 7 18,683 / 1,627, clock 7,119 / 2,047.
+- Qwen3.6 is the faster model per token and matches Qwen3.8 without thinking; with thinking it
+  spends several times more tokens per answer, so Qwen3.8 stays the default.

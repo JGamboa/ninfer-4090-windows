@@ -1,4 +1,4 @@
-"""`qwen3_8_27b_a8_mtp_q4q5` from a reference artifact of the `qwen3_8_27b` recipe.
+"""`qwen3_{8,6}_27b_a8_mtp_q4q5` from a reference artifact of the matching non-A8 recipe.
 
 The reference is a random Qwen3.8-shaped artifact (the Bonsai fixture's small geometry). The
 oracle is the reference's own stored words and decoded values: every parameter outside the MTP
@@ -13,7 +13,7 @@ import torch
 
 from tools.artifact.formats import DirectFormat, get_format
 from tools.convert.__main__ import main as convert_main
-from tools.convert.official_recipes import qwen3_8_27b
+from tools.convert.official_recipes import qwen3_6_27b, qwen3_8_27b
 from tools.convert.pipeline import convert
 from tools.convert.qwen3_5 import build_model
 from tools.convert.recipe import Recipe
@@ -32,9 +32,12 @@ _Q4 = {"attention/query", "attention/key", "mlp/gate", "mlp/up"}
 _QMAX = {"q4_g64_fp16": 7, "q5_g64_fp16": 15}
 
 
-@pytest.fixture(scope="module")
-def converted(tmp_path_factory):
-    tmp = tmp_path_factory.mktemp("qwen38_mtp")
+_CASES = {"qwen3_8_27b_a8_mtp_q4q5": qwen3_8_27b, "qwen3_6_27b_a8_mtp_q4q5": qwen3_6_27b}
+
+
+@pytest.fixture(scope="module", params=sorted(_CASES))
+def converted(request, tmp_path_factory):
+    tmp = tmp_path_factory.mktemp(request.param)
     config_dir = tmp / "config"
     write_resources(config_dir)
     reference = tmp / "reference.ninfer"
@@ -44,13 +47,13 @@ def converted(tmp_path_factory):
         generator = torch.Generator().manual_seed(5)
         for name, parameter in model.parameters.items():
             recipe.assign(name, source=array_source(torch.randn(parameter.shape, generator=generator), name))
-        qwen3_8_27b(model, recipe, {})
+        _CASES[request.param](model, recipe, {})
         convert(model, recipe, reference, device="cpu")
     out = tmp / "mtp_q4q5.ninfer"
     convert_main(
         [
             "--model", str(config_dir),
-            "--recipe", "qwen3_8_27b_a8_mtp_q4q5",
+            "--recipe", request.param,
             "--components", "text,mtp",
             "--source", f"reference={reference}",
             "--device", "cpu",
