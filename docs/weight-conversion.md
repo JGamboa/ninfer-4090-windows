@@ -55,6 +55,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
 | `qwen3_8_27b_a8` | `qwen3_8_27b` with `AllowA8` on the text layers' Q4/Q5 projection inputs | Optional `reference` |
+| `qwen3_8_27b_a8_mtp_q4q5` | `qwen3_8_27b_a8` with the MTP layer's projections in the Q4/Q5 mix instead of Q8 | Optional `reference` |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
@@ -98,6 +99,15 @@ python3 -m tools.convert \
   --name qwen3.8-27b \
   --out models/qwen3_8_27b_a8.ninfer
 ```
+
+`qwen3_8_27b_a8_mtp_q4q5` is `qwen3_8_27b_a8` with the MTP layer's attention and MLP
+projections in the same Q4/Q5 mix as the text layers (Q4 for query/key and gate/up, Q5 for the
+rest); `mtp/input_projection` stays Q8. With `--source reference=...` those projections are
+requantized from the reference's decoded values and everything else is copied word for word.
+The draft runs this layer once per draft token, so the smaller layer shortens each MTP round
+(Qwen3.8 MTP 3 on the RTX 4090: 22.79 to 22.20 ms per round, with the same acceptance). Main
+model outputs are not changed by the MTP format, but greedy text can resolve near-ties
+differently because the acceptance pattern changes the verification order.
 
 The configuration directory holds the Qwen3.8 `config.json` and the frontend resource files
 (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`,

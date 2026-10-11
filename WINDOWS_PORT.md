@@ -1384,3 +1384,56 @@ and 3, Qwen3.8 MTP 3, with and without n-gram), every needle answer exact. Measu
 | Qwen3.8 A8 MTP 3, six prompts | 118.2 / 118.2 tok/s | 118.5 / 118.4 tok/s |
 | Qwen3.8 A8 `pp2048` | 5,745 / 5,713 tok/s | 5,825 / 5,891 tok/s |
 | Qwen3.8 A8 `long_niah_64k` | 15.1 / 15.1 s | 14.9 / 14.9 s |
+
+## Qwen3.8 decode profile and a Q4/Q5 MTP layer (2026-10-11)
+
+Profile (measured, nsys, `profiles/nsys/qwen38_a8_mtp3_{code,story}`): `qwen3_8_27b_a8.ninfer`,
+rk4v4-e8, MTP 3 with `--lm-head-draft`, greedy, thinking off, 512 tokens, build `e905787f`, 4090
+headless. Plain runs: code prompt 147.7 tok/s (78.2 % acceptance, 3.34 tokens per round), story
+95.2 tok/s (38.8 %, 2.16). Both run 23.2 ms per round with the GPU busy 22.4 ms (96.5 %):
+
+| Kernel family (per round) | ms | Bytes read | GB/s |
+|---|---:|---:|---:|
+| Q4 MLP gate+up, K-split MMA (64 x 110.7 us) | 7.08 | 6.06 GB | 856 |
+| Q5 MLP down + o_proj/out_proj, split2 (128 calls) | 6.11 | 5.06 GB | 829 |
+| GDN input projection, Q5 split4 + Q4 SIMT (48 + 48) | 3.03 | 2.51 GB | 830 |
+| Attention input projection, Q5 split4 + Q4 SIMT (16 + 16) | 0.89 | 0.70 GB | 783 |
+| Q8 output head for verification (1 x 1.43 ms) | 1.43 | 1.31 GB | 917 |
+| Q8 MTP layer, three drafts (15 calls) | 1.49 | 1.31 GB | 880 |
+| Q4 proposal head, three drafts (3 x 376 us) | 1.13 | 1.07 GB | 948 |
+| GDN recurrence, attention, norms and the rest | 1.3 | | |
+
+Every weight stream runs at 783-948 GB/s against the ~845 GB/s sequential ceiling measured on
+this card, so the round is bandwidth bound: ~18 GB of weights per round. The kernels have little
+left; the remaining lever is the bytes. The draft side (MTP layer and proposal head) reads 2.4 GB
+of the 18 GB, and the MTP layer was still Q8 although Bonsai showed in September that a Q4/Q5 MTP
+layer keeps its acceptance (Bonsai design notes, section 9.1, item 11).
+
+New recipe `qwen3_8_27b_a8_mtp_q4q5` (`tools/convert/official_recipes.py`): `qwen3_8_27b_a8`
+with the MTP layer's projections requantized to the Q4/Q5 mix from the reference's decoded values
+(`mtp/input_projection` stays Q8). Converted from the A8 artifact in 147 s on CUDA; 20,259,427,584
+bytes against 20,437,521,664:
+
+```powershell
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\bonsai2-27b-vl --recipe qwen3_8_27b_a8_mtp_q4q5 `
+  --source reference=E:\LLM\qwen3_8_27b_a8.ninfer --source dflash2=E:\LLM\dflash2-src `
+  --components text,vision,mtp,dflash2 --name qwen3.8-27b --device cuda `
+  --out E:\LLM\qwen3_8_27b_a8_mtpq4q5.ninfer
+```
+
+Six prompts, MTP 3, `--lm-head-draft`, rk4v4-e8, greedy, thinking off, 512 tokens, order base,
+new, new, base:
+
+| Artifact | Decode | ms per round | Acceptance | Tokens per round |
+|---|---:|---:|---:|---:|
+| Q8 MTP layer (base) | 117.1 / 116.9 tok/s | 22.774 / 22.813 | 55.4 % | 2.666 |
+| Q4/Q5 MTP layer | **121.0 / 120.9 tok/s** | **22.191 / 22.203** | 56.1 % | 2.685 |
+
+- +3.3 % decode; the round is 0.60 ms shorter (the estimate from the bytes was ~0.6 ms) and
+  acceptance does not fall.
+- Greedy text matches on two of the six prompts; the other four diverge early at near-ties
+  ("Merges" / "Merge"). The base artifact alone also changes its greedy text between MTP 3,
+  MTP 2 and no speculation on the same prompts, so this is the verification-order sensitivity
+  already noted for Bonsai's draft window, not a change in the main model.
+- `tests/convert/test_qwen38_mtp_recipe.py` checks the requantization against the reference's
+  decoded values and that every other parameter is copied word for word.

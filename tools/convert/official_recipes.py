@@ -182,6 +182,20 @@ def qwen3_8_27b_a8(model, recipe, sources):
             recipe.assign(name, activation_policy="AllowA8")
 
 
+def qwen3_8_27b_a8_mtp_q4q5(model, recipe, sources):
+    """`qwen3_8_27b_a8` with the MTP layer's projections in the dense Q4/Q5 mix instead of Q8.
+
+    With a `reference`, those projections are requantized from the reference's decoded values;
+    `mtp/input_projection` keeps its Q8 words. The draft runs the layer once per draft token, so
+    this cuts the bytes each round reads (design doc section 9.1)."""
+    qwen3_8_27b_a8(model, recipe, sources)
+    reference = sources.get("reference")
+    for name, parameter in model.parameters.items():
+        if parameter.projection and name.startswith("mtp/layers/"):
+            source = None if reference is None else reference.parameter_source(name, parameter.shape)
+            _assign(recipe, name, _mixed_format(name), source=source)
+
+
 def qwen3_6_35b_a3b(model, recipe, sources):
     if "num_experts" not in model.config:
         raise ValueError("this official recipe requires Qwen3.5 MoE mathematics")
@@ -467,6 +481,7 @@ RECIPES = {
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_a8": qwen3_8_27b_a8,
+    "qwen3_8_27b_a8_mtp_q4q5": qwen3_8_27b_a8_mtp_q4q5,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "bonsai2_27b": bonsai2_27b,
