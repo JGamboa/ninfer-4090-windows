@@ -1,13 +1,14 @@
 # NInfer-4090 for Windows
 
 A C++20/CUDA inference engine specialized for **one NVIDIA GeForce RTX 4090** (`sm_89`), built
-and run natively on **Windows 11** (MSVC + CUDA; no WSL, no Docker). It serves two 27B models of
+and run natively on **Windows 11** (MSVC + CUDA; no WSL, no Docker). It serves 27B models of
 the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP server:
 
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **229 tok/s** | **648 tok/s** (MTP + n-gram) | **6,027 tok/s** |
-| **Qwen3.8-27B, int8 prefill** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 19.0 GiB | **120 tok/s** | **289 tok/s** (MTP + n-gram) | **5,860 tok/s** |
+| **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision, self-distilled MTP) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **252 tok/s** | **840 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Qwen3.8-27B, int8 prefill, Q4/Q5 MTP** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 18.9 GiB | **121 tok/s** | **289 tok/s** (MTP + n-gram) | **5,860 tok/s** |
+| **Qwen3.6-27B, int8 prefill, Q4/Q5 MTP** | [jgamboa/Qwen3.6-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.6-27B-NInfer-4090) | 16.1 GiB | **126 tok/s** | — | — |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
@@ -57,7 +58,7 @@ otherwise; the conditions are next to each table. Both models run the full 262K-
 [latest release](https://github.com/JGamboa/ninfer-4090-windows/releases/latest) and unzip it.
 It needs only an NVIDIA driver 595 or newer and the
 [VC++ 2015-2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe): the CUDA
-runtime is built into the executables, and the zip includes the DLLs, two server launchers and
+runtime is built into the executables, and the zip includes the DLLs, three server launchers and
 the licenses. Skip to step 2.
 
 **Or build from source** from a "x64 Native Tools" prompt (or after running `vcvars64.bat`) with
@@ -81,28 +82,34 @@ CUDA `bin` directory on `PATH`. Build details and the Windows-specific changes a
 ### 2. Download a model
 
 ```bat
-:: Ternary Bonsai 2 27B: text + vision + MTP head (6.4 GiB)
-hf download jgamboa/Ternary-Bonsai-2-27B-NInfer-4090 bonsai2_27b_vl_mtp_q4q5.ninfer --local-dir E:\LLM
+:: Ternary Bonsai 2 27B: text + vision + self-distilled MTP head (6.4 GiB)
+hf download jgamboa/Ternary-Bonsai-2-27B-NInfer-4090 bonsai2_27b_vl_mtp_retrained.ninfer --local-dir E:\LLM
 
-:: Qwen3.8-27B with int8 prefill: text + vision + MTP + DFlash2 (19.0 GiB)
-hf download jgamboa/Qwen3.8-27B-NInfer-4090 qwen3_8_27b_a8.ninfer --local-dir E:\LLM
+:: Qwen3.8-27B with int8 prefill: text + vision + Q4/Q5 MTP + DFlash2 (18.9 GiB)
+hf download jgamboa/Qwen3.8-27B-NInfer-4090 qwen3_8_27b_a8_mtpq4q5.ninfer --local-dir E:\LLM
 
-:: or the official Qwen3.8-27B artifact (same weights, BF16 prefill)
+:: Qwen3.6-27B with int8 prefill: text + vision + Q4/Q5 MTP (16.1 GiB)
+hf download jgamboa/Qwen3.6-27B-NInfer-4090 qwen3_6_27b_a8_mtpq4q5.ninfer --local-dir E:\LLM
+
+:: or the official Qwen3.8-27B artifact (same main weights, BF16 prefill, Q8 MTP)
 hf download neroued/Qwen3.8-27B-NInfer qwen3_8_27b.ninfer --local-dir E:\LLM
 ```
 
-Any folder works; the examples below use `E:\LLM`. The Bonsai repository also has
-`bonsai2_27b_vl.ninfer`, the same model with a Q8 MTP layer (3.5-4.8 % slower decode). Verify
-each download against the checksums on its model card.
+Any folder works; the examples below use `E:\LLM`. The Bonsai repository also keeps
+`bonsai2_27b_vl_mtp_q4q5.ninfer` (the MTP layer before self-distillation, 12-16 % slower decode)
+and `bonsai2_27b_vl.ninfer` (Q8 MTP layer); the Qwen3.8 repository keeps `qwen3_8_27b_a8.ninfer`
+(Q8 MTP layer, 3 % slower decode). Qwen3.6 thinks about 3.3x longer than Qwen3.8 on hard
+problems, so Qwen3.8 stays the recommended Qwen. Verify each download against the checksums on
+its model card.
 
 ### 3. Run from the command line
 
 ```bat
-build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
+build\apps\ninfer.exe E:\LLM\bonsai2_27b_vl_mtp_retrained.ninfer ^
   --prompt "Write a Python function that merges two sorted lists." ^
   --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 3 --lm-head-draft
 
-build\apps\ninfer.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
+build\apps\ninfer.exe E:\LLM\qwen3_8_27b_a8_mtpq4q5.ninfer ^
   --prompt "Write a Python function that merges two sorted lists." ^
   --max-context 8192 --max-new 1024 --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain
 ```
@@ -118,7 +125,7 @@ list every option.
 Ternary Bonsai 2 27B, full 262K context per request, three concurrent requests, vision on:
 
 ```bat
-build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
+build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_retrained.ninfer ^
   --host 127.0.0.1 --port 8080 --model-id bonsai-27b ^
   --max-context 262144 --kv-capacity auto --kv-dtype rk4v4-e8 --max-concurrency 3 ^
   --spec mtp --draft-tokens 3 --lm-head-draft --ngram chain --vision
@@ -127,7 +134,7 @@ build\apps\ninfer-serve.exe E:\LLM\bonsai2_27b_vl_mtp_q4q5.ninfer ^
 Qwen3.8-27B, 100K context, three concurrent requests:
 
 ```bat
-build\apps\ninfer-serve.exe E:\LLM\qwen3_8_27b_a8.ninfer ^
+build\apps\ninfer-serve.exe E:\LLM\qwen3_8_27b_a8_mtpq4q5.ninfer ^
   --host 127.0.0.1 --port 8080 --model-id qwen3.8-27b ^
   --max-context 100000 --kv-capacity 100000 --kv-dtype rk4v4-e8 --max-concurrency 3 ^
   --max-pending-requests 10 --pending-timeout-ms 600000 --prefill-chunk 1408 ^
