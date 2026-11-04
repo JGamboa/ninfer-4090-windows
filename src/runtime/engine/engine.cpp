@@ -10,6 +10,17 @@
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/slot_spill_guard.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <timeapi.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -245,6 +256,19 @@ public:
         std::unique_lock lock(writer_mutex);
         writer_cv.wait(lock, [this] { return pending_writes.empty() && !write_in_flight; });
     }
+
+#ifdef _WIN32
+    // The scheduling loop polls with a 1 ms condition-variable timeout; the default 15.6 ms
+    // Windows timer stretches each poll to a full tick. Declared first so it covers startup
+    // and is released only after the core and device are gone.
+    struct WindowsTimerResolution {
+        WindowsTimerResolution() noexcept { ::timeBeginPeriod(1); }
+        ~WindowsTimerResolution() noexcept { ::timeEndPeriod(1); }
+        WindowsTimerResolution(const WindowsTimerResolution&)            = delete;
+        WindowsTimerResolution& operator=(const WindowsTimerResolution&) = delete;
+    };
+    WindowsTimerResolution timer_resolution;
+#endif
 
     EngineOptions options;
     DeviceContext device;

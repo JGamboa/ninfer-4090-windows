@@ -98,6 +98,28 @@ explicit specialization, so linking `ninfer.exe` failed with 4 unresolved extern
 body (`impl_ = std::move(other.impl_); return *this;`), which MSVC emits normally. GCC/Clang
 accepted the `= default` form, so this is MSVC-specific and Linux is unaffected.
 
+### 5. Timer resolution for the engine's 1 ms poll
+
+The engine's scheduling loop waits on a condition variable with a 1 ms timeout. Windows rounds
+that wait up to the system timer tick, 15.6 ms by default, so a request that polls (admission,
+context transactions) pays whole ticks. `Engine::Impl` (`src/runtime/engine/engine.cpp`) holds
+a `timeBeginPeriod(1)` / `timeEndPeriod(1)` guard for its whole lifetime (linked with `winmm`),
+so the CLI, the server and perplexity all get it. Adapted from headpiece747/ninfer-5090-windows
+(`63650cc6`, `c323ff3d`).
+
+Measured 2026-11-04 on the RTX 4090 (Bonsai, MTP 3, `ninfer-serve`, 30 sequential 8-token
+requests per run, runs alternated with the 2026.11.03 release binary; server `total` from
+`--request-log-jsonl`):
+
+| | Before | After |
+|---|---:|---:|
+| Request total, median | 57.5-58.4 ms | 57.3-59.6 ms |
+| Request total, mean | 65.2-65.7 ms | 61.2-61.7 ms |
+| Request total, p90 | 78.2-90.0 ms | 73.2-73.9 ms |
+| TTFT with a reused 3.9K-token system prefix | 120-123 ms | 73-82 ms |
+
+The median is unchanged; the poll mostly cost tail latency and requests that poll several times.
+
 ---
 
 ## Building on Windows

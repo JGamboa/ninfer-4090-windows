@@ -24,4 +24,7 @@ target_link_libraries(ninfer_engine PRIVATE
   ninfer_ops
   ninfer_text
   ninfer_media_decode)
+if(WIN32)
+  target_link_libraries(ninfer_engine PRIVATE winmm)
+endif()
 add_library(ninfer::engine ALIAS ninfer_engine)
