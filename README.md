@@ -9,7 +9,7 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 | **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision, self-distilled MTP) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **252 tok/s** | **840 tok/s** (MTP + n-gram) | **6,027 tok/s** |
 | **Qwen3.8-27B, int8 prefill, Q4/Q5 MTP** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 18.9 GiB | **121 tok/s** | **289 tok/s** (MTP + n-gram) | **5,860 tok/s** |
 | **Qwen3.6-27B, int8 prefill, Q4/Q5 MTP** | [jgamboa/Qwen3.6-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.6-27B-NInfer-4090) | 16.1 GiB | **126 tok/s** | — | — |
-| **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 211 tok/s (DFlash2, code) | 2,762 tok/s |
+| **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 402 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
 
 The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
@@ -210,7 +210,7 @@ machine:
 | Decode, MTP 3, mean of six mixed prompts, thinking off | **120 tok/s** |
 | Decode, MTP 3, mean of six mixed prompts, thinking on (2026-09-25) | 107 tok/s |
 | Decode, MTP 3, code prompt, thinking off (server) | 149 tok/s |
-| Decode, DFlash2 draft 12, code prompt, thinking off | **211 tok/s** |
+| Decode, DFlash2 draft 12, code prompt, thinking off (server, 2026-11-16) | **402 tok/s** |
 | Decode, MTP 3 + n-gram, edit-style prompts, thinking off | **289 tok/s** |
 | Decode, MTP 3 + n-gram, 7K-11K-token file edits through the server, thinking on | 258 tok/s |
 | Prefill, `pp512` / `pp2048`, official artifact / int8 artifact | 2,536 / 2,762 tok/s, **5,340 / 5,830-5,890 tok/s** |
@@ -255,7 +255,9 @@ Decode tok/s, KV `rk4v4-e8`:
 
 CLI rows: one request, greedy, up to 1024 tokens. Server rows: `ninfer-serve` with the launcher
 flags above (three lanes, sampling and thinking defaults), one request at a time. Measured on
-2026-09-24/25 with the monitor on the 4090. The Bonsai default is now MTP 3; on the same CLI
+2026-09-24/25 with the monitor on the 4090. The DFlash2 d6 column predates the Q4/Q5 tensor-core
+verification kernels of 2026-11-16, which speed DFlash2 up by 9-14 % on the code prompt (see
+[Qwen3.8-27B](#qwen38-27b)) and were not re-measured on these workloads. The Bonsai default is now MTP 3; on the same CLI
 prompts (2026-10-05, 4090 headless) it gives 368 tok/s on edit-style prompts, 648 with n-gram and
 190-235 tok/s on prose.
 
@@ -267,7 +269,7 @@ not change; only the speed does.
 | Model | Recommended | When to change |
 |---|---|---|
 | Bonsai | `--spec mtp --draft-tokens 3 --lm-head-draft --ngram chain` | Default since 2026-10-05: against `--draft-tokens 2` it is 20 % faster on edit-style prompts (368 against 308 tok/s), 2-3 % faster with n-gram and between -2 % and +7 % on prose (CLI, greedy, thinking off, 4090 headless) |
-| Qwen3.8 | `--spec mtp --draft-tokens 3 --lm-head-draft --ngram chain` | `--spec dflash2 --draft-tokens 6` is faster on free-form prose (99 against 85 tok/s through the server); `--draft-tokens 12` peaks at 211 tok/s on code. DFlash2 loads 1.6 GiB more weights; with three lanes, `--no-cuda-graph` frees about 1.1 GiB of graph memory for about 4 % of decode speed |
+| Qwen3.8 | `--spec mtp --draft-tokens 3 --lm-head-draft --ngram chain` | `--spec dflash2 --draft-tokens 6` is faster on free-form prose (99 against 85 tok/s through the server); `--draft-tokens 12` peaks at 402 tok/s on code (server, quicksort/mergesort request, 2026-11-16). DFlash2 loads 1.6 GiB more weights; with three lanes, `--no-cuda-graph` frees about 1.1 GiB of graph memory for about 4 % of decode speed |
 
 `--ngram chain` extends each MTP proposal with text copied from the context, so rounds that
 reproduce code, JSON, tool calls or documents accept 10 or more tokens. It costs a second set of

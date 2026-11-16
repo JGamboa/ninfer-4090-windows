@@ -1558,3 +1558,14 @@ where text is copied (long_py K=7 327 -> 408, K=15 352 -> 535) and costs where i
 
 Dropped: no clear win over MTP3+ngram or DFlash2 K=7. A gate that knew the neural draft's
 confidence (device side) would be the next thing to try; the prototype diff is not kept in the tree.
+
+### DFlash2 code prompt, README protocol, before and after (2026-11-16)
+
+`ninfer-serve --kv-dtype rk4v4-e8 --spec dflash2 --draft-tokens K --lm-head-draft`, the
+quicksort/mergesort request (thinking off, temperature 0, 500 tokens), `qwen3_8_27b_a8_mtpq4q5`,
+original binary of 2026-11-04 against the rebuilt tree (Q5 small-T and Q4 T=5/6 kernels),
+alternated over three server starts of three requests each, run-to-run spread under 1 %:
+K=12 352.2 -> 402.5 tok/s (+14 %, 10.72 tokens per round in both); K=6 234.5 -> 256.1 tok/s
+(+9 %, 6.62 -> 6.35 tokens per round: the greedy text diverges slightly under the new kernels'
+accumulation order, +14 % per round). README rows updated from the 211 tok/s of 2026-09-21; that
+number was already stale: the original binary measures 352 tok/s today.
