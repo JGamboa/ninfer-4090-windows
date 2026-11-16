@@ -93,6 +93,12 @@ void launch_q4_ksplit_band(const Tensor& x, const Weight& weight, Tensor& q, Ten
         throw std::invalid_argument("attention Q4 K-split requires padded K == hidden");
     }
     switch (x.ne[1]) {
+    case 5:
+        launch_q4_ksplit_exact<5>(x, weight, q, key, stream);
+        return;
+    case 6:
+        launch_q4_ksplit_exact<6>(x, weight, q, key, stream);
+        return;
     case 7:
         launch_q4_ksplit_exact<7>(x, weight, q, key, stream);
         return;
@@ -124,7 +130,7 @@ void launch_q4_ksplit_band(const Tensor& x, const Weight& weight, Tensor& q, Ten
         launch_q4_ksplit_exact<16>(x, weight, q, key, stream);
         return;
     default:
-        throw std::invalid_argument("attention Q4 K-split band covers T in [7,16]");
+        throw std::invalid_argument("attention Q4 K-split band covers T in [5,16]");
     }
 }
 
@@ -133,6 +139,8 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
     case 1:
         launch_q4_gemv(x, weight, q, key, stream);
         return;
+    case 5:
+    case 6:
     case 7:
     case 8:
     case 9:
@@ -149,15 +157,13 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
         // and 107.8-108.3 us for the grouped form the resolver switches to at T=13. The resolver
         // boundary at 13 is right for the grouped-vs-row-split question, but it hid this: the split
         // form with a K-split Q4 parent is 24-29% faster than both. The range now reaches the DFlash2
-        // verification widths (T <= 16) with the Q5 parent on its K-split MMA as well. T=2..6 keep
-        // the SIMT tile, where a 16-wide K-split tile would waste more MMA work than it saves.
+        // verification widths (T <= 16). T=5/6 use it on the eight-column tile: 110 / 118 us whole-op
+        // with the row-split SIMT tile against 77 / 80 us. T=2..4 keep the SIMT tile.
         launch_q4_ksplit_band(x, weight, q, key, stream);
         return;
     case 2:
     case 3:
     case 4:
-    case 5:
-    case 6:
         launch_q4_simt_route<Q4AttnSimtR8C4Schedule>(x, weight, q, key, stream);
         return;
     default:
@@ -244,8 +250,9 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         return;
     }
     if (x.ne[1] <= 6) {
-        // The whole operation at T=5/6 is bound by its Q4 side, so the small-T kernel does not
-        // change it there (109.6 / 116.7 us against 112.6 / 115.5 us).
+        // With the Q4 parent on the K-split MMA from T=5, the Q5 parent's SIMT split4 and the
+        // small-T tensor-core kernel give the same whole-op time at T=5/6 (within 3 us), so the
+        // SIMT form stays.
         launch_q5_split4_exact(x, weight, gate, value, stream);
         return;
     }

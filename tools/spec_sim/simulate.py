@@ -12,6 +12,8 @@ Policies:
   select:<ngram>   MTP draft, replaced by the n-gram draft when that is longer than k tokens
                    and at least --draft-min
   chain:<ngram>    MTP draft followed by the n-gram continuation keyed on context + MTP draft
+  replace:<ngram>  the neural draft, replaced outright by the n-gram draft whenever that has at
+                   least --draft-min tokens (a copy overlay on a fixed-width neural round)
 N-gram drafts (alone or as a chain extension) shorter than --draft-min are dropped.
 """
 
@@ -26,7 +28,7 @@ from .ngram import Context, NgramModPool, NgramSimpleIndex, Sink
 
 NGRAM_KINDS = ("ngram-simple", "ngram-mod")
 POLICIES = ("mtp", "ngram-simple", "ngram-mod", "select:ngram-simple", "select:ngram-mod",
-            "chain:ngram-simple", "chain:ngram-mod")
+            "chain:ngram-simple", "chain:ngram-mod", "replace:ngram-simple", "replace:ngram-mod")
 ACCEPT_HISTOGRAM_EDGES = (0, 1, 2, 3, 4, 8, 16, 32, 64)
 LONG_DRAFT = 15
 
@@ -64,7 +66,7 @@ class SimConfig:
 
     @property
     def uses_mtp(self) -> bool:
-        return self.policy == "mtp" or self.policy.startswith(("select:", "chain:"))
+        return self.policy == "mtp" or self.policy.startswith(("select:", "chain:", "replace:"))
 
     @property
     def ngram_kind(self) -> str | None:
@@ -256,6 +258,11 @@ class Simulator:
         if policy.startswith("select:"):
             ngram = self._ngram(context, limit)
             if len(ngram) > len(mtp):
+                return ngram, True
+            return mtp, False
+        if policy.startswith("replace:"):
+            ngram = self._ngram(context, limit)
+            if ngram:
                 return ngram, True
             return mtp, False
         extension = self._ngram(context, limit - len(mtp), mtp)

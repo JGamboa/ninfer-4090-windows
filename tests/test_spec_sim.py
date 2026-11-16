@@ -176,6 +176,22 @@ def test_mtp_model_acceptance_extremes_and_select_chain_policies() -> None:
     assert select["ngram_round_fraction"] == pytest.approx(10 / 11)
 
 
+def test_replace_policy_overlays_long_copies_on_a_failing_neural_draft() -> None:
+    rng = random.Random(3)
+    file = tuple(rng.randrange(5000) for _ in range(320))
+    record = Record(file, file)
+    # A neural draft that is always wrong commits one token per round on its own; once the pool
+    # window sits inside the repeated span the copy replaces it, capped at the round width.
+    neural = run("mtp", [record], cap=7, mtp_k=7, mtp_accept=(0.0,))
+    replace = run("replace:ngram-mod", [record], cap=7, mtp_k=7, mtp_accept=(0.0,), draft_min=4)
+    assert neural["tokens_per_round"] == pytest.approx(1.0)
+    assert replace["tokens_per_round"] > 5.0
+    assert replace["ngram_round_fraction"] > 0.5
+    # A copy shorter than --draft-min leaves the neural draft alone.
+    short = run("replace:ngram-mod", [record], cap=7, mtp_k=7, mtp_accept=(0.0,), draft_min=64)
+    assert short["tokens_per_round"] == pytest.approx(1.0)
+
+
 def test_draft_min_drops_short_ngram_drafts() -> None:
     record = Record((), (1, 2, 3, 4, 1, 2, 3, 5, 6, 7))
     assert run("ngram-simple", [record], draft_min=1)["draft_round_fraction"] > 0

@@ -1522,3 +1522,19 @@ tokens/round unchanged within noise.
 
 Harness pitfall: a memset-based L2 flush leaves dirty lines and understates kernel differences;
 use a read-only flush kernel to match in-situ nsys numbers.
+
+## Q4 parents on tensor cores at T=5/6 (2026-11-16)
+
+DFlash2 K=4/K=5 verification (T=5/6) still ran the Q4 parents of the attention and GDN input
+projections on the row-split SIMT tile: a K=5 round (29.6 ms) cost more than a K=7 one (28.0 ms).
+attn and the GDN independent route now send T=5/6 to the K-split tensor-core Q4 kernel on its
+eight-column tile, and the GDN projection+conv op (fused epilogue kernel, SIMT inside) now
+materializes from T=4, so T=5/6 reach the same kernel. Whole-op, RTX 4090, cold L2:
+attn 110 / 118 -> 77 / 80 us, GDN independent 105 / 112 -> 91 / 94 us, GDN projection+conv
+102 / 115 -> 90 / 94 us. The Q5 parent gains nothing from the small-T kernel at T=5/6 once Q4 is
+fixed (within 3 us), so it keeps its split4 SIMT form. Capacity of the snapshot workspace and its
+interval test follow the new boundary (T=1..3 fused, T>=4 materialized).
+
+End to end (greedy, 27B a8 mtpq4q5, previous binary vs new, alternated): DFlash2 K=5 +3..7 %
+(code/doc/py), K=4 +5 % on code/doc/py, K=3/K=6 unchanged. Run-to-run drift on this box reaches
+several percent (an unchanged K=7 cell moved -9 % once), so single cells under ~5 % are noise.

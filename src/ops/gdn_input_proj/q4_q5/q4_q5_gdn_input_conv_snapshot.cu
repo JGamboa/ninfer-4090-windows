@@ -30,7 +30,6 @@ constexpr int kChannels    = kQkRows + kValueRows;
 constexpr int kValueOffset = kQkRows;
 
 using Q4ScheduleC4 = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
-using Q4ScheduleC8 = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
 
 enum class PdlOrder {
     Q4ThenQ5,
@@ -294,13 +293,8 @@ void launch_small_t(const Tensor& x, const Weight& qk_weight, const Weight& valu
                     const GdnConvEpilogue<Publish>& qk_epilogue,
                     const GdnConvEpilogue<Publish>& value_epilogue, Tensor& query, Tensor& value,
                     Tensor& z, cudaStream_t stream) {
-    if constexpr (Tokens <= 4) {
-        launch_small_t_schedule<Tokens, Q4ScheduleC4, Order, Publish>(
-            x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value, z, stream);
-    } else {
-        launch_small_t_schedule<Tokens, Q4ScheduleC8, Order, Publish>(
-            x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value, z, stream);
-    }
+    launch_small_t_schedule<Tokens, Q4ScheduleC4, Order, Publish>(
+        x, qk_weight, value_z_weight, qk_epilogue, value_epilogue, query, value, z, stream);
 }
 
 template <PdlOrder Order, class Publish>
@@ -327,16 +321,8 @@ void launch_conv(const Tensor& x, const Weight& qk_weight, const Weight& value_z
         launch_small_t<3, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
                                           query, value, z, stream);
         break;
-    case 5:
-        launch_small_t<5, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
-                                          query, value, z, stream);
-        break;
-    case 6:
-        launch_small_t<6, Order, Publish>(x, qk_weight, value_z_weight, qk_epilogue, value_epilogue,
-                                          query, value, z, stream);
-        break;
     default:
-        throw std::invalid_argument("Q4/Q5 projection-epilogue GDN conv requires T=1..3 or 5..6");
+        throw std::invalid_argument("Q4/Q5 projection-epilogue GDN conv requires T=1..3");
     }
     CUDA_CHECK(cudaGetLastError());
 }

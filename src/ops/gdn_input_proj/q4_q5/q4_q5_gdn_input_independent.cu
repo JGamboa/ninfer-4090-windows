@@ -28,7 +28,6 @@ constexpr std::int32_t kValueZRows = kValueRows + kZRows;
 constexpr std::int32_t kHidden     = 5120;
 
 using Q4GdnSimtR8C4Schedule = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
-using Q4GdnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
 
 void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Schedule = Q4GemvR1Q8DirectSchedule;
@@ -93,6 +92,12 @@ void launch_q4_ksplit_band(const Tensor& x, const Weight& weight, Tensor& out,
         throw std::invalid_argument("Q4/Q5 GDN K-split requires padded K == hidden");
     }
     switch (x.ne[1]) {
+    case 5:
+        launch_q4_ksplit_exact<5>(x, weight, out, stream);
+        return;
+    case 6:
+        launch_q4_ksplit_exact<6>(x, weight, out, stream);
+        return;
     case 7:
         launch_q4_ksplit_exact<7>(x, weight, out, stream);
         return;
@@ -124,7 +129,7 @@ void launch_q4_ksplit_band(const Tensor& x, const Weight& weight, Tensor& out,
         launch_q4_ksplit_exact<16>(x, weight, out, stream);
         return;
     default:
-        throw std::invalid_argument("Q4/Q5 GDN K-split band covers T in [7,16]");
+        throw std::invalid_argument("Q4/Q5 GDN K-split band covers T in [5,16]");
     }
 }
 
@@ -138,6 +143,8 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
     case 4:
         launch_q4_simt_route<Q4GdnSimtR8C4Schedule>(x, weight, out, stream);
         return;
+    case 5:
+    case 6:
     case 7:
     case 8:
     case 9:
@@ -153,12 +160,9 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
         // at T=9..12: the split form with this parent is 101.6-105.7 us against 120.1 us for the
         // grouped kernel. At T=13 the grouped kernel won (120.1 against 126.2) while the Q5 side
         // still ran a SIMT tile; with the Q5 K-split MMA side the band covers the DFlash2
-        // verification widths through 16.
+        // verification widths through 16. T=5/6 use it on the eight-column tile: 105 / 112 us
+        // whole-op with the row-split SIMT tile against 91 / 94 us. T=2..4 keep the SIMT tile.
         launch_q4_ksplit_band(x, weight, out, stream);
-        return;
-    case 5:
-    case 6:
-        launch_q4_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, out, stream);
         return;
     default:
         throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
@@ -244,8 +248,9 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
         return;
     }
     if (x.ne[1] <= 6) {
-        // The whole operation at T=5/6 is bound by its Q4 side, so the small-T kernel does not
-        // change it there (105.5 / 111.6 us against 108.4 / 110.6 us).
+        // With the Q4 parent on the K-split MMA from T=5, the Q5 parent's SIMT split4 and the
+        // small-T tensor-core kernel give the same whole-op time at T=5/6 (within 3 us), so the
+        // SIMT form stays.
         launch_q5_split4_exact(x, weight, value, z, stream);
         return;
     }

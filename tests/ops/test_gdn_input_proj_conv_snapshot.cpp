@@ -1082,14 +1082,15 @@ int main() {
     }
 
     int failures = 0;
-    const std::size_t q4_interval =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
-    const std::size_t q4_witness =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 4, 4);
-    const std::size_t q4_right_endpoint =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6, 6);
-    if (q4_interval != q4_witness || q4_witness == 0 || q4_right_endpoint != 0) {
-        std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
+    // Widths 1..3 run the fused projection-epilogue kernel with no scratch; every width from 4
+    // materializes the projection, so the interval's capacity is that of its widest member.
+    const auto q4_capacity = [](std::int32_t min_width, std::int32_t max_width) {
+        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1,
+                                                                          min_width, max_width);
+    };
+    if (q4_capacity(1, 3) != 0 || q4_capacity(4, 4) == 0 || q4_capacity(1, 6) != q4_capacity(6, 6) ||
+        q4_capacity(4, 4) >= q4_capacity(6, 6) || q4_capacity(5, 5) <= q4_capacity(4, 4)) {
+        std::cerr << "Q4/Q5 snapshot interval capacity does not follow the materialized widths\n";
         ++failures;
     }
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=

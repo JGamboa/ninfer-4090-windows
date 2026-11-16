@@ -125,8 +125,8 @@ Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem
     case 1:
     case 2:
     case 3:
-    case 5:
-    case 6:
+        // T=5/6 use the materialized form: the projection runs on the K-split tensor-core Q4
+        // parent there, which the fused epilogue kernel (row-split SIMT) cannot host.
         return {Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused};
     default:
         return {Q4Q5GdnInputConvScheduleId::Materialized};
