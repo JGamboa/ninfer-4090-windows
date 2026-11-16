@@ -1538,3 +1538,23 @@ interval test follow the new boundary (T=1..3 fused, T>=4 materialized).
 End to end (greedy, 27B a8 mtpq4q5, previous binary vs new, alternated): DFlash2 K=5 +3..7 %
 (code/doc/py), K=4 +5 % on code/doc/py, K=3/K=6 unchanged. Run-to-run drift on this box reaches
 several percent (an unchanged K=7 cell moved -9 % once), so single cells under ~5 % are noise.
+
+## DFlash2 + n-gram copy overlay: measured, not kept (2026-11-16)
+
+Prototype: a host n-gram pool match of at least `--ngram-min` tokens overwrote the first drafts of
+a DFlash2 round (device op writing the copy as a one-hot sparse proposal: `drafts`,
+`candidate_ids`, `proposal_q`), at unchanged width, graphs and memory. Exact oracle test for the
+op; greedy output identical to plain DFlash2 in 23 of 24 cells.
+
+Offline replay (`tools/spec_sim`, `replace:` policy, five agent transcripts, `--draft-min 4`):
++31 % at 0.5 per-position drafter acceptance, +15 % at 0.75, about 0 at 0.92.
+
+Measured on this 4090, Qwen3.8-27B a8 greedy: -1..-12 % (doc K=15 13.5 -> 12.0 tokens per round),
+because copies replace correct neural drafts or shorten the proposal. Bonsai + ProCreations head,
+server (thinking, T=1.0, 3 lanes, 100K, 2 seeds), aggregate tok/s: MTP3+ngram 237, DFlash2 K=7
+255 -> 256 with copy (`--ngram-n 12 --ngram-min 6`), K=15 221 -> 218. Per prompt the copy helps
+where text is copied (long_py K=7 327 -> 408, K=15 352 -> 535) and costs where it is not
+(agent_doc K=7 467 -> 443, long_cpp K=15 345 -> 305), so the aggregate does not move.
+
+Dropped: no clear win over MTP3+ngram or DFlash2 K=7. A gate that knew the neural draft's
+confidence (device side) would be the next thing to try; the prototype diff is not kept in the tree.
