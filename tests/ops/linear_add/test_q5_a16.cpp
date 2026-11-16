@@ -11,26 +11,31 @@ using ninfer::test::linear_add::WeightFormat;
 
 int q5_a16_conformance() {
     // Starts of the registered positive-T regions. run_shape checks b-1/b/b+1 for every start,
-    // plus one interior point for every region, through the public Op. The first region now
-    // reaches down to T=1 (T=1 is covered by the leading probe and its own interior point), and
-    // 513 starts the whole-wave + narrow-tail composite, whose interiors cover a short, a
-    // 128-column and a 256-column tail (the last one keeping the single wide launch).
+    // plus one interior point for every region, through the public Op. The first region is the
+    // exact SIMT split2 at T=1..3 (T=1 is covered by the leading probe and its own interior point),
+    // the second the small-T tensor-core kernel from T=4, and 513 starts the whole-wave +
+    // narrow-tail composite, whose interiors cover a short, a 128-column and a 256-column tail
+    // (the last one keeping the single wide launch).
     //
     // composite_offset re-probes the same starts one whole wave (512 columns) later, where the
     // tail - not the leading launch - is the one resolving against them: 528/529/530, 544/545/546,
     // 560/561/562 for both k, 704/705/706 for the tail=192/193
     // composite-to-wide fallback, and 1024/1025/1026 for a zero, one and two column tail after the
     // second whole wave.
-    constexpr std::array<std::int32_t, 16> kInteriors{1,  2,   3,   8,   11,  24,  40,  56,
-                                                      64, 96, 128, 129, 256, 640, 768, 1024};
-    constexpr std::array<std::int32_t, 6> kK6144RouteStarts{7, 17, 33, 49, 193, 513};
+    //
+    // The small-T tensor-core route (T=4..16) stages a 4-column activation tile at T=4, an 8-column
+    // one up to T=8 and a 16-column one above it: 6 and 7 leave two and three live columns in the
+    // 8-column tile, and 9, 13 and 15 one, five and seven in the second eight-column MMA tile.
+    constexpr std::array<std::int32_t, 21> kInteriors{1,   2,   3,   6,   7,   8,   9,   11,  13, 15,  24,
+                                                      40,  56,  64,  96,  128, 129, 256, 640, 768, 1024};
+    constexpr std::array<std::int32_t, 6> kK6144RouteStarts{4, 17, 33, 49, 193, 513};
     constexpr std::array<std::int32_t, 6> kK6144GraphTokens{513, 529, 545, 561, 705, 1025};
 
     int failures = 0;
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 6144, 401U, kK6144RouteStarts, kInteriors, kK6144GraphTokens, false, 512});
-    constexpr std::array<std::int32_t, 6> kK17408RouteStarts{7, 17, 33, 49, 193, 513};
+    constexpr std::array<std::int32_t, 6> kK17408RouteStarts{4, 17, 33, 49, 193, 513};
     constexpr std::array<std::int32_t, 6> kK17408GraphTokens{513, 529, 545, 561, 705, 1025};
     failures +=
         ninfer::test::linear_add::run_shape("Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,

@@ -3,14 +3,14 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/common/small_t_split_store.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_ksplit_strided_store.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
-#include "ops/linear/q5/q5_ksplit_mma.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
-#include "ops/linear/q5/q5_rowsplit_rowblock_small_t.cuh"
+#include "ops/linear/q5/q5_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 
@@ -219,41 +219,21 @@ void launch_q5_split4_exact(const Tensor& x, const Weight& weight, Tensor& gate,
     }
 }
 
-// T=9..16: 16 rows per CTA, eight warps splitting K, Q5 codes and high bits decoded for BF16
-// MMAs; gate rows [0, 6144) land in gate and value rows in value, each with its own stride.
-void launch_q5_ksplit(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                      cudaStream_t stream) {
-    const Q5KSplitOutput out{static_cast<__nv_bfloat16*>(gate.data), kSplitRow,
-                             static_cast<int>(gate.nb[1] / sizeof(__nv_bfloat16)),
-                             static_cast<__nv_bfloat16*>(value.data),
-                             static_cast<int>(value.nb[1] / sizeof(__nv_bfloat16))};
-    q5_ksplit_mma_kernel<kHidden, 16, false>
-        <<<kParentRows / Q5KSplitMmaSchedule::kRowsPerCta, Q5KSplitMmaSchedule::kThreads, 0,
-           stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                     static_cast<const std::uint8_t*>(weight.qdata),
-                     static_cast<const std::uint8_t*>(weight.qhigh),
-                     static_cast<const std::uint8_t*>(weight.scales), out, x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void launch_q5_rowblock(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
-                        cudaStream_t stream) {
-    constexpr int kColsPerTile  = 8;
-    constexpr int kRowsPerBlock = 8;
-    constexpr int kStages       = 2;
-    constexpr int kThreads      = kRowsPerBlock * 32;
-    const std::int32_t cols     = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(div_up(kParentRows, kRowsPerBlock)),
-                    static_cast<unsigned>(div_up(cols, kColsPerTile)), 1u);
-    q5_rowsplit_rowblock_small_t_kernel<Q5RowSplitSimtSchedule, kColsPerTile, kRowsPerBlock,
-                                        kStages, true, kSplitRow>
-        <<<grid, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.qhigh),
-            static_cast<const std::uint8_t*>(weight.scales),
-            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data),
-            kParentRows, gate.ne[0], kHidden, cols, weight.padded_shape[1], kHidden / 1024);
+// T=7..16: the small-T tensor-core kernel (q5_small_t_mma.cuh); gate rows [0, 6144) land in gate
+// and value rows in value, each with its own stride.
+template <int XCols, int Stages>
+void launch_q5_small_t(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& value,
+                       cudaStream_t stream) {
+    const SmallTSplitStore store{static_cast<__nv_bfloat16*>(gate.data),
+                                 static_cast<__nv_bfloat16*>(value.data),
+                                 static_cast<std::int32_t>(gate.nb[1] / sizeof(__nv_bfloat16)),
+                                 static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16)),
+                                 kSplitRow, x.ne[1]};
+    q5_small_t_mma_launch<kParentRows, kHidden, XCols, Stages, SmallTSplitStore>(
+        stream, static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh),
+        static_cast<const std::uint8_t*>(weight.scales), store, x.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -264,19 +244,20 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
         return;
     }
     if (x.ne[1] <= 6) {
+        // The whole operation at T=5/6 is bound by its Q4 side, so the small-T kernel does not
+        // change it there (109.6 / 116.7 us against 112.6 / 115.5 us).
         launch_q5_split4_exact(x, weight, gate, value, stream);
         return;
     }
+    // One kernel, clean L2, RTX 4090, us: 31.7 at T=7/8 on the eight-column tile and 31.7-32.8 at
+    // T=9..16 on the sixteen-column one, against 39.9-45.0 for the K-split MMA kernel and ~60 for
+    // the row-block SIMT kernel (T=7/8) that this kernel replaced.
     if (x.ne[1] <= 8) {
-        // See the GDN sibling: at T=7/8 this side is bound by repeated activation loads, and staging
-        // the activation slab per block measured 42.2 us against 64.8 us at T=7 - the best of the
-        // candidates tried here.
-        launch_q5_rowblock(x, weight, gate, value, stream);
+        launch_q5_small_t<8, 1>(x, weight, gate, value, stream);
         return;
     }
     if (x.ne[1] <= 16) {
-        // T=9..12 previously ran a 4-column SIMT tile, and T=13..16 the grouped form at ~245 GB/s.
-        launch_q5_ksplit(x, weight, gate, value, stream);
+        launch_q5_small_t<16, 2>(x, weight, gate, value, stream);
         return;
     }
     throw std::invalid_argument("attention Q5 split-output requires T in [1,16]");

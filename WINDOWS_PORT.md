@@ -1500,3 +1500,25 @@ Against `qwen3_8_27b_a8_mtpq4q5.ninfer` on the same binary (`62875ced`), RTX 409
   11,600, zebra 3,376 / 2,916, mod 7 18,683 / 1,627, clock 7,119 / 2,047.
 - Qwen3.6 is the faster model per token and matches Qwen3.8 without thinking; with thinking it
   spends several times more tokens per answer, so Qwen3.8 stays the default.
+## Q5 small-T tensor-core kernel from ninfer-all (2026-11-16)
+
+Ported `q5_small_t_mma` (iamwavecut/ninfer-all, Apache-2.0) as `src/ops/linear/q5/q5_small_t_mma.cuh`
+plus `src/ops/common/small_t_split_store.cuh`. 16 rows x 8 K-warps per CTA, cp.async staging, a
+permuted k order so the A fragment is one 64-bit load of Q5 codes decoded with magic-number bit
+tricks, bf16 m16n8k16 `mma.sync`, per-64-group fp16 scale folded with fmaf. XCols in {4,8,16}.
+
+Routes: linear_add Q5 T=4..16 (T=1..3 stays exact SIMT split2); attn/GDN input projections
+T=7..16 (T<=6 stays split4_exact: the Q4 SIMT side dominates there, so extending Q5 does nothing).
+Removed `q5_ksplit_mma.cuh`, `q5_rowsplit_rowblock_small_t.cuh` and the old linear_add ksplit file.
+
+Qualification: linear_add/attn/GDN oracle tests pass over the T ranges and route boundaries; a
+deliberately broken decode constant fails all three (mutation check).
+
+End to end (RTX 4090, Qwen3.8-27B a8 mtpq4q5, greedy, 8192 ctx, rk4v4-e8, original vs new binary
+alternated): DFlash2 K=7 +12..20 %, K=11 +11..13 %, K=15 +11..14 %, K=5 +3..8 %; MTP3 and
+MTP3+ngram unchanged within noise (the doc+ngram cell moved 391 -> 446 tok/s). Greedy outputs
+are identical on most cells; some diverge late because bf16 accumulation order changed, with
+tokens/round unchanged within noise.
+
+Harness pitfall: a memset-based L2 flush leaves dirty lines and understates kernel differences;
+use a read-only flush kernel to match in-situ nsys numbers.

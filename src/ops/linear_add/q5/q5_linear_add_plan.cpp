@@ -38,12 +38,13 @@ constexpr std::array<SupportSpec, 2> kSupports{{
     {5120, 17408, 17408},
 }};
 
-// T = 7..16 is the DFlash2 verification band (six to fifteen drafts); the SIMT split2 route read
-// the weights at ~350 GB/s there, and the 16-column MMA tile at k = 6144 measured ~96 us at
-// T = 14..16 against ~46 us for this route at 13 (WINDOWS_PORT.md, Qwen3.8 DFlash2 profile).
+// T = 4..16 covers MTP verification (T = 4) and the DFlash2 verification band (three to fifteen
+// drafts); the SIMT split2 route reads the weights at ~350 GB/s from T = 4 and grows with T, and
+// the small-T tensor-core kernel (q5_small_t_mma.cuh) streams them at ~800 GB/s at every T of
+// the band.
 constexpr std::array<RouteSpec, 7> kK6144Routes{{
-    {{1, 6}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{7, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
+    {{1, 3}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{4, 16}, Q5LinearAddScheduleId::SmallTMmaResidual},
     {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
@@ -52,8 +53,8 @@ constexpr std::array<RouteSpec, 7> kK6144Routes{{
 }};
 
 constexpr std::array<RouteSpec, 7> kK17408Routes{{
-    {{1, 6}, Q5LinearAddScheduleId::Split2ExactResidual},
-    {{7, 16}, Q5LinearAddScheduleId::KSplitMmaResidual},
+    {{1, 3}, Q5LinearAddScheduleId::Split2ExactResidual},
+    {{4, 16}, Q5LinearAddScheduleId::SmallTMmaResidual},
     {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
@@ -134,8 +135,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
     switch (schedule) {
     case Q5LinearAddScheduleId::Split2ExactResidual:
         return "linear_add.q5.simt.split2.exact.residual";
-    case Q5LinearAddScheduleId::KSplitMmaResidual:
-        return "linear_add.q5.mma.ksplit.r16.residual";
+    case Q5LinearAddScheduleId::SmallTMmaResidual:
+        return "linear_add.q5.mma.small_t.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         return "linear_add.q5.mma.r64.c16.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C24:
@@ -206,8 +207,8 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::Split2ExactResidual:
         q5_linear_add_split2_exact_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::KSplitMmaResidual:
-        q5_linear_add_ksplit_mma_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::SmallTMmaResidual:
+        q5_linear_add_small_t_mma_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C16:
         q5_linear_add_mma_r64_c16_launch(x, w, residual_out, stream);
