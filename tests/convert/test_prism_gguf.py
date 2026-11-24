@@ -222,6 +222,74 @@ def test_ternary_rows_repack_the_stored_codes_exactly(tmp_path):
             )
 
 
+def _scalar_q4_0_block(block: bytes) -> list[float]:
+    """Literal transliteration of ggml `dequantize_row_q4_0` for one 18-byte block."""
+    d = struct.unpack("<e", block[0:2])[0]
+    qs = block[2:18]
+    y = [0.0] * 32
+    for j in range(16):
+        x0 = (qs[j] & 0x0F) - 8
+        x1 = (qs[j] >> 4) - 8
+        y[j] = x0 * d
+        y[j + 16] = x1 * d
+    return y
+
+
+def test_q4_0_vectorized_decode_matches_scalar_oracle():
+    from tools.convert.sources.prism_gguf import dequantize_q4_0_blocks
+
+    rng = random.Random(7)
+    raw = b"".join(
+        struct.pack("<e", rng.uniform(-0.5, 0.5)) + bytes(rng.randrange(256) for _ in range(16))
+        for _ in range(37)
+    )
+    decoded = dequantize_q4_0_blocks(raw)
+    assert decoded.shape == (37, 32)
+    for index in range(37):
+        np.testing.assert_array_equal(
+            decoded[index], np.float32(_scalar_q4_0_block(raw[index * 18 : (index + 1) * 18]))
+        )
+    with pytest.raises(ValueError):
+        dequantize_q4_0_blocks(raw[:-1])
+
+
+def test_q4_0_rows_read_the_requested_rows_of_a_matrix(tmp_path):
+    from tools.convert.sources.prism_gguf import dequantize_q4_0_rows
+
+    rng = random.Random(8)
+    rows, k = 5, 64  # two blocks per row
+    raw = b"".join(
+        struct.pack("<e", rng.uniform(0.01, 0.2)) + bytes(rng.randrange(256) for _ in range(16))
+        for _ in range(rows * k // 32)
+    )
+    path = tmp_path / "q4.gguf"
+    path.write_bytes(build_gguf({}, [("m.weight", (k, rows), 2, raw)]))
+    with GgufStore(path) as store:
+        got = dequantize_q4_0_rows(store, "m.weight", 1, 4).numpy()
+    expected = np.float32(
+        [
+            _scalar_q4_0_block(raw[(row * 2 + block) * 18 : (row * 2 + block + 1) * 18])
+            for row in range(1, 4)
+            for block in range(2)
+        ]
+    ).reshape(3, k)
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_text_layer_count_excludes_the_nextn_block():
+    from tools.convert.sources.prism_gguf import text_layer_count
+
+    assert text_layer_count({"qwen35.block_count": 64}) == 64
+    assert text_layer_count({"qwen35.block_count": 65, "qwen35.nextn_predict_layers": 1}) == 64
+    for bad in (
+        {},
+        {"qwen35.block_count": 64, "qwen35.nextn_predict_layers": 2},
+        {"qwen35.block_count": 1, "qwen35.nextn_predict_layers": 1},
+    ):
+        with pytest.raises(ValueError):
+            text_layer_count(bad)
+
+
 def test_ternary_rows_reject_the_invalid_pq2_0_code(tmp_path):
     format = "t5_g128_fp16"
     from tools.convert.sources.prism_gguf import ternary_rows

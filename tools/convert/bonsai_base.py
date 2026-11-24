@@ -30,6 +30,7 @@ from .resources import TEXT_RESOURCES, VISION_RESOURCES
 from .sources.gguf_reader import GgufStore
 from .sources.mmproj import MmprojCheckpoint
 from .sources.ninfer_artifact import NInferArtifactStore
+from .sources.prism_gguf import text_layer_count
 
 _GGUF_FIELDS = {
     "hidden_size": "qwen35.embedding_length",
@@ -59,10 +60,16 @@ def write_base(
         config.pop("prism_hadamard", None)
         text_config(config, mtp=True)
         for key, meta_key in _GGUF_FIELDS.items():
-            if config.get(key) != gguf.metadata.get(meta_key):
+            # An `-mtp` GGUF counts its draft layer in block_count; the text model does not.
+            expected = (
+                text_layer_count(gguf.metadata)
+                if meta_key == "qwen35.block_count"
+                else gguf.metadata.get(meta_key)
+            )
+            if config.get(key) != expected:
                 raise ValueError(
                     f"{reference_path}: {key}={config.get(key)!r} differs from "
-                    f"{gguf_path} {meta_key}={gguf.metadata.get(meta_key)!r}"
+                    f"{gguf_path} {meta_key}={expected!r}"
                 )
         vocab = gguf.tensor("token_embd.weight").shape[1]
         if config["vocab_size"] != vocab:

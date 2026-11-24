@@ -44,10 +44,13 @@ from .logical import EncodedRows, LogicalSource
 from .prism_gguf import (
     PQ2_0_TYPE,
     PTQ1_0_TYPE,
+    Q4_0_TYPE,
     assert_prism_ternary_gguf,
+    dequantize_q4_0_rows,
     dequantize_rows,
     sign_vectors,
     ternary_rows,
+    text_layer_count,
 )
 from .safetensors import TensorInfo
 
@@ -148,12 +151,7 @@ class PrismCheckpoint:
             taps = x.size // channels
             return x.reshape(channels, taps)[channel_map].reshape(channels, 1, taps)
 
-        matrix("embed_tokens.weight", "token_embd.weight")
-        matrix("lm_head.weight", "output.weight")
-        vector("norm.weight", "output_norm.weight", (h,), norm)
-        layers = self._meta("block_count")
-        for i in range(layers):
-            p, g = f"layers.{i}.", f"blk.{i}."
+        def common(p, g):
             vector(p + "input_layernorm.weight", g + "attn_norm.weight", (h,), norm)
             vector(
                 p + "post_attention_layernorm.weight",
@@ -163,6 +161,23 @@ class PrismCheckpoint:
             )
             for role, name in (("gate", "ffn_gate"), ("up", "ffn_up"), ("down", "ffn_down")):
                 matrix(p + f"mlp.{role}_proj.weight", g + name + ".weight")
+
+        def full_attention(p, g):
+            s = p + "self_attn."
+            for role, name in (("q", "attn_q"), ("k", "attn_k"), ("v", "attn_v")):
+                matrix(s + f"{role}_proj.weight", g + name + ".weight")
+            matrix(s + "o_proj.weight", g + "attn_output.weight")
+            d = self._meta("attention.key_length")
+            vector(s + "q_norm.weight", g + "attn_q_norm.weight", (d,), norm)
+            vector(s + "k_norm.weight", g + "attn_k_norm.weight", (d,), norm)
+
+        matrix("embed_tokens.weight", "token_embd.weight")
+        matrix("lm_head.weight", "output.weight")
+        vector("norm.weight", "output_norm.weight", (h,), norm)
+        layers = text_layer_count(store.metadata)
+        for i in range(layers):
+            p, g = f"layers.{i}.", f"blk.{i}."
+            common(p, g)
             if g + "attn_qkv.weight" in store.tensors:
                 a = p + "linear_attn."
                 matrix(
@@ -180,14 +195,23 @@ class PrismCheckpoint:
                 vector(a + "conv1d.weight", g + "ssm_conv1d.weight", (channels, 1, taps), conv)
                 vector(a + "norm.weight", g + "ssm_norm.weight", (dv,))
             else:
-                s = p + "self_attn."
-                for role, name in (("q", "attn_q"), ("k", "attn_k"), ("v", "attn_v")):
-                    matrix(s + f"{role}_proj.weight", g + name + ".weight")
-                matrix(s + "o_proj.weight", g + "attn_output.weight")
-                d = self._meta("attention.key_length")
-                vector(s + "q_norm.weight", g + "attn_q_norm.weight", (d,), norm)
-                vector(s + "k_norm.weight", g + "attn_k_norm.weight", (d,), norm)
+                full_attention(p, g)
+        if store.metadata.get("qwen35.nextn_predict_layers", 0):
+            # The draft layer (block `layers`) under the HF `mtp.*` names the builder reads:
+            # an unrotated full-attention layer plus the nextn projection and norms.
+            g = f"blk.{layers}."
+            matrix("mtp.fc.weight", g + "nextn.eh_proj.weight")
+            vector("mtp.pre_fc_norm_embedding.weight", g + "nextn.enorm.weight", (h,), norm)
+            vector("mtp.pre_fc_norm_hidden.weight", g + "nextn.hnorm.weight", (h,), norm)
+            vector("mtp.norm.weight", g + "nextn.shared_head_norm.weight", (h,), norm)
+            common("mtp.layers.0.", g)
+            full_attention("mtp.layers.0.", g)
         return entries
+
+    @property
+    def has_mtp(self) -> bool:
+        """Whether the GGUF carries its own MTP draft layer (a Bonsai 2.5 `-mtp` file)."""
+        return "mtp.fc.weight" in self._entries
 
     # SafetensorsSource interface used by qwen3_5._Builder and tensor_source.
 
@@ -235,6 +259,9 @@ class PrismCheckpoint:
         for low, high in self._runs(entry, begin, end):
             if info.ggml_type in _TERNARY_TYPES:
                 pieces.append(dequantize_rows(self._store, entry.gguf, low, high))
+                continue
+            if info.ggml_type == Q4_0_TYPE:
+                pieces.append(dequantize_q4_0_rows(self._store, entry.gguf, low, high))
                 continue
             if info.ggml_type not in (_F32, _BF16):
                 raise ValueError(f"{entry.gguf}: unsupported GGUF type {info.type_name}")

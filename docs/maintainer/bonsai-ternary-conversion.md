@@ -253,3 +253,54 @@ cost (design doc section 9.1, item 11). Same inputs as the Vision build above:
 ```
 
 Replace `q5` by `q4` or `q4q5` (recipe and output name) for the other two.
+
+### MTP layer from the GGUF (Bonsai 2.5 `-mtp` files)
+
+The Bonsai 2.5 `Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf` carries its own draft layer as block 64
+(`qwen35.block_count` 65, `qwen35.nextn_predict_layers` 1): a full attention layer plus
+`nextn.eh_proj`, `enorm`, `hnorm` and `shared_head_norm`, all Q4_0 and outside
+`prism.hadamard.weight_names` (primal basis, not rotated). `PrismCheckpoint` presents it under
+the HF `mtp.*` names (`mtp.fc.weight`, `mtp.pre_fc_norm_*`, `mtp.norm`, `mtp.layers.0.*`) with the
+same `1 + w` norm convention, `text_layer_count` excludes the block from the text layers, and
+`bonsai_base` / `bonsai2_27b` compare the text geometry against `block_count - nextn`.
+
+When the recipe has no `--source mtp=...` and the GGUF has the layer, `_bonsai_mtp_gguf` stores the
+decoded Q4_0 values in Q8 (`mtp/input_projection` always; the layer's projections too for plain
+`bonsai2_27b`) or in the `bonsai2_27b_mtp_*` formats. An explicit `--source mtp=REFERENCE.ninfer`
+still wins and selects the Qwen3.8 head as before. The `bonsai_base` reference only supplies the
+text config, tokenizer and Vision resources in this flow, so any Qwen3.8 artifact with matching
+geometry works (the NInfer chat template differs from the GGUF's only by its extensions: `developer`
+turns, final-turn continuation and tool-result histories).
+
+```
+.venv\Scripts\python.exe -m tools.convert.bonsai_base ^
+  --gguf E:\LLM\hf-bonsai25\Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf ^
+  --reference E:\LLM\qwen3_8_27b_a8_mtpq4q5.ninfer ^
+  --mmproj E:\LLM\hf-bonsai25\Ternary-Bonsai-2.5-27B-mmproj-BF16.gguf --out E:\LLM\bonsai25-27b-vl
+.venv\Scripts\python.exe -m tools.convert --model E:\LLM\bonsai25-27b-vl --recipe bonsai2_27b_mtp_q4q5 ^
+  --components text,vision,mtp ^
+  --source gguf=E:\LLM\hf-bonsai25\Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf ^
+  --source mmproj=E:\LLM\hf-bonsai25\Ternary-Bonsai-2.5-27B-mmproj-BF16.gguf ^
+  --proposal --name bonsai2.5-27b --out E:\LLM\bonsai25_27b_vl_mtp_q4q5.ninfer --device cuda
+```
+
+Coverage: `tests/convert/test_prism_gguf.py` decodes Q4_0 against a literal transliteration of ggml's
+`dequantize_row_q4_0`; `test_bonsai_recipe.py` converts a synthetic GGUF with a Q4_0 draft block and
+checks every MTP parameter (query/gate interleave, norms, Q8 and Q4/Q5 formats within half a
+quantization step of the decoded values), that an explicit source still wins and that a GGUF
+without the layer demands one.
+
+Result (RTX 4090, 2026-11-24, CLI, greedy, thinking off, `rk4v4-e8`, MTP 3 + n-gram chain, eight
+`examples/cli/messages` prompts, one run each, alternated): the 2.5 artifact above averages 287.3
+tok/s with 3.03 tokens per round (60.3 % acceptance) against 271.4 tok/s, 2.87 and 55.1 % for the
+Bonsai 2 retrained artifact; it is faster on six prompts and 1-4 % slower on two. The outputs
+differ between the models, so acceptance mixes head quality with the text each model writes.
+`long_niah_256k` returns `ORCHID=493817; COLOR=COBALT` (260,096 prompt tokens, prefill 2.48k tok/s,
+the same 2.49k tok/s as Bonsai 2; 64K prefill 4.48k tok/s for both).
+
+`tools.eval` (45 tasks, thinking off, `ninfer-serve` with MTP 3 + n-gram chain, one lane, 64K context):
+Bonsai 2 retrained passes 43/45 and the 2.5 artifact 44/45, at 319 and 318 tok/s. The one difference is
+`if.answer_in_spanish`; `json.order_total` fails on both (12.0 and 13.5 against 13). The 2.5 model writes
+about 25 % more tokens (mean 153 against 122; 450 against 339 on `reasoning_math`). The suite is close to
+saturation and does not exercise the agentic coding tasks the 2.5 release targets, so it shows no
+regression but not the claimed improvement.

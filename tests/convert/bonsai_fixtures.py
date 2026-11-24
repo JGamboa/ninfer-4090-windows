@@ -95,6 +95,7 @@ class GgufFixture:
     def __init__(self, seed=0):
         self.rng = np.random.default_rng(seed)
         self.ternary = {}  # gguf name -> (codes uint8 [N, K], scales fp16 [N, K/128])
+        self.q4_0 = {}  # gguf name -> (codes uint8 [N, K], scales fp16 [N, K/32])
         self.dense = {}  # gguf name -> float32 array in GGUF memory order
         self.tensors = []
 
@@ -113,6 +114,23 @@ class GgufFixture:
         self.ternary[name] = (codes, scales)
         self.tensors.append((name, (k, n), 142, bytes(raw)))
 
+    def q4_0_tensor(self, name, n, k):
+        """A Q4_0 matrix written block by block from stored codes; `q4_0[name]` keeps the codes
+        and scales, `dense[name]` the values `(code - 8) * d` an independent reader must get."""
+        codes = self.rng.integers(0, 16, (n, k), dtype=np.uint8)
+        scales = (self.rng.random((n, k // 32)) * 0.05 + 0.005).astype(np.float16)
+        raw = bytearray()
+        for row in range(n):
+            for block in range(k // 32):
+                c = codes[row, block * 32 : (block + 1) * 32]
+                raw += scales[row, block].tobytes()
+                raw += bytes(int(c[j] | c[j + 16] << 4) for j in range(16))
+        self.q4_0[name] = (codes, scales)
+        self.dense[name] = (
+            (codes.astype(np.float32) - 8.0) * np.repeat(scales.astype(np.float32), 32, axis=1)
+        )
+        self.tensors.append((name, (k, n), 2, bytes(raw)))
+
     def f32(self, name, ne, values):
         values = np.asarray(values, dtype=np.float32)
         self.dense[name] = values
@@ -125,7 +143,27 @@ class GgufFixture:
         self.tensors.append((name, (k, n), 30, words.view(torch.int16).numpy().tobytes()))
 
 
-def write_gguf(path):
+def _write_nextn_block(fixture, rng):
+    """Block `LAYERS`: the Bonsai 2.5 draft layer (Q4_0, not Hadamard-rotated)."""
+    b = f"blk.{LAYERS}."
+    fixture.q4_0_tensor(b + "nextn.eh_proj.weight", H, 2 * H)
+    for name in ("nextn.enorm", "nextn.hnorm", "nextn.shared_head_norm", "attn_norm", "post_attention_norm"):
+        fixture.f32(b + name + ".weight", (H,), 1.0 + rng.random(H) * 0.1)
+    for name, n, k in (
+        ("attn_q", 2 * Q, H),
+        ("attn_k", KVW, H),
+        ("attn_v", KVW, H),
+        ("attn_output", H, Q),
+        ("ffn_gate", INTER, H),
+        ("ffn_up", INTER, H),
+        ("ffn_down", H, INTER),
+    ):
+        fixture.q4_0_tensor(b + name + ".weight", n, k)
+    fixture.f32(b + "attn_q_norm.weight", (HEAD_DIM,), 1.0 + rng.random(HEAD_DIM))
+    fixture.f32(b + "attn_k_norm.weight", (HEAD_DIM,), 1.0 + rng.random(HEAD_DIM))
+
+
+def write_gguf(path, *, mtp=False):
     fixture = GgufFixture()
     rng = fixture.rng
     fixture.ternary_tensor("token_embd.weight", VOCAB, H)
@@ -165,11 +203,14 @@ def write_gguf(path):
             # Memory order is (channels, taps) although ne is recorded as [taps, channels].
             fixture.f32(b + "ssm_conv1d.weight", (CONV, 2 * KG + VG), rng.random((2 * KG + VG, CONV)))
             fixture.f32(b + "ssm_norm.weight", (DV,), rng.random(DV))
+    if mtp:
+        _write_nextn_block(fixture, rng)
     signs = {w: rng.choice([-1, 1], w).astype(np.int8) for w in (H, INTER)}
     metadata = {
         "general.architecture": (8, "qwen35"),
         "general.file_type": (4, 142),
-        "qwen35.block_count": (4, LAYERS),
+        "qwen35.block_count": (4, LAYERS + int(mtp)),
+        **({"qwen35.nextn_predict_layers": (4, 1)} if mtp else {}),
         "qwen35.embedding_length": (4, H),
         "qwen35.feed_forward_length": (4, INTER),
         "qwen35.attention.head_count": (4, HEADS),
@@ -215,9 +256,11 @@ def write_reference(tmp_path):
     return path
 
 
-def convert_bonsai(tmp_path, *extra, recipe="bonsai2_27b"):
-    """Write the GGUF, reference and base directory, then run the CLI; return all paths."""
-    fixture, signs = write_gguf(tmp_path / "bonsai.gguf")
+def convert_bonsai(tmp_path, *extra, recipe="bonsai2_27b", gguf_mtp=False):
+    """Write the GGUF, reference and base directory, then run the CLI; return all paths.
+
+    With `gguf_mtp` the GGUF carries its own draft layer and no `mtp` source is given."""
+    fixture, signs = write_gguf(tmp_path / "bonsai.gguf", mtp=gguf_mtp)
     reference = write_reference(tmp_path)
     report = write_base(tmp_path / "bonsai.gguf", reference, tmp_path / "base")
     out = tmp_path / "bonsai.ninfer"
@@ -227,7 +270,7 @@ def convert_bonsai(tmp_path, *extra, recipe="bonsai2_27b"):
             "--recipe", recipe,
             "--components", "text,mtp",
             "--source", f"gguf={tmp_path / 'bonsai.gguf'}",
-            "--source", f"mtp={reference}",
+            *([] if gguf_mtp else ["--source", f"mtp={reference}"]),
             "--device", "cpu",
             "--rows-per-chunk", "100",
             "--out", str(out),

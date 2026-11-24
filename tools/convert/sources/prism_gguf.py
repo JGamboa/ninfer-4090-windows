@@ -23,10 +23,13 @@ from .gguf_reader import GgufStore
 
 PTQ1_0_TYPE = 143
 PQ2_0_TYPE = 142
+Q4_0_TYPE = 2
 BLOCK_ELEMENTS = 128  # QK_PTQ1_0 == QK_PQ2_0 == 128
+Q4_0_BLOCK_ELEMENTS = 32  # QK4_0
 
 _PTQ1_0_BLOCK_BYTES = 28
 _PQ2_0_BLOCK_BYTES = 34
+_Q4_0_BLOCK_BYTES = 18
 _POW3 = (1, 3, 9, 27, 81, 243)
 
 
@@ -94,6 +97,47 @@ def dequantize_pq2_0_blocks(raw: bytes | bytearray | memoryview) -> np.ndarray:
     """`(code - 1) * d` per block, float32 `(nblocks, 128)`; see :func:`pq2_0_block_codes`."""
     codes, d = pq2_0_block_codes(raw)
     return (codes.astype(np.float32) - 1.0) * d.astype(np.float32)[:, None]
+
+
+def dequantize_q4_0_blocks(raw: bytes | bytearray | memoryview) -> np.ndarray:
+    """ggml `dequantize_row_q4_0`: `((q & 15) - 8) * d` for elements 0..15 and `((q >> 4) - 8) * d`
+    for elements 16..31 of each 18-byte block (`ggml_half d`, `qs[16]`); float32 `(nblocks, 32)`.
+
+    The Bonsai 2.5 MTP layer is stored this way (it is not Hadamard-rotated)."""
+    if len(raw) % _Q4_0_BLOCK_BYTES:
+        raise ValueError("Q4_0 raw byte length is not a multiple of the 18-byte block")
+    nblocks = len(raw) // _Q4_0_BLOCK_BYTES
+    block_dtype = np.dtype([("d", "<f2"), ("qs", np.uint8, 16)])
+    blocks = np.frombuffer(raw, dtype=block_dtype, count=nblocks)
+    qs = blocks["qs"]
+    values = np.concatenate(
+        ((qs & np.uint8(0xF)).astype(np.int32) - 8, (qs >> np.uint8(4)).astype(np.int32) - 8), axis=1
+    )
+    return values.astype(np.float32) * blocks["d"].astype(np.float32)[:, None]
+
+
+def dequantize_q4_0_rows(store: GgufStore, name: str, row_begin: int, row_end: int) -> torch.Tensor:
+    """Dequantize a contiguous row range of a Q4_0 matrix as `[rows, K]` float32."""
+    info = store.tensor(name)
+    if info.ggml_type != Q4_0_TYPE:
+        raise ValueError(f"{name}: expected Q4_0, got {info.type_name}")
+    k = info.shape[0]
+    if k % Q4_0_BLOCK_ELEMENTS:
+        raise ValueError(f"{name}: K={k} is not a multiple of the Q4_0 block size")
+    decoded = dequantize_q4_0_blocks(store.read_rows_raw(name, row_begin, row_end))
+    return torch.from_numpy(decoded.reshape(row_end - row_begin, k).copy())
+
+
+def text_layer_count(metadata: dict) -> int:
+    """Text layers of a Prism qwen35 GGUF: `block_count` minus the trailing MTP block(s).
+
+    The Bonsai 2.5 `-mtp` files store the draft layer as block `text_layers` and declare it with
+    `qwen35.nextn_predict_layers = 1`; the plain files have no such key."""
+    blocks = metadata.get("qwen35.block_count")
+    nextn = metadata.get("qwen35.nextn_predict_layers", 0)
+    if type(blocks) is not int or type(nextn) is not int or nextn not in (0, 1) or blocks <= nextn:
+        raise ValueError(f"invalid qwen35.block_count={blocks!r} / nextn_predict_layers={nextn!r}")
+    return blocks - nextn
 
 
 _DECODERS = {
@@ -190,9 +234,13 @@ def assert_prism_ternary_gguf(store: GgufStore) -> None:
 __all__ = [
     "PTQ1_0_TYPE",
     "PQ2_0_TYPE",
+    "Q4_0_TYPE",
     "BLOCK_ELEMENTS",
     "dequantize_ptq1_0_blocks",
     "dequantize_pq2_0_blocks",
+    "dequantize_q4_0_blocks",
+    "dequantize_q4_0_rows",
+    "text_layer_count",
     "dequantize_rows",
     "ptq1_0_block_codes",
     "pq2_0_block_codes",

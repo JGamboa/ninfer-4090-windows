@@ -17,8 +17,12 @@ from tools.artifact.reader import Artifact
 from tools.convert.official_recipes import TERNARY_FORMAT
 from tools.convert.sources.ninfer_artifact import NInferArtifactStore
 
+from tools.convert.__main__ import main as convert_main
+from tools.convert.bonsai_base import write_base
+
 from .bonsai_fixtures import (
-    CONV, DV, H, HEAD_DIM, HEADS, INTER, KG, NK, NV, REP, VG, convert_bonsai,
+    CONV, DV, H, HEAD_DIM, HEADS, INTER, KG, LAYERS, NK, NV, REP, VG, convert_bonsai,
+    write_gguf, write_reference,
 )
 
 def _grouped_to_tiled(j):
@@ -190,6 +194,114 @@ def _expected_mtp_format(variant, role):
     if variant == "q4q5":
         return "q4_g64_fp16" if role in _MTP_Q4_IN_MIX else "q5_g64_fp16"
     return f"{variant}_g64_fp16"
+
+
+def _assert_within_grouped_step(got, expected, group, qmax, name):
+    """Each stored value lies within half a quantization step (group absmax / qmax) of the source
+    value; the slack covers the binary16 rounding of the group scale."""
+    expected = expected.astype(np.float64)
+    groups = expected.reshape(expected.shape[0], -1, group)
+    step = np.abs(groups).max(axis=2, keepdims=True) / qmax
+    error = np.abs(np.asarray(got, dtype=np.float64).reshape(groups.shape) - groups)
+    assert bool((error <= step * 0.6 + 1e-12).all()), name
+    assert float(error.max()) > 0, name  # quantized, not copied
+
+
+def _gguf_mtp_expected(fixture):
+    """The logical MTP parameters rebuilt from the fixture's decoded Q4_0 values with the same
+    conventions as a text attention layer (query/gate interleave per head)."""
+    d, b = fixture.dense, f"blk.{LAYERS}."
+    q = d[b + "attn_q.weight"]
+    return {
+        "mtp/input_projection": d[b + "nextn.eh_proj.weight"],
+        _MTP_LAYER + "attention/query": np.concatenate(
+            [q[2 * h * HEAD_DIM : (2 * h + 1) * HEAD_DIM] for h in range(HEADS)]
+        ),
+        _MTP_LAYER + "attention/gate": np.concatenate(
+            [q[(2 * h + 1) * HEAD_DIM : (2 * h + 2) * HEAD_DIM] for h in range(HEADS)]
+        ),
+        _MTP_LAYER + "attention/key": d[b + "attn_k.weight"],
+        _MTP_LAYER + "attention/value": d[b + "attn_v.weight"],
+        _MTP_LAYER + "attention/output": d[b + "attn_output.weight"],
+        _MTP_LAYER + "mlp/gate": d[b + "ffn_gate.weight"],
+        _MTP_LAYER + "mlp/up": d[b + "ffn_up.weight"],
+        _MTP_LAYER + "mlp/down": d[b + "ffn_down.weight"],
+    }
+
+
+def test_mtp_is_read_from_the_gguf_when_it_carries_the_layer(tmp_path):
+    fixture, _, _, out, _ = convert_bonsai(tmp_path, gguf_mtp=True)
+    with NInferArtifactStore(out) as result:
+        for name, expected in _gguf_mtp_expected(fixture).items():
+            assert result.stored_format(name) == "q8_g32_fp16", name
+            _assert_within_grouped_step(result.dequantize(name).numpy(), expected, 32, 127, name)
+        d, b = fixture.dense, f"blk.{LAYERS}."
+        norms = {
+            "mtp/embedding_norm": d[b + "nextn.enorm.weight"],
+            "mtp/hidden_norm": d[b + "nextn.hnorm.weight"],
+            "mtp/final_norm": d[b + "nextn.shared_head_norm.weight"],
+            _MTP_LAYER + "input_norm": d[b + "attn_norm.weight"],
+            _MTP_LAYER + "post_attention_norm": d[b + "post_attention_norm.weight"],
+            _MTP_LAYER + "attention/query_norm": d[b + "attn_q_norm.weight"],
+            _MTP_LAYER + "attention/key_norm": d[b + "attn_k_norm.weight"],
+        }
+        for name, expected in norms.items():  # the GGUF stores 1 + w
+            got = result.dequantize(name).numpy().reshape(expected.shape)
+            np.testing.assert_allclose(got, expected - 1, rtol=1e-2, atol=1e-2, err_msg=name)
+        # The text layers are untouched by the extra block.
+        assert "text/layers/4/input_norm" not in set(result.parameters())
+
+
+@pytest.mark.parametrize("variant", ["q5", "q4q5"])
+def test_gguf_mtp_layer_uses_the_requested_formats(tmp_path, variant):
+    fixture, _, _, out, _ = convert_bonsai(
+        tmp_path, recipe=f"bonsai2_27b_mtp_{variant}", gguf_mtp=True
+    )
+    qmax = {"q4_g64_fp16": 7, "q5_g64_fp16": 15}
+    with NInferArtifactStore(out) as result:
+        assert result.stored_format("mtp/input_projection") == "q8_g32_fp16"
+        for role in _MTP_ROLES:
+            name = _MTP_LAYER + role
+            format = _expected_mtp_format(variant, role)
+            assert result.stored_format(name) == format, name
+            expected = _gguf_mtp_expected(fixture)[name]
+            _assert_within_grouped_step(
+                result.dequantize(name).numpy(), expected, 64, qmax[format], name
+            )
+
+
+def test_an_explicit_mtp_source_wins_over_the_gguf_layer(tmp_path):
+    """A GGUF that also carries a draft layer still copies the explicit reference when one is given."""
+    fixture, _ = write_gguf(tmp_path / "bonsai.gguf", mtp=True)
+    reference = write_reference(tmp_path)
+    write_base(tmp_path / "bonsai.gguf", reference, tmp_path / "base")
+    out = tmp_path / "bonsai.ninfer"
+    convert_main(
+        [
+            "--model", str(tmp_path / "base"), "--recipe", "bonsai2_27b",
+            "--components", "text,mtp",
+            "--source", f"gguf={tmp_path / 'bonsai.gguf'}", "--source", f"mtp={reference}",
+            "--device", "cpu", "--rows-per-chunk", "100", "--out", str(out),
+        ]
+    )
+    with NInferArtifactStore(reference) as source, NInferArtifactStore(out) as result:
+        assert torch.equal(
+            source.dequantize("mtp/input_projection"), result.dequantize("mtp/input_projection")
+        )
+
+
+def test_a_gguf_without_a_draft_layer_needs_an_mtp_source(tmp_path):
+    fixture, _ = write_gguf(tmp_path / "bonsai.gguf")
+    reference = write_reference(tmp_path)
+    write_base(tmp_path / "bonsai.gguf", reference, tmp_path / "base")
+    with pytest.raises(ValueError, match="no MTP layer"):
+        convert_main(
+            [
+                "--model", str(tmp_path / "base"), "--recipe", "bonsai2_27b",
+                "--components", "text,mtp", "--source", f"gguf={tmp_path / 'bonsai.gguf'}",
+                "--device", "cpu", "--out", str(tmp_path / "x.ninfer"),
+            ]
+        )
 
 
 @pytest.mark.parametrize("variant", ["q5", "q4", "q4q5"])

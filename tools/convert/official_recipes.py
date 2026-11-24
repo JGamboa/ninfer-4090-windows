@@ -13,6 +13,7 @@ from .sources.logical import array_source
 from .sources.ninfer_artifact import NInferArtifactStore
 from .sources.mmproj import MmprojCheckpoint
 from .sources.prism_checkpoint import PrismCheckpoint
+from .sources.prism_gguf import text_layer_count
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -328,7 +329,7 @@ def _bonsai_geometry(model, gguf: PrismCheckpoint) -> None:
     meta = gguf.metadata
     expected = {
         "hidden_size": meta.get("qwen35.embedding_length"),
-        "num_hidden_layers": meta.get("qwen35.block_count"),
+        "num_hidden_layers": text_layer_count(meta),
         "intermediate_size": meta.get("qwen35.feed_forward_length"),
         "num_attention_heads": meta.get("qwen35.attention.head_count"),
         "num_key_value_heads": meta.get("qwen35.attention.head_count_kv"),
@@ -385,12 +386,31 @@ def _bonsai_mtp(model, recipe, reference: NInferArtifactStore, layer_format=None
             recipe.assign(name, format=format, method=import_encoded, source=source)
 
 
+def _bonsai_mtp_gguf(model, recipe, gguf: PrismCheckpoint, layer_format=None) -> None:
+    """MTP layer read from the GGUF itself (a Bonsai 2.5 `-mtp` file: Q4_0 values in the primal
+    basis). The decoded values are stored in Q8 (`mtp/input_projection` always) or, for the
+    layer's projections, in the `layer_format` formats."""
+    if not gguf.has_mtp:
+        raise ValueError(f"{gguf.path}: no MTP layer (qwen35.nextn_predict_layers is absent)")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("mtp/"):
+            continue
+        source = model.source(name, gguf)
+        if parameter.projection:
+            format = layer_format(name) if layer_format and name.startswith("mtp/layers/") else Q8
+            _assign(recipe, name, format, source=source)
+        else:
+            recipe.assign(name, source=source)
+
+
 def bonsai2_27b(model, recipe, sources, mtp_layer=None):
     """Prism Ternary Bonsai 2: t5 projections, output head and embedding, copied MTP.
 
     Sources: ``gguf`` (the PTQ1_0/PQ2_0 GGUF); with the ``mtp`` component, ``mtp`` (an
     existing Qwen3.8-27B ``.ninfer`` whose MTP head is copied word for word, or with its layer
-    requantized to the `BONSAI_MTP_LAYER_FORMATS[mtp_layer]` formats); with the
+    requantized to the `BONSAI_MTP_LAYER_FORMATS[mtp_layer]` formats). Without ``mtp``, a GGUF
+    that carries its own MTP layer (a Bonsai 2.5 `-mtp` file) supplies it, decoded from Q4_0
+    and stored in Q8 or the same layer formats; with the
     ``vision`` component, ``mmproj`` (Prism's Qwen3-VL mmproj GGUF, not ternary), quantized
     to the official Vision formats (Q4/Q5/Q6/Q8, the registered Vision kernels).
     """
@@ -463,7 +483,11 @@ def bonsai2_27b(model, recipe, sources, mtp_layer=None):
     }
     if "mtp" in model.components:
         layer_format = None if mtp_layer is None else BONSAI_MTP_LAYER_FORMATS[mtp_layer]
-        _bonsai_mtp(model, recipe, sources["mtp"], layer_format)
+        mtp = sources["mtp"] if "mtp" in sources else gguf
+        if isinstance(mtp, PrismCheckpoint):
+            _bonsai_mtp_gguf(model, recipe, mtp, layer_format)
+        else:
+            _bonsai_mtp(model, recipe, mtp, layer_format)
     elif mtp_layer is not None:
         raise ValueError(f"bonsai2_27b_mtp_{mtp_layer} requires the mtp component")
     if "vision" in model.components:
