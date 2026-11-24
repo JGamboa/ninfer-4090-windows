@@ -7,10 +7,17 @@ the same architecture through a CLI and an OpenAI- and Anthropic-compatible HTTP
 | Model | Artifact | Size | Decode (MTP) | Best decode | Prefill (`pp2048`) |
 |---|---|---:|---:|---:|---:|
 | **Ternary Bonsai 2 27B** (Prism ML, ternary weights, text + vision, self-distilled MTP) | [jgamboa/Ternary-Bonsai-2-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2-27B-NInfer-4090) | 6.4 GiB | **252 tok/s** | **840 tok/s** (MTP + n-gram) | **6,027 tok/s** |
+| **Ternary Bonsai 2.5 27B** (Prism ML, same format as Bonsai 2, Prism's own MTP head) | [jgamboa/Ternary-Bonsai-2.5-27B-NInfer-4090](https://huggingface.co/jgamboa/Ternary-Bonsai-2.5-27B-NInfer-4090) | 6.4 GiB | 287 tok/s (MTP 3 + n-gram) | — | — (64K: 4.48k tok/s, as Bonsai 2) |
 | **Qwen3.8-27B, int8 prefill, Q4/Q5 MTP** (recommended) | [jgamboa/Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.8-27B-NInfer-4090) | 18.9 GiB | **121 tok/s** | **289 tok/s** (MTP + n-gram) | **5,860 tok/s** |
 | **Qwen3.6-27B, int8 prefill, Q4/Q5 MTP** | [jgamboa/Qwen3.6-27B-NInfer-4090](https://huggingface.co/jgamboa/Qwen3.6-27B-NInfer-4090) | 16.1 GiB | **126 tok/s** | — | — |
 | **Qwen3.8-27B**, official artifact | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19.0 GiB | 120 tok/s | 289 tok/s; 402 tok/s (DFlash2, code) | 2,762 tok/s |
 | **Swift 1.5 Qwen3.8-27B** (UkisAI fine-tune that thinks less), int8 prefill | [jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090](https://huggingface.co/jgamboa/Swift-1.5-Qwen3.8-27B-NInfer-4090) | 19.0 GiB | same as Qwen3.8 | 27 % fewer tokens per answer on hard problems, same accuracy | same as Qwen3.8 int8 |
+
+Bonsai 2.5 is Prism's agentic release of the same ternary model. Measured on 2026-11-24 against the
+retrained Bonsai 2 (CLI, greedy, thinking off, MTP 3 + n-gram, eight mixed prompts): 287 against 271 tok/s
+with 60.3 % against 55.1 % draft acceptance, the same prefill (4.48k tok/s at 64K, 2.49k at 260K) and 44/45
+against 43/45 on the task suite. Its agentic-coding gains are Prism's claim and were not reproduced here
+([conversion and results](docs/maintainer/bonsai-ternary-conversion.md)).
 
 The two Qwen3.8-27B files hold the same weights, byte for byte; the int8-prefill file lets prompt
 processing run on int8 tensor cores (1.7-1.9x faster, same decode, same quality within noise).
